@@ -111,6 +111,27 @@ export default async function plugin(bb: BbPluginApi) {
     return candidates[0] ?? null;
   }
 
+  // Two switchers share one Keychain: this plugin and the Python poller
+  // (claude_accounts.decide_switch, its own COOLDOWN in state.json). They do not
+  // share cooldown state, and usage.json only learns who is active on the next
+  // 180s poll — so right after the poller switches, the cache's `active` flag is
+  // a lie, and acting on it would switch a second time for nothing. `claude-acct
+  // current` reads the truth from the Keychain; disagreement means the cache is
+  // behind, so skip this tick rather than reason about a stale world.
+  async function activeSlotIsTrustworthy(cacheActive: string): Promise<boolean> {
+    try {
+      const { stdout } = await run(CLAUDE_ACCT, ["current"], { timeout: 10_000 });
+      const live = stdout.trim();
+      if (live && live !== cacheActive) {
+        bb.log.info(`skipping watch: live slot ${live} != cached active ${cacheActive} (usage cache is behind)`);
+        return false;
+      }
+    } catch {
+      return true; // claude-acct unavailable: fall back to the cache rather than freeze
+    }
+    return true;
+  }
+
   async function underCooldown(overrideSec?: number): Promise<boolean> {
     const { cooldownSec } = await settings.get();
     const window = overrideSec ?? Number(cooldownSec);
@@ -158,6 +179,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (await isStale(polledAt)) return;
     const active = accounts.find((a) => a.active);
     if (!active) return;
+    if (!(await activeSlotIsTrustworthy(active.slot))) return;
     const best = await pickBest(active.slot);
     if (!best) return;
 
