@@ -85,7 +85,8 @@ const worst = (a: Account) => Math.max(a.fiveHour ?? 0, a.sevenDay ?? 0);
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
-    switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "85" },
+    switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "97" },
+    downgradeModel: { type: "string", label: "Model to continue Fable threads on when only Fable's own limit is hit", default: "claude-opus-5[1m]" },
     cooldownSec: { type: "string", label: "Minimum seconds between switches", default: "120" },
     staleAfterMin: { type: "string", label: "Treat usage data older than this (min) as stale", default: "15" },
   });
@@ -141,22 +142,64 @@ export default async function plugin(bb: BbPluginApi) {
     );
   });
 
-  // Reactive path: a rate-limited thread is the ground-truth signal. Switch,
-  // then auto-continue the failed thread through the SDK recovery path.
+  // Reactive path — the optimization ladder. Goal: maximize usage across all
+  // accounts × model tiers; never leave window tokens stranded.
+  //
+  // A rate-limited thread is the ground-truth signal (there is NO Fable-specific
+  // usage bucket in the API — learned 2026-08-09). Ladder:
+  //   1. Failing model is Fable AND the account's overall 5h window is still
+  //      under switchAt → only Fable's own ceiling was hit. DON'T burn a fresh
+  //      account: continue the thread on downgradeModel (Opus) so the rest of
+  //      the window gets used. Record the observed ceiling for the optimizer.
+  //   2. Otherwise the whole window (or a non-Fable limit) is gone → switch to
+  //      the lowest-usage fresh account and auto-continue the thread there.
   const RATE_LIMIT_RE = /rate.?limit|usage.?limit|429|subscription.*(limit|window)|out of.*(quota|usage)/i;
   bb.events.on("thread.failed", ({ thread, error }) => {
     void (async () => {
       if (!error || !RATE_LIMIT_RE.test(error)) return;
-      const { autoSwitch } = await settings.get();
+      const { autoSwitch, switchAt, downgradeModel } = await settings.get();
       if (!autoSwitch || (await underCooldown())) return;
       const { accounts } = await readUsage();
       const active = accounts.find((a) => a.active);
+
+      let failingModel = "";
+      try {
+        const exec = (await bb.sdk.threads.defaultExecutionOptions({ threadId: thread.id })) as { model?: string };
+        failingModel = String(exec?.model ?? "");
+      } catch { /* model unknown — fall through to account switch */ }
+
+      const fiveH = active?.fiveHour ?? 100;
+      if (/fable/i.test(failingModel) && fiveH < Number(switchAt)) {
+        const ceilings = (await bb.storage.kv.get<object[]>("fable-ceilings")) ?? [];
+        await bb.storage.kv.set("fable-ceilings", [
+          ...ceilings.slice(-49),
+          { at: Date.now(), slot: active?.slot ?? "?", overallFiveHour: fiveH },
+        ]);
+        try {
+          await bb.sdk.threads.send({
+            threadId: thread.id,
+            mode: "auto",
+            model: downgradeModel,
+            input: [{
+              type: "text",
+              mentions: [],
+              text: `[accounts] Fable 5 hit its model-specific limit (account overall 5h at ${fiveH}% — window still has room). Continuing this thread on ${downgradeModel} to use the remaining tokens. Please continue from where you left off.`,
+            }],
+          });
+          bb.log.info(`thread ${thread.id}: Fable ceiling at overall ${fiveH}% — downgraded to ${downgradeModel} on ${active?.slot} (no account switch)`);
+          bb.realtime.publish("accounts.switched", { from: "fable-5", to: downgradeModel, reason: `model downgrade on ${active?.slot}, window at ${fiveH}%` });
+        } catch (e) {
+          bb.log.warn(`model-downgrade continue failed for ${thread.id}: ${e instanceof Error ? e.message : e}`);
+        }
+        return;
+      }
+
       const best = await pickBest(active?.slot ?? "");
       if (!best) {
         bb.log.warn(`thread ${thread.id} rate-limited but no fresh alternative slot — leaving to provider-retry`);
         return;
       }
-      const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit`);
+      const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit on ${failingModel || "unknown model"} with window at ${fiveH}%`);
       if (!ok) return;
       try {
         const status = await bb.sdk.threads.rateLimitRecovery({ threadId: thread.id });
