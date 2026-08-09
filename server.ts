@@ -1,0 +1,248 @@
+// bb-plugin-accounts — Claude Max account switching inside bb.
+//
+// The standalone Python poller (claude.usage-poll LaunchAgent) keeps polling
+// Anthropic's usage endpoint for every captured account and owns the Keychain
+// swap (`claude-acct use <slot>`). This plugin is the brain and the surface on
+// top of it:
+//  - reads ~/.config/claude-usage/usage.json (the poller's cache)
+//  - `bb accounts` CLI + homepage usage tiles
+//  - schedule: proactive switch when the ACTIVE slot crosses switchAt (default
+//    85 — Fable 5 hits its wall before the reported 5h window reaches 95;
+//    learned 2026-08-09) to the freshest lowest-usage slot
+//  - thread.failed: a provider rate-limit failure IS the trigger — switch
+//    immediately and auto-continue the failed thread via the SDK's
+//    rate-limit-recovery path. Utilization thresholds can lie; the 429 doesn't.
+import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import os from "node:os";
+import { promisify } from "node:util";
+import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { z } from "zod";
+
+const run = promisify(execFile);
+const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
+const CLAUDE_ACCT = `${os.homedir()}/.local/bin/claude-acct`;
+
+const accountShape = z.object({
+  slot: z.string(),
+  email: z.string(),
+  active: z.boolean(),
+  fiveHour: z.number().nullable(),
+  sevenDay: z.number().nullable(),
+  fiveHourResetsAt: z.string().nullable(),
+  sevenDayResetsAt: z.string().nullable(),
+});
+type Account = z.infer<typeof accountShape>;
+
+export const rpcContract = defineRpcContract({
+  status: {
+    input: z.null(),
+    output: z.object({
+      polledAt: z.number().nullable(),
+      stale: z.boolean(),
+      accounts: z.array(accountShape),
+      lastSwitch: z
+        .object({ at: z.number(), from: z.string(), to: z.string(), reason: z.string() })
+        .nullable(),
+    }),
+  },
+});
+
+interface RawUsage {
+  polledAt?: number;
+  active?: string;
+  accounts?: {
+    slot: string;
+    email: string;
+    active: boolean;
+    fiveHour?: { util?: number | null; resetsAt?: string | null } | null;
+    sevenDay?: { util?: number | null; resetsAt?: string | null } | null;
+  }[];
+}
+
+async function readUsage(): Promise<{ polledAt: number | null; accounts: Account[] }> {
+  try {
+    const raw = JSON.parse(await readFile(USAGE, "utf8")) as RawUsage;
+    return {
+      polledAt: raw.polledAt ?? null,
+      accounts: (raw.accounts ?? []).map((a) => ({
+        slot: a.slot,
+        email: a.email,
+        active: a.active,
+        fiveHour: a.fiveHour?.util ?? null,
+        sevenDay: a.sevenDay?.util ?? null,
+        fiveHourResetsAt: a.fiveHour?.resetsAt ?? null,
+        sevenDayResetsAt: a.sevenDay?.resetsAt ?? null,
+      })),
+    };
+  } catch {
+    return { polledAt: null, accounts: [] };
+  }
+}
+
+const worst = (a: Account) => Math.max(a.fiveHour ?? 0, a.sevenDay ?? 0);
+
+export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
+    switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "85" },
+    cooldownSec: { type: "string", label: "Minimum seconds between switches", default: "120" },
+    staleAfterMin: { type: "string", label: "Treat usage data older than this (min) as stale", default: "15" },
+  });
+
+  const isStale = async (polledAt: number | null) => {
+    const { staleAfterMin } = await settings.get();
+    return polledAt === null || Date.now() / 1000 - polledAt > Number(staleAfterMin) * 60;
+  };
+
+  async function pickBest(exceptSlot: string): Promise<Account | null> {
+    const { polledAt, accounts } = await readUsage();
+    if (await isStale(polledAt)) return null;
+    const candidates = accounts
+      .filter((a) => a.slot !== exceptSlot && (a.sevenDay ?? 0) < 100)
+      .sort((a, b) => worst(a) - worst(b));
+    return candidates[0] ?? null;
+  }
+
+  async function underCooldown(): Promise<boolean> {
+    const { cooldownSec } = await settings.get();
+    const last = await bb.storage.kv.get<{ at: number }>("last-switch");
+    return !!last && Date.now() - last.at < Number(cooldownSec) * 1000;
+  }
+
+  async function switchTo(to: Account, from: string, reason: string): Promise<boolean> {
+    try {
+      await run(CLAUDE_ACCT, ["use", to.slot], { timeout: 30_000 });
+    } catch (e) {
+      bb.log.error(`switch to ${to.slot} FAILED: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+    await bb.storage.kv.set("last-switch", { at: Date.now(), from, to: to.slot, reason });
+    bb.log.info(`switched ${from} -> ${to.slot} (${reason})`);
+    bb.realtime.publish("accounts.switched", { from, to: to.slot, reason });
+    return true;
+  }
+
+  // Proactive path: every 2 minutes, compare the active slot to switchAt.
+  bb.background.schedule("watch", "*/2 * * * *", async () => {
+    const { autoSwitch, switchAt } = await settings.get();
+    if (!autoSwitch) return;
+    if (await underCooldown()) return;
+    const { polledAt, accounts } = await readUsage();
+    if (await isStale(polledAt)) return;
+    const active = accounts.find((a) => a.active);
+    if (!active || (active.fiveHour ?? 0) < Number(switchAt)) return;
+    const best = await pickBest(active.slot);
+    if (!best || worst(best) >= (active.fiveHour ?? 0)) return;
+    await switchTo(
+      best,
+      active.slot,
+      `proactive: 5h ${active.fiveHour}% >= ${switchAt}% (best alternative ${best.slot} at ${worst(best)}%)`,
+    );
+  });
+
+  // Reactive path: a rate-limited thread is the ground-truth signal. Switch,
+  // then auto-continue the failed thread through the SDK recovery path.
+  const RATE_LIMIT_RE = /rate.?limit|usage.?limit|429|subscription.*(limit|window)|out of.*(quota|usage)/i;
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    void (async () => {
+      if (!error || !RATE_LIMIT_RE.test(error)) return;
+      const { autoSwitch } = await settings.get();
+      if (!autoSwitch || (await underCooldown())) return;
+      const { accounts } = await readUsage();
+      const active = accounts.find((a) => a.active);
+      const best = await pickBest(active?.slot ?? "");
+      if (!best) {
+        bb.log.warn(`thread ${thread.id} rate-limited but no fresh alternative slot — leaving to provider-retry`);
+        return;
+      }
+      const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit`);
+      if (!ok) return;
+      try {
+        const status = await bb.sdk.threads.rateLimitRecovery({ threadId: thread.id });
+        if (status.reason === "eligible" && status.candidate) {
+          await new Promise((r) => setTimeout(r, 3000));
+          await bb.sdk.threads.continueAfterRateLimit({
+            threadId: thread.id,
+            failedRequestId: status.candidate.failedRequestId,
+          });
+          bb.log.info(`thread ${thread.id} auto-continued on ${best.slot}`);
+        } else {
+          bb.log.info(`thread ${thread.id} not auto-continuable (${status.reason}) — switched account only`);
+        }
+      } catch (e) {
+        bb.log.warn(`auto-continue failed for ${thread.id}: ${e instanceof Error ? e.message : e}`);
+      }
+    })();
+  });
+
+  bb.rpc.register(rpcContract, {
+    async status() {
+      const { polledAt, accounts } = await readUsage();
+      const lastSwitch =
+        (await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch")) ?? null;
+      return { polledAt, stale: await isStale(polledAt), accounts, lastSwitch };
+    },
+  });
+
+  bb.cli.register({
+    name: "accounts",
+    summary: "Claude Max account usage and switching (auto-switch on limits)",
+    commands: [
+      { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
+      { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
+      { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
+      { name: "log", summary: "Recent switch decisions", usage: "bb accounts log" },
+    ],
+    async run(argv) {
+      const cmd = argv[0] ?? "list";
+      if (cmd === "switch") {
+        const slot = argv[1];
+        if (!slot) return { exitCode: 1, stderr: "usage: bb accounts switch <slot>" };
+        const { accounts } = await readUsage();
+        const target = accounts.find((a) => a.slot === slot);
+        if (!target) return { exitCode: 1, stderr: `unknown slot '${slot}' — bb accounts list` };
+        const active = accounts.find((a) => a.active);
+        const ok = await switchTo(target, active?.slot ?? "?", "manual via bb accounts switch");
+        return ok ? { exitCode: 0, stdout: `switched to ${slot}` } : { exitCode: 1, stderr: "switch failed — see bb plugin logs accounts" };
+      }
+      if (cmd === "auto") {
+        const { switchAt } = await settings.get();
+        const { accounts } = await readUsage();
+        const active = accounts.find((a) => a.active);
+        if (!active) return { exitCode: 1, stderr: "no active account in usage cache" };
+        if ((active.fiveHour ?? 0) < Number(switchAt)) {
+          return { exitCode: 0, stdout: `active ${active.slot} at ${active.fiveHour}% 5h — below ${switchAt}%, no switch` };
+        }
+        const best = await pickBest(active.slot);
+        if (!best) return { exitCode: 1, stderr: "no fresh alternative slot" };
+        const ok = await switchTo(best, active.slot, "manual auto-evaluation");
+        return ok ? { exitCode: 0, stdout: `switched to ${best.slot}` } : { exitCode: 1, stderr: "switch failed" };
+      }
+      if (cmd === "log") {
+        const last = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch");
+        return {
+          exitCode: 0,
+          stdout: last
+            ? `${new Date(last.at).toISOString()} ${last.from} -> ${last.to}: ${last.reason}`
+            : "no switches recorded by this plugin yet",
+        };
+      }
+      const { polledAt, accounts } = await readUsage();
+      const stale = await isStale(polledAt);
+      const bar = (v: number | null) => {
+        const f = Math.min(1, (v ?? 0) / 100);
+        const n = Math.round(f * 12);
+        return "█".repeat(n) + "░".repeat(12 - n);
+      };
+      const lines = accounts.map(
+        (a) =>
+          `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${String(a.fiveHour ?? 0).padStart(3)}%  7d ${bar(a.sevenDay)} ${String(a.sevenDay ?? 0).padStart(3)}%`,
+      );
+      if (stale) lines.push("⚠ usage cache is stale — check the claude.usage-poll LaunchAgent");
+      return { exitCode: 0, stdout: lines.join("\n") || "no accounts captured (claude-acct capture)" };
+    },
+  });
+
+  bb.log.info("accounts plugin loaded");
+}
