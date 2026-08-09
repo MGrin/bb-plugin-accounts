@@ -1,83 +1,77 @@
 # bb-plugin-accounts
 
-A BB plugin.
+Claude Max account usage and auto-switching for [bb](https://getbb.app).
 
-## UI components
+Shows what each of your Claude subscriptions has left, and — when a thread actually
+hits a rate limit — switches to an account with headroom and continues the interrupted
+thread where it stopped.
 
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
-
-```
-npx shadcn add @bb/dialog @bb/select
+```sh
+bb plugin install git:https://github.com/MGrin/bb-plugin-accounts.git@main
 ```
 
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Ship `dist/` (npm tarball or committed for git installs) so
-people installing your plugin never need npm.
+## What it does
 
-## Manifest
+**Homepage tiles** — 5-hour and 7-day utilization per account, with the active one marked.
 
-`package.json` is the plugin manifest. Notable fields:
-
-- `bb.server` — backend entry (required); optional `bb.app` for a frontend.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — supported plugin SDK range (scaffold: `^0.4.1`).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` (and, with `bb.app`, `app.js` /
-`app.css` / `app.meta.json`). Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
-
-## Install
-
-From this directory:
+**`bb accounts`**
 
 ```
-bb plugin install .
+bb accounts [list]        per-account 5h/7d utilization
+bb accounts switch <slot> switch the live credentials to a slot
+bb accounts auto          run one auto-switch evaluation now
+bb accounts log           the last switch decision and why
 ```
 
-After editing sources, reload:
+**Proactive switching** — a schedule compares the active account against `switchAt` and
+moves to the candidate with the lowest `max(5h, 7d)` among accounts whose usage data is
+fresh, subject to a cooldown.
 
-```
-bb plugin reload accounts
-```
+**Reactive switching** — this is the useful part. bb emits `thread.failed`; when the
+error is a rate limit the plugin switches accounts and then calls bb's rate-limit
+recovery to **continue the failed thread**, so long-running work survives a limit
+instead of dying at it. It complements bb's builtin `provider-retry` plugin, which
+*waits* for the window to reset on the single account bb knows about; this one *moves*.
 
-## Configure
+**Model downgrade before account switch** — if the failing model has its own ceiling but
+the account's overall window still has room, the thread is continued on a lower-tier
+model rather than burning a fresh account.
 
-```
-bb plugin config accounts
-bb plugin config accounts set greeting hi
-```
+## Requirements
 
-## Types & API reference
+This plugin is the brain and the UI; it does **not** manage credentials itself. It needs:
 
-`types/bb-plugin-sdk.d.ts` (and `types/bb-plugin-sdk-app.d.ts` for the
-frontend) are the full, bundled BB plugin API — `tsconfig.json` maps
-`@bb/plugin-sdk` to them, so your editor and `tsc` see real types with no extra
-install. They are readable declarations: open them for an exact signature.
+- a JSON usage cache at `~/.config/claude-usage/usage.json` with `polledAt` and an
+  `accounts[]` array (`slot`, `email`, `active`, `fiveHour.util`, `sevenDay.util`), and
+- a `claude-acct` executable on `~/.local/bin` supporting `claude-acct use <slot>` to
+  swap the live credentials.
 
-The SDK surface grows with every BB release, and these are a copy. Refresh
-them from the BB you are running:
+Both come from the author's dotfiles rather than this repo, so **this plugin will not
+work out of the box for you** — you need a poller and a credential switcher that produce
+that contract. Issues and PRs generalizing this are welcome.
 
-```
-bb plugin types          # rewrite types/ from this BB
-bb plugin types --check  # CI: fail when they are out of date
-```
+## Settings
 
-`bb plugin build` and `bb plugin dev` refresh them for you. Ask BB to write
-plugins for you: the `bb-plugin-authoring` skill documents the whole surface
-with examples.
+| Setting | Default | Meaning |
+|---|---|---|
+| `autoSwitch` | `true` | master switch for both paths |
+| `switchAt` | `97` | 5h utilization % that triggers a proactive switch |
+| `downgradeModel` | `claude-opus-5[1m]` | model to continue on when only the top model's ceiling was hit |
+| `cooldownSec` | `120` | minimum seconds between switches |
+| `staleAfterMin` | `15` | usage data older than this is ignored |
 
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+## A note on multiple accounts
+
+This routes your work across subscriptions **you own and pay for**. It is not a way to
+exceed a plan's limits, and it does not proxy, pool, share or resell credentials — model
+requests are made by bb spawning the normal `claude` binary with the normal credential in
+your OS keychain. Sharing credentials and relaying requests on behalf of other users
+*are* prohibited by Anthropic's terms; this does neither.
+
+Note also that the usage endpoint it reads is undocumented and unsupported, and per-model
+buckets can be absent, so reported utilization may understate real exhaustion. Poll
+conservatively. Use at your own risk.
+
+## License
+
+MIT
