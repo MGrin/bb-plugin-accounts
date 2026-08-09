@@ -24,14 +24,13 @@
       ]
     },
     "noEmit": true,
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    "allowImportingTsExtensions": true
   },
   "include": [
     "server.ts",
-    "app.tsx",
-    "types",
-    "components",
-    "lib",
-    "hooks"
+    "lib.ts",
+    "lib.test.ts",
+    "types"
   ]
 }

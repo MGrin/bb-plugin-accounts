@@ -38,5 +38,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/MGrin/bb-plugin-accounts.git"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types lib.test.ts",
+    "typecheck": "tsc --noEmit"
   }
 }

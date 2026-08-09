@@ -18,6 +18,9 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
+// The judgement lives in lib.ts so `node --test` can exercise it without a
+// Keychain, a poller or a clock. A second copy here is how the two drift.
+import { decideSwitch, pickBest as pickBestOf, worst } from "./lib.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -80,8 +83,6 @@ async function readUsage(): Promise<{ polledAt: number | null; accounts: Account
   }
 }
 
-const worst = (a: Account) => Math.max(a.fiveHour ?? 0, a.sevenDay ?? 0);
-
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
@@ -105,10 +106,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function pickBest(exceptSlot: string): Promise<Account | null> {
     const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return null;
-    const candidates = accounts
-      .filter((a) => a.slot !== exceptSlot && (a.sevenDay ?? 0) < 100)
-      .sort((a, b) => worst(a) - worst(b));
-    return candidates[0] ?? null;
+    return (pickBestOf(accounts, exceptSlot) as Account | null) ?? null;
   }
 
   // Two switchers share one Keychain: this plugin and the Python poller
@@ -172,37 +170,30 @@ export default async function plugin(bb: BbPluginApi) {
   //     it fires only on a wide margin (default 25 points of max(5h,7d)) and no
   //     more often than spreadCooldownSec (default 30 min).
   bb.background.schedule("watch", "*/2 * * * *", async () => {
-    const { autoSwitch, switchAt, spreadMargin, spreadCooldownSec } = await settings.get();
+    const { autoSwitch, switchAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
     if (!autoSwitch) return;
-    if (await underCooldown()) return;
     const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return;
     const active = accounts.find((a) => a.active);
     if (!active) return;
     if (!(await activeSlotIsTrustworthy(active.slot))) return;
-    const best = await pickBest(active.slot);
-    if (!best) return;
 
-    if ((active.fiveHour ?? 0) >= Number(switchAt)) {
-      if (worst(best) >= (active.fiveHour ?? 0)) return;
-      await switchTo(
-        best,
-        active.slot,
-        `proactive: 5h ${active.fiveHour}% >= ${switchAt}% (best alternative ${best.slot} at ${worst(best)}%)`,
-      );
-      return;
-    }
-
-    const margin = Number(spreadMargin);
-    if (!(margin > 0)) return;
-    const gap = worst(active) - worst(best);
-    if (gap < margin) return;
-    if (await underCooldown(Number(spreadCooldownSec))) return;
-    await switchTo(
-      best,
-      active.slot,
-      `spread: ${active.slot} at max(5h,7d)=${worst(active)}% vs ${best.slot} at ${worst(best)}% (gap ${gap} >= ${margin})`,
+    const last = await bb.storage.kv.get<{ at: number }>("last-switch");
+    const sinceSec = last ? (Date.now() - last.at) / 1000 : Number.POSITIVE_INFINITY;
+    const decision = decideSwitch(
+      accounts,
+      {
+        switchAt: Number(switchAt),
+        spreadMargin: Number(spreadMargin),
+        cooldownSec: Number(cooldownSec),
+        spreadCooldownSec: Number(spreadCooldownSec),
+      },
+      sinceSec,
     );
+    if (decision.action === "none") return;
+    const target = accounts.find((a) => a.slot === decision.to);
+    if (!target) return;
+    await switchTo(target, active.slot, decision.reason);
   });
 
   // Reactive path — the optimization ladder. Goal: maximize usage across all
