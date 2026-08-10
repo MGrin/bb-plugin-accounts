@@ -20,7 +20,7 @@ import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
-import { decideSwitch, pickBest as pickBestOf, worst } from "./lib.ts";
+import { decideSwitch, isLimitError, pickBest as pickBestOf, worst } from "./lib.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -207,10 +207,10 @@ export default async function plugin(bb: BbPluginApi) {
   //      the window gets used. Record the observed ceiling for the optimizer.
   //   2. Otherwise the whole window (or a non-Fable limit) is gone → switch to
   //      the lowest-usage fresh account and auto-continue the thread there.
-  const RATE_LIMIT_RE = /rate.?limit|usage.?limit|429|subscription.*(limit|window)|out of.*(quota|usage)/i;
   bb.events.on("thread.failed", ({ thread, error }) => {
     void (async () => {
-      if (!error || !RATE_LIMIT_RE.test(error)) return;
+      // isLimitError lives in lib.ts under test — see the 2026-08-10 note there.
+      if (!isLimitError(error)) return;
       const { autoSwitch, switchAt, downgradeModel } = await settings.get();
       if (!autoSwitch || (await underCooldown())) return;
       const { accounts } = await readUsage();
@@ -327,6 +327,27 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const { polledAt, accounts } = await readUsage();
       const stale = await isStale(polledAt);
+      // --json is the Übersicht widget's feed (dash-claude-usage). The widget
+      // used to read the poller's cache file directly, which meant the desktop
+      // could show a different active account than bb was actually billing.
+      // One surface, one answer.
+      if (argv.includes("--json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            polledAt,
+            stale,
+            active: accounts.find((a) => a.active)?.slot ?? null,
+            accounts: accounts.map((a) => ({
+              slot: a.slot,
+              email: a.email,
+              active: a.active,
+              fiveHour: { util: a.fiveHour, resetsAt: a.fiveHourResetsAt },
+              sevenDay: { util: a.sevenDay, resetsAt: a.sevenDayResetsAt },
+            })),
+          }),
+        };
+      }
       const bar = (v: number | null) => {
         const f = Math.min(1, (v ?? 0) / 100);
         const n = Math.round(f * 12);

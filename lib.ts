@@ -107,3 +107,22 @@ export function decideSwitch(
     reason: `spread: ${active.slot} at max(5h,7d)=${worst(active)}% vs ${best.slot} at ${worst(best)}% (gap ${gap} >= ${policy.spreadMargin})`,
   };
 }
+
+/**
+ * Does this thread.failed error mean "this account is out of window", as
+ * opposed to any of the thousand other ways a thread dies?
+ *
+ * This is the trigger for the entire reactive path, and it lived as an
+ * un-exercised literal in server.ts until 2026-08-10, when Anthropic's wording
+ * ("You've hit your session limit · resets 6pm") matched none of its branches
+ * and six threads sat stopped while two accounts idled. The lesson is not "add
+ * session" — it is that the vocabulary is the vendor's to change, so the match
+ * has to be broad on the ways a limit can be phrased and narrow only on the
+ * word `limit`/`quota`/`429` itself. False positives cost one wasted switch;
+ * false negatives cost a night.
+ */
+export function isLimitError(error: string | null | undefined): boolean {
+  if (!error) return false;
+  return /rate.?limit|usage.?limit|session.?limit|weekly.?limit|429|subscription.*(limit|window)|out of.*(quota|usage)|hit your.*limit|reached your.*limit|limit.*resets/i
+    .test(error);
+}
