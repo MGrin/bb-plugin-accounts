@@ -5,7 +5,22 @@
 // equally-dead account, and thrash.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type AccountUsage, decideSwitch, isLimitError, pickBest, type SwitchPolicy, worst } from "./lib.ts";
+import {
+  type AccountUsage,
+  createRecoverySweeper,
+  decideSwitch,
+  isLimitError,
+  pickBest,
+  planSweep,
+  type RecoveryAttemptResult,
+  type RecoveryPolicy,
+  type StuckThreadRecord,
+  type StuckThreadStore,
+  type SwitchPolicy,
+  type ThreadStatus,
+  type ThreadStatusPort,
+  worst,
+} from "./lib.ts";
 
 const POLICY: SwitchPolicy = { switchAt: 97, spreadMargin: 25, cooldownSec: 120, spreadCooldownSec: 1800 };
 const acct = (slot: string, fiveHour: number | null, sevenDay: number | null, active = false): AccountUsage =>
@@ -195,4 +210,157 @@ test("will not switch INTO a slot at 99% of its week", () => {
   const d = decideSwitch([acct("a", 98, 10, true), acct("b", 0, 99)], POLICY, 3600);
   assert.equal(d.action, "none");
   assert.equal(pickBest([acct("a", 98, 10, true), acct("b", 0, 99)], "a"), null);
+});
+
+// ── recovery sweep: resuming every stuck thread, not just the one that just
+// failed (2026-08-10 consolidation — six threads sat stopped with capacity
+// idle elsewhere because only the just-failed thread was ever resumed) ──────
+
+const RPOLICY: RecoveryPolicy = { attemptCooldownSec: 120, maxAttempts: 5, giveUpAfterSec: 6 * 3600 };
+const stuck = (
+  threadId: string,
+  firstFailedAt: number,
+  lastAttemptAt: number | null = null,
+  attempts = 0,
+): StuckThreadRecord => ({ threadId, providerId: "claude-code", firstFailedAt, lastFailedAt: firstFailedAt, lastAttemptAt, attempts });
+
+test("planSweep drops a candidate that exhausted maxAttempts", () => {
+  const plan = planSweep([stuck("a", T, T - 200_000, 5)], T, RPOLICY);
+  assert.deepEqual(plan.drop, ["a"]);
+  assert.deepEqual(plan.attempt, []);
+});
+
+test("planSweep maxAttempts: 0 means unlimited", () => {
+  const unlimited = { ...RPOLICY, maxAttempts: 0 };
+  const plan = planSweep([stuck("a", T, T - 200_000, 999)], T, unlimited);
+  assert.equal(plan.drop.length, 0);
+  assert.equal(plan.attempt.length, 1);
+});
+
+test("planSweep drops a candidate stuck longer than giveUpAfterSec, regardless of attempts", () => {
+  const plan = planSweep([stuck("a", T - 7 * 3600 * 1000, null, 0)], T, RPOLICY);
+  assert.deepEqual(plan.drop, ["a"]);
+});
+
+test("planSweep giveUpAfterSec: 0 means never give up on time", () => {
+  const noGiveUp = { ...RPOLICY, giveUpAfterSec: 0 };
+  const plan = planSweep([stuck("a", T - 999 * 3600 * 1000, null, 0)], T, noGiveUp);
+  assert.equal(plan.drop.length, 0);
+});
+
+test("planSweep puts a still-cooling-down candidate in waiting, not attempt", () => {
+  const plan = planSweep([stuck("a", T, T - 60_000, 1)], T, RPOLICY); // 60s < 120s cooldown
+  assert.deepEqual(plan.waiting, ["a"]);
+  assert.deepEqual(plan.attempt, []);
+});
+
+test("planSweep attempts a never-tried candidate immediately", () => {
+  const plan = planSweep([stuck("a", T, null, 0)], T, RPOLICY);
+  assert.equal(plan.attempt.length, 1);
+  assert.equal(plan.attempt[0].threadId, "a");
+});
+
+test("planSweep orders attempts oldest-firstFailedAt-first", () => {
+  const plan = planSweep([stuck("newer", T, null, 0), stuck("older", T - 10_000, null, 0)], T, RPOLICY);
+  assert.deepEqual(plan.attempt.map((c) => c.threadId), ["older", "newer"]);
+});
+
+test("planSweep ties break deterministically by threadId", () => {
+  const plan = planSweep([stuck("z", T, null, 0), stuck("a", T, null, 0)], T, RPOLICY);
+  assert.deepEqual(plan.attempt.map((c) => c.threadId), ["a", "z"]);
+});
+
+function inMemoryStore(seed: StuckThreadRecord[] = []): StuckThreadStore {
+  let rows = [...seed];
+  return {
+    async list() { return [...rows]; },
+    async upsert(r) { rows = [...rows.filter((x) => x.threadId !== r.threadId), r]; },
+    async remove(id) { rows = rows.filter((x) => x.threadId !== id); },
+  };
+}
+
+function fakeStatus(statuses: Record<string, ThreadStatus>): ThreadStatusPort {
+  return { async getStatus(id) { return statuses[id] ?? "not-found"; } };
+}
+
+function fakeRecovery(outcomes: Record<string, RecoveryAttemptResult>) {
+  const calls: string[] = [];
+  return {
+    calls,
+    async attemptContinue(id: string) {
+      calls.push(id);
+      return outcomes[id] ?? { outcome: "not-eligible" as const, reason: "no-fixture" };
+    },
+  };
+}
+
+test("sweep drops a candidate whose live status is no longer error, without attempting it", async () => {
+  const store = inMemoryStore([stuck("a", T, null, 0)]);
+  const recovery = fakeRecovery({});
+  const sweeper = createRecoverySweeper({ store, status: fakeStatus({ a: "idle" }), recovery, policy: RPOLICY, now: () => T });
+  const result = await sweeper.sweep("periodic");
+  assert.deepEqual(result.attempted, []);
+  assert.deepEqual(await store.list(), []);
+  assert.deepEqual(recovery.calls, []);
+});
+
+test("sweep removes a candidate from the store on a successful continue", async () => {
+  const store = inMemoryStore([stuck("a", T, null, 0)]);
+  const sweeper = createRecoverySweeper({
+    store,
+    status: fakeStatus({ a: "error" }),
+    recovery: fakeRecovery({ a: { outcome: "continued" } }),
+    policy: RPOLICY,
+    now: () => T,
+  });
+  const result = await sweeper.sweep("reactive");
+  assert.deepEqual(result.continued, ["a"]);
+  assert.deepEqual(await store.list(), []);
+});
+
+test("sweep keeps tracking a candidate after a failed attempt, incrementing attempts", async () => {
+  const store = inMemoryStore([stuck("a", T, null, 0)]);
+  const sweeper = createRecoverySweeper({
+    store,
+    status: fakeStatus({ a: "error" }),
+    recovery: fakeRecovery({ a: { outcome: "not-eligible", reason: "still hot" } }),
+    policy: RPOLICY,
+    now: () => T,
+  });
+  const result = await sweeper.sweep("reactive");
+  assert.deepEqual(result.continued, []);
+  assert.deepEqual(result.attempted, ["a"]);
+  const [after] = await store.list();
+  assert.equal(after.attempts, 1);
+  assert.equal(after.lastAttemptAt, T);
+});
+
+test("sweep isolates one throwing candidate from the rest of the batch", async () => {
+  const store = inMemoryStore([stuck("bad", T - 10_000, null, 0), stuck("good", T, null, 0)]);
+  const sweeper = createRecoverySweeper({
+    store,
+    status: {
+      async getStatus(id) {
+        if (id === "bad") throw new Error("boom");
+        return "error";
+      },
+    },
+    recovery: fakeRecovery({ good: { outcome: "continued" } }),
+    policy: RPOLICY,
+    now: () => T,
+  });
+  const result = await sweeper.sweep("reactive");
+  assert.deepEqual(result.continued, ["good"]);
+  assert.equal(result.attempted.includes("bad"), false, "a thrown status check counts as neither attempted nor dropped");
+});
+
+test("onLimitFailure preserves firstFailedAt and attempts across repeat failures", async () => {
+  const store = inMemoryStore();
+  const sweeper = createRecoverySweeper({ store, status: fakeStatus({}), recovery: fakeRecovery({}), policy: RPOLICY, now: () => T });
+  await sweeper.onLimitFailure("a", "claude-code", T - 5000);
+  await sweeper.onLimitFailure("a", "claude-code", T);
+  const [record] = await store.list();
+  assert.equal(record.firstFailedAt, T - 5000);
+  assert.equal(record.lastFailedAt, T);
+  assert.equal(record.attempts, 0);
 });

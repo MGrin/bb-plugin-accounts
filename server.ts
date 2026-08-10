@@ -20,7 +20,20 @@ import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
-import { decideSwitch, isLimitError, pickBest as pickBestOf, type PrevSample, worst } from "./lib.ts";
+import {
+  createRecoverySweeper,
+  decideSwitch,
+  isLimitError,
+  pickBest as pickBestOf,
+  type PrevSample,
+  type RecoveryAttemptResult,
+  type StuckThreadRecord,
+  type StuckThreadStore,
+  type ThreadRecoveryPort,
+  type ThreadStatus,
+  type ThreadStatusPort,
+  worst,
+} from "./lib.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -97,6 +110,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     spreadCooldownSec: { type: "string", label: "Minimum seconds between early (spread) switches", default: "1800" },
     staleAfterMin: { type: "string", label: "Treat usage data older than this (min) as stale", default: "15" },
+    recoveryCooldownSec: { type: "string", label: "Minimum seconds between resume attempts on the SAME stuck thread", default: "120" },
+    recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "5" },
+    recoveryGiveUpAfterHours: { type: "string", label: "Give up resuming a thread this long after it first got stuck (0 = never)", default: "6" },
   });
 
   const isStale = async (polledAt: number | null) => {
@@ -150,6 +166,66 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish("accounts.switched", { from, to: to.slot, reason });
     return true;
   }
+
+  // Recovery sweep — resumes EVERY currently-stuck limit-failed thread, not
+  // just the one attached to whichever event fired. `bb.sdk.threads.list` has
+  // no status/providerId filter, so "which threads are stuck" is tracked here
+  // rather than queried from bb. Pure judgement (planSweep) and the port
+  // shapes below live in lib.ts, under the same `node --test` coverage as
+  // decideSwitch/isLimitError.
+  const stuckThreadsStore: StuckThreadStore = {
+    async list() {
+      return (await bb.storage.kv.get<StuckThreadRecord[]>("stuck-threads")) ?? [];
+    },
+    async upsert(record) {
+      const all = await stuckThreadsStore.list();
+      await bb.storage.kv.set("stuck-threads", [...all.filter((r) => r.threadId !== record.threadId), record]);
+    },
+    async remove(threadId) {
+      const all = await stuckThreadsStore.list();
+      await bb.storage.kv.set("stuck-threads", all.filter((r) => r.threadId !== threadId));
+    },
+  };
+
+  const threadStatus: ThreadStatusPort = {
+    async getStatus(threadId): Promise<ThreadStatus> {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        return thread.status;
+      } catch {
+        return "not-found";
+      }
+    },
+  };
+
+  const threadRecovery: ThreadRecoveryPort = {
+    async attemptContinue(threadId): Promise<RecoveryAttemptResult> {
+      try {
+        const status = await bb.sdk.threads.rateLimitRecovery({ threadId });
+        if (status.reason !== "eligible" || !status.candidate) return { outcome: "not-eligible", reason: status.reason };
+        await new Promise((r) => setTimeout(r, 3000));
+        await bb.sdk.threads.continueAfterRateLimit({ threadId, failedRequestId: status.candidate.failedRequestId });
+        return { outcome: "continued" };
+      } catch (e) {
+        return { outcome: "error", message: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  };
+
+  // Snapshotted at load, like the rest of this plugin's config surface
+  // requires `bb plugin reload accounts` to pick up a settings change.
+  const recoverySettings = await settings.get();
+  const sweeper = createRecoverySweeper({
+    store: stuckThreadsStore,
+    status: threadStatus,
+    recovery: threadRecovery,
+    policy: {
+      attemptCooldownSec: Number(recoverySettings.recoveryCooldownSec),
+      maxAttempts: Number(recoverySettings.recoveryMaxAttempts),
+      giveUpAfterSec: Number(recoverySettings.recoveryGiveUpAfterHours) * 3600,
+    },
+    log: (m) => bb.log.info(m),
+  });
 
   // Proactive path, every 2 minutes. Two triggers, because two different kinds
   // of capacity get stranded:
@@ -233,12 +309,21 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (decision.action === "none") {
       await alarmIfCornered(decision.reason, active, Number(switchAt), Number(weeklyAt));
+      // No switch happened, but an account can regain capacity on its own
+      // (5h/7d window rolling forward) with nothing to hang a sweep off of —
+      // so sweep every watch tick regardless, not only right after a switch.
+      const swept = await sweeper.sweep("periodic");
+      if (swept.continued.length) bb.log.info(`periodic sweep on ${active.slot} resumed: ${swept.continued.join(", ")}`);
       return;
     }
     const target = accounts.find((a) => a.slot === decision.to);
     if (!target) return;
     await bb.storage.kv.delete("cornered-since");
-    await switchTo(target, active.slot, decision.reason);
+    const switched = await switchTo(target, active.slot, decision.reason);
+    if (switched) {
+      const swept = await sweeper.sweep("proactive-switch");
+      if (swept.continued.length) bb.log.info(`proactive switch to ${target.slot} resumed: ${swept.continued.join(", ")}`);
+    }
   });
 
   // Reactive path — the optimization ladder. Goal: maximize usage across all
@@ -256,6 +341,9 @@ export default async function plugin(bb: BbPluginApi) {
     void (async () => {
       // isLimitError lives in lib.ts under test — see the 2026-08-10 note there.
       if (!isLimitError(error)) return;
+      // Track this thread as stuck regardless of what happens below — a
+      // fable-downgrade or a switch that itself fails must not lose it.
+      await sweeper.onLimitFailure(thread.id, thread.providerId);
       const { autoSwitch, switchAt, downgradeModel } = await settings.get();
       if (!autoSwitch || (await underCooldown())) return;
       const { accounts } = await readUsage();
@@ -300,21 +388,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit on ${failingModel || "unknown model"} with window at ${fiveH}%`);
       if (!ok) return;
-      try {
-        const status = await bb.sdk.threads.rateLimitRecovery({ threadId: thread.id });
-        if (status.reason === "eligible" && status.candidate) {
-          await new Promise((r) => setTimeout(r, 3000));
-          await bb.sdk.threads.continueAfterRateLimit({
-            threadId: thread.id,
-            failedRequestId: status.candidate.failedRequestId,
-          });
-          bb.log.info(`thread ${thread.id} auto-continued on ${best.slot}`);
-        } else {
-          bb.log.info(`thread ${thread.id} not auto-continuable (${status.reason}) — switched account only`);
-        }
-      } catch (e) {
-        bb.log.warn(`auto-continue failed for ${thread.id}: ${e instanceof Error ? e.message : e}`);
-      }
+      // Sweeps thread.id itself plus every other currently-stuck thread —
+      // replaces the old single-thread rateLimitRecovery/continueAfterRateLimit
+      // dance, which never revisited threads that failed earlier.
+      const swept = await sweeper.sweep("reactive");
+      if (swept.continued.length) bb.log.info(`reactive switch to ${best.slot} resumed: ${swept.continued.join(", ")}`);
     })();
   });
 

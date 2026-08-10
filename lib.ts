@@ -201,3 +201,198 @@ export function isLimitError(error: string | null | undefined): boolean {
   return /rate.?limit|usage.?limit|session.?limit|weekly.?limit|429|subscription.*(limit|window)|out of.*(quota|usage)|hit your.*limit|reached your.*limit|limit.*resets/i
     .test(error);
 }
+
+// ── Recovery sweep — resuming EVERY stuck thread when capacity returns ──────
+//
+// `bb.sdk.threads.list` has no status/providerId filter, so "which threads
+// are stuck" cannot be queried from bb — it is tracked here as a small
+// durable set, fed only by onLimitFailure(), which is only ever called after
+// isLimitError() upstream. There is no second detector, and no code path
+// here re-implements that judgement.
+
+export interface StuckThreadRecord {
+  threadId: string;
+  providerId: string;
+  /** First time this thread was ever seen limit-failed. Never overwritten. */
+  firstFailedAt: number;
+  /** Most recent limit-failure. Refreshed every time onLimitFailure fires again. */
+  lastFailedAt: number;
+  /** Most recent attemptContinue call, successful or not. Null = never attempted. */
+  lastAttemptAt: number | null;
+  /** Count of attemptContinue calls that came back not-eligible/error. */
+  attempts: number;
+}
+
+export interface RecoveryPolicy {
+  /** Min seconds between attemptContinue calls on the SAME thread. */
+  attemptCooldownSec: number;
+  /** Give up on a thread after this many failed attempts. 0 = unlimited. */
+  maxAttempts: number;
+  /** Give up on a thread this long after firstFailedAt, regardless of attempts. 0 = never. */
+  giveUpAfterSec: number;
+}
+
+export interface SweepPlan {
+  /** Oldest-stuck-first, deterministic tie-break by threadId. */
+  attempt: StuckThreadRecord[];
+  /** threadIds to stop tracking this tick (maxAttempts or giveUpAfterSec exceeded). */
+  drop: string[];
+  /** threadIds still tracked but skipped this tick (under attemptCooldownSec). */
+  waiting: string[];
+}
+
+/**
+ * Pure: no clock reads, no I/O. `now` and `candidates` are the entire input,
+ * exactly like decideSwitch. Live thread status is deliberately NOT part of
+ * this decision — that is a fact the impure sweep() re-checks per candidate
+ * right before attempting, since it can change for reasons this module never
+ * causes (provider-retry, a human, an earlier sweep).
+ */
+export function planSweep(candidates: StuckThreadRecord[], now: number, policy: RecoveryPolicy): SweepPlan {
+  const drop: string[] = [];
+  const waiting: string[] = [];
+  const eligible: StuckThreadRecord[] = [];
+
+  for (const c of candidates) {
+    if (policy.maxAttempts > 0 && c.attempts >= policy.maxAttempts) {
+      drop.push(c.threadId);
+      continue;
+    }
+    if (policy.giveUpAfterSec > 0 && now - c.firstFailedAt > policy.giveUpAfterSec * 1000) {
+      drop.push(c.threadId);
+      continue;
+    }
+    if (c.lastAttemptAt !== null && now - c.lastAttemptAt < policy.attemptCooldownSec * 1000) {
+      waiting.push(c.threadId);
+      continue;
+    }
+    eligible.push(c);
+  }
+
+  eligible.sort((a, b) => a.firstFailedAt - b.firstFailedAt || a.threadId.localeCompare(b.threadId));
+  return { attempt: eligible, drop, waiting };
+}
+
+export type ThreadStatus = "error" | "active" | "starting" | "idle" | "stopping" | "not-found";
+
+export interface StuckThreadStore {
+  list(): Promise<StuckThreadRecord[]>;
+  upsert(record: StuckThreadRecord): Promise<void>;
+  remove(threadId: string): Promise<void>;
+}
+
+export interface ThreadStatusPort {
+  getStatus(threadId: string): Promise<ThreadStatus>;
+}
+
+export type RecoveryAttemptResult =
+  | { outcome: "continued" }
+  | { outcome: "not-eligible"; reason: string }
+  | { outcome: "error"; message: string };
+
+export interface ThreadRecoveryPort {
+  /** Hides the rateLimitRecovery -> continueAfterRateLimit two-step and its settle delay. */
+  attemptContinue(threadId: string): Promise<RecoveryAttemptResult>;
+}
+
+/** Tag for logging/observability only — must never change planSweep's judgement. */
+export type SweepTrigger = "reactive" | "proactive-switch" | "periodic";
+
+export interface SweepResult {
+  trigger: SweepTrigger;
+  attempted: string[];
+  continued: string[];
+  dropped: string[];
+  waiting: number;
+}
+
+export interface RecoverySweeper {
+  /**
+   * Call exactly once per thread.failed event AFTER isLimitError(error) is
+   * true. Idempotent per threadId: repeat failures refresh lastFailedAt but
+   * preserve firstFailedAt/attempts, so cooldown/give-up math isn't reset by
+   * a thread that keeps failing.
+   */
+  onLimitFailure(threadId: string, providerId: string, now?: number): Promise<void>;
+  /**
+   * Call after ANY successful account switch, AND on every watch tick even
+   * when nothing switched — an account can regain capacity on its own
+   * (5h/7d window rolling forward) with no switch event to hang a sweep off
+   * of. Never throws for expected failure modes; those are reflected in the
+   * returned result. Not reentrant — a sweep already in flight makes a
+   * concurrent call return a zero-progress result rather than double-attempt
+   * a candidate.
+   */
+  sweep(trigger: SweepTrigger, now?: number): Promise<SweepResult>;
+}
+
+export interface RecoverySweeperDeps {
+  store: StuckThreadStore;
+  status: ThreadStatusPort;
+  recovery: ThreadRecoveryPort;
+  policy: RecoveryPolicy;
+  now?: () => number;
+  log?: (msg: string) => void;
+}
+
+export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweeper {
+  const now = deps.now ?? Date.now;
+  const log = deps.log ?? (() => {});
+  let sweeping = false;
+
+  async function onLimitFailure(threadId: string, providerId: string, at: number = now()): Promise<void> {
+    const existing = (await deps.store.list()).find((r) => r.threadId === threadId);
+    await deps.store.upsert({
+      threadId,
+      providerId,
+      firstFailedAt: existing?.firstFailedAt ?? at,
+      lastFailedAt: at,
+      lastAttemptAt: existing?.lastAttemptAt ?? null,
+      attempts: existing?.attempts ?? 0,
+    });
+  }
+
+  async function sweep(trigger: SweepTrigger, at: number = now()): Promise<SweepResult> {
+    const result: SweepResult = { trigger, attempted: [], continued: [], dropped: [], waiting: 0 };
+    if (sweeping) return result;
+    sweeping = true;
+    try {
+      const candidates = await deps.store.list();
+      const plan = planSweep(candidates, at, deps.policy);
+      result.waiting = plan.waiting.length;
+
+      for (const threadId of plan.drop) {
+        await deps.store.remove(threadId);
+        result.dropped.push(threadId);
+      }
+
+      for (const candidate of plan.attempt) {
+        try {
+          const status = await deps.status.getStatus(candidate.threadId);
+          if (status !== "error") {
+            // Resolved elsewhere (provider-retry, a human, a prior sweep) —
+            // not an attempt, not a drop, just quietly no longer tracked.
+            await deps.store.remove(candidate.threadId);
+            continue;
+          }
+          result.attempted.push(candidate.threadId);
+          const outcome = await deps.recovery.attemptContinue(candidate.threadId);
+          if (outcome.outcome === "continued") {
+            await deps.store.remove(candidate.threadId);
+            result.continued.push(candidate.threadId);
+          } else {
+            await deps.store.upsert({ ...candidate, lastAttemptAt: at, attempts: candidate.attempts + 1 });
+          }
+        } catch (e) {
+          // One bad candidate must never abort the rest of the sweep.
+          log(`sweep: ${candidate.threadId} failed: ${e instanceof Error ? e.message : e}`);
+        }
+      }
+    } finally {
+      sweeping = false;
+    }
+    return result;
+  }
+
+  return { onLimitFailure, sweep };
+}

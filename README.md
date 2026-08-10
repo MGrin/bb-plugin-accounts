@@ -28,10 +28,19 @@ moves to the candidate with the lowest `max(5h, 7d)` among accounts whose usage 
 fresh, subject to a cooldown.
 
 **Reactive switching** — this is the useful part. bb emits `thread.failed`; when the
-error is a rate limit the plugin switches accounts and then calls bb's rate-limit
-recovery to **continue the failed thread**, so long-running work survives a limit
-instead of dying at it. It complements bb's builtin `provider-retry` plugin, which
-*waits* for the window to reset on the single account bb knows about; this one *moves*.
+error is a rate limit the plugin switches accounts and then sweeps every currently-stuck
+thread through bb's rate-limit recovery, so long-running work survives a limit instead of
+dying at it. It complements bb's builtin `provider-retry` plugin, which *waits* for the
+window to reset on the single account bb knows about; this one *moves*.
+
+**Recovery sweep** — resumes EVERY currently-stuck limit-failed thread, not just the one
+attached to whichever event fired. A thread that hit a limit is tracked (there is no
+server-side way to ask bb for "every errored thread"); every proactive tick and every
+reactive switch then sweeps the tracked set, re-verifying each thread is still `error`
+before attempting it, so a thread already fixed elsewhere (bb's own `provider-retry`, a
+human) quietly falls out of tracking instead of being retried. Bounded by
+`recoveryCooldownSec`/`recoveryMaxAttempts`/`recoveryGiveUpAfterHours` so a thread that
+keeps failing for a non-limit reason is never retried forever.
 
 **Model downgrade before account switch** — if the failing model has its own ceiling but
 the account's overall window still has room, the thread is continued on a lower-tier
@@ -59,6 +68,9 @@ that contract. Issues and PRs generalizing this are welcome.
 | `downgradeModel` | `claude-opus-5[1m]` | model to continue on when only the top model's ceiling was hit |
 | `cooldownSec` | `120` | minimum seconds between switches |
 | `staleAfterMin` | `15` | usage data older than this is ignored |
+| `recoveryCooldownSec` | `120` | minimum seconds between resume attempts on the same stuck thread |
+| `recoveryMaxAttempts` | `5` | give up resuming a thread after this many failed attempts (`0` = unlimited) |
+| `recoveryGiveUpAfterHours` | `6` | give up resuming a thread this long after it first got stuck (`0` = never) |
 
 ## A note on multiple accounts
 
