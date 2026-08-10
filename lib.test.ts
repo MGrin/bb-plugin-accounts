@@ -5,7 +5,7 @@
 // equally-dead account, and thrash.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type AccountUsage, decideSwitch, pickBest, type SwitchPolicy, worst } from "./lib.ts";
+import { type AccountUsage, decideSwitch, isLimitError, pickBest, type SwitchPolicy, worst } from "./lib.ts";
 
 const POLICY: SwitchPolicy = { switchAt: 97, spreadMargin: 25, cooldownSec: 120, spreadCooldownSec: 1800 };
 const acct = (slot: string, fiveHour: number | null, sevenDay: number | null, active = false): AccountUsage =>
@@ -93,4 +93,31 @@ test("ties break deterministically, so a tie cannot flap between two slots", () 
   if (first.action === "none" || again.action === "none") assert.fail("expected a switch both ways round");
   assert.equal(first.to, "b");
   assert.equal(again.to, "b");
+});
+
+test("isLimitError catches every limit wording the vendor has actually sent", () => {
+  // The 2026-08-10 outage: this exact string matched nothing and six threads
+  // stayed stopped while two accounts sat idle.
+  assert.ok(isLimitError("You've hit your session limit · resets 6pm (Asia/Makassar)"));
+  assert.ok(isLimitError("Claude AI usage limit reached|1754812800"));
+  assert.ok(isLimitError("You've reached your weekly limit for Claude Opus"));
+  assert.ok(isLimitError("rate_limit_error"));
+  assert.ok(isLimitError("HTTP 429 Too Many Requests"));
+  assert.ok(isLimitError("Your subscription has reached its limit for this window"));
+  assert.ok(isLimitError("You are out of quota for this model"));
+});
+
+test("isLimitError ignores the ordinary ways a thread dies", () => {
+  // A false positive burns a fresh account on a bug that will fail there too.
+  for (const e of [
+    "Error: ENOENT no such file or directory",
+    "TypeError: cannot read properties of undefined",
+    "Tool use failed: permission denied",
+    "session ended by user",
+    "Connection reset by peer",
+    "AbortError: The operation was aborted",
+    "",
+    null,
+    undefined,
+  ]) assert.equal(isLimitError(e), false, `should not match: ${JSON.stringify(e)}`);
 });
