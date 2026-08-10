@@ -24,6 +24,30 @@ export interface SwitchPolicy {
   cooldownSec: number;
   /** Seconds since the last switch below which only an URGENT switch may happen. */
   spreadCooldownSec: number;
+  /**
+   * 7d % at which the active slot must be abandoned. Deliberately LOWER than
+   * switchAt: a 5-hour window can be waited out, a weekly one resets on a
+   * calendar date. Also caps which slots may be switched INTO.
+   */
+  weeklyAt?: number;
+  /** Seconds ahead the burn rate is projected. Matches the poller's interval. */
+  pollIntervalSec?: number;
+}
+
+const WEEKLY_AT = 95;
+const POLL_INTERVAL_S = 180;
+
+/** The previous 5h reading for the SAME slot, for measuring a burn rate. */
+export interface PrevSample {
+  slot: string;
+  fiveHour: number;
+  polledAt: number;
+}
+
+/** Current sample time plus the prior reading, when one exists. */
+export interface VelocityInput {
+  polledAt: number;
+  prev: PrevSample | null;
 }
 
 export type SwitchDecision =
@@ -46,11 +70,35 @@ export const worst = (a: AccountUsage): number => Math.max(a.fiveHour ?? 0, a.se
  * whose 5h is unknown (an unpolled account only LOOKS free), and anything whose
  * week is spent (switching in trips again on the next poll).
  */
-export function pickBest(accounts: AccountUsage[], exceptSlot: string): AccountUsage | null {
+export function pickBest(
+  accounts: AccountUsage[],
+  exceptSlot: string,
+  weeklyAt: number = WEEKLY_AT,
+): AccountUsage | null {
   const candidates = accounts
-    .filter((a) => a.slot !== exceptSlot && a.fiveHour !== null && (a.sevenDay ?? 0) < 100)
+    .filter((a) => a.slot !== exceptSlot && a.fiveHour !== null && (a.sevenDay ?? 0) < weeklyAt)
     .sort((a, b) => worst(a) - worst(b) || a.slot.localeCompare(b.slot));
   return candidates[0] ?? null;
+}
+
+/**
+ * Points per second the active slot's 5h window is burning, or null when that
+ * cannot be known.
+ *
+ * `prev.slot` is load-bearing. A switch resets the series: two accounts'
+ * readings are not one sequence, and subtracting across a switch invents a burn
+ * rate out of unrelated numbers. Python guards this the same way, by only
+ * carrying `_prev_five_hour` forward when the active slot is unchanged.
+ *
+ * A single reading has no rate. A falling rate is not a rate worth acting on —
+ * only an upward burn can hit a wall.
+ */
+function burnRate(activeSlot: string, activeFive: number, v: VelocityInput | undefined): number | null {
+  if (!v?.prev || v.prev.slot !== activeSlot) return null;
+  const dt = v.polledAt - v.prev.polledAt;
+  if (!(dt > 0)) return null;
+  const rate = (activeFive - v.prev.fiveHour) / dt;
+  return rate > 0 ? rate : null;
 }
 
 /**
@@ -61,11 +109,22 @@ export function pickBest(accounts: AccountUsage[], exceptSlot: string): AccountU
  * one, because a stalled thread costs more than a churned Keychain, while a
  * SPREAD move waits out the long one, because it is an optimization and
  * optimizations must not thrash.
+ *
+ * Three things make a move URGENT, and each was bought with an outage:
+ *  - BURST: 5h at or past switchAt.
+ *  - WEEKLY: 7d at or past weeklyAt. 2026-07-31 — active sat at 7d 100% / 5h 13%
+ *    with two idle slots, and a fresh-looking 5-hour window kept a dead account
+ *    in place because only spread could move it.
+ *  - VELOCITY: the burn rate says the NEXT sample lands past switchAt.
+ *    2026-08-09 — read 90% and was walled before the next 180s poll. A static
+ *    threshold assumes the next sample arrives in time; a fast fleet means it
+ *    does not.
  */
 export function decideSwitch(
   accounts: AccountUsage[],
   policy: SwitchPolicy,
   sinceLastSwitchSec: number,
+  velocity?: VelocityInput,
 ): SwitchDecision {
   if (sinceLastSwitchSec < policy.cooldownSec) {
     return { action: "none", reason: `cooldown (${Math.round(sinceLastSwitchSec)}s < ${policy.cooldownSec}s)` };
@@ -73,20 +132,36 @@ export function decideSwitch(
   const active = accounts.find((a) => a.active);
   if (!active) return { action: "none", reason: "no active account in the usage cache" };
 
-  const best = pickBest(accounts, active.slot);
+  const weeklyAt = policy.weeklyAt ?? WEEKLY_AT;
+  const horizon = policy.pollIntervalSec ?? POLL_INTERVAL_S;
+
+  const best = pickBest(accounts, active.slot, weeklyAt);
   if (!best) return { action: "none", reason: "no eligible alternative slot" };
 
   const activeFive = active.fiveHour ?? 0;
-  if (activeFive >= policy.switchAt) {
+  const activeSeven = active.sevenDay ?? 0;
+  const rate = burnRate(active.slot, activeFive, velocity);
+  const projected = rate === null ? null : activeFive + rate * horizon;
+
+  let why: string | null = null;
+  if (activeSeven >= weeklyAt) {
+    why = `7d ${activeSeven}% >= ${weeklyAt}% (a week does not wait out)`;
+  } else if (activeFive >= policy.switchAt) {
+    why = `5h ${activeFive}% >= ${policy.switchAt}%`;
+  } else if (projected !== null && projected >= policy.switchAt) {
+    why = `velocity: 5h ${activeFive}% projected ~${projected.toFixed(0)}% >= ${policy.switchAt}% by next poll`;
+  }
+
+  if (why !== null) {
     // Only move if the destination is actually better on its worst window —
     // otherwise this is a switch into the same wall, one slot over.
-    if (worst(best) >= activeFive) {
-      return { action: "none", reason: `active at ${activeFive}% but ${best.slot} is no better (${worst(best)}%)` };
+    if (worst(best) >= worst(active)) {
+      return { action: "none", reason: `active at ${worst(active)}% but ${best.slot} is no better (${worst(best)}%)` };
     }
     return {
       action: "urgent",
       to: best.slot,
-      reason: `proactive: 5h ${activeFive}% >= ${policy.switchAt}% (best alternative ${best.slot} at ${worst(best)}%)`,
+      reason: `proactive: ${why} (best alternative ${best.slot} at ${worst(best)}%)`,
     };
   }
 
