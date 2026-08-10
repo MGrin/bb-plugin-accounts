@@ -42,6 +42,15 @@ human) quietly falls out of tracking instead of being retried. Bounded by
 `recoveryCooldownSec`/`recoveryMaxAttempts`/`recoveryGiveUpAfterHours` so a thread that
 keeps failing for a non-limit reason is never retried forever.
 
+**Capacity gating** — those bounds measure "this thread looks unrecoverable", which is not
+what an outage means. When EVERY account is walled the sweep holds: no attempts, and
+critically no drops, with the dry time banked in `stalledMs` and excluded from the give-up
+clock. Without this, the shipped defaults (5 attempts, 120s apart) dropped every stuck
+thread 10 minutes into a dry spell — while the soonest account reset was still 87 minutes
+away, so the threads were abandoned long before the capacity they were waiting for
+arrived. A stale usage cache counts as capacity available: a broken poller must not be
+able to freeze recovery.
+
 **Model downgrade before account switch** — if the failing model has its own ceiling but
 the account's overall window still has room, the thread is continued on a lower-tier
 model rather than burning a fresh account.

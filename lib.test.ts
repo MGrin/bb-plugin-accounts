@@ -364,3 +364,99 @@ test("onLimitFailure preserves firstFailedAt and attempts across repeat failures
   assert.equal(record.lastFailedAt, T);
   assert.equal(record.attempts, 0);
 });
+
+// ── capacity gating: a dry spell must not be charged to the thread ───────────
+// Asked 2026-08-10: "when all accounts are unusable, will the threads still be
+// resumed once one frees up?" With the live defaults they would NOT have been —
+// 5 attempts 120s apart drops everything 10 minutes in, and the soonest reset
+// was 87 minutes away.
+
+const NO_CAPACITY = (sinceLastSweepMs = 120_000) => ({ available: false, sinceLastSweepMs });
+
+test("cornered: no capacity means no attempts and — critically — no drops", () => {
+  // Both give-up rules would fire here: attempts exhausted AND stuck 7h.
+  const plan = planSweep(
+    [stuck("a", T - 7 * 3600 * 1000, T - 200_000, 5), stuck("b", T, null, 0)],
+    T,
+    RPOLICY,
+    NO_CAPACITY(),
+  );
+  assert.deepEqual(plan.attempt, [], "attempting while every account is walled is doomed by definition");
+  assert.deepEqual(plan.drop, [], "dropping here loses a thread that was only ever waiting for capacity");
+  assert.deepEqual(plan.waiting, ["a", "b"]);
+  assert.equal(plan.stallCreditMs, 120_000);
+});
+
+test("the attempts budget survives a long dry spell", () => {
+  // 87 minutes cornered — the real gap to scani's reset — at one sweep per 2min.
+  let rec = stuck("a", T, null, 0);
+  for (let i = 0; i < 44; i++) {
+    const at = T + i * 120_000;
+    const plan = planSweep([rec], at, RPOLICY, NO_CAPACITY());
+    assert.deepEqual(plan.drop, [], `dropped at sweep ${i}`);
+    assert.deepEqual(plan.attempt, [], `attempted at sweep ${i}`);
+    rec = { ...rec, stalledMs: (rec.stalledMs ?? 0) + plan.stallCreditMs };
+  }
+  assert.equal(rec.attempts, 0, "not one attempt spent on a doomed retry");
+
+  // Capacity returns: the thread is still tracked and immediately eligible.
+  const after = planSweep([rec], T + 44 * 120_000, RPOLICY);
+  assert.deepEqual(after.attempt.map((r) => r.threadId), ["a"]);
+});
+
+test("stalled time is excluded from the give-up clock", () => {
+  // Stuck 7h wall-clock, 6h of it with nothing able to serve it. Only 1h counts.
+  const rec = { ...stuck("a", T - 7 * 3600 * 1000, null, 0), stalledMs: 6 * 3600 * 1000 };
+  assert.deepEqual(planSweep([rec], T, RPOLICY).drop, [], "6h of outage is not the thread's fault");
+
+  // Without the credit the same record is dropped — proving the field is doing the work.
+  assert.deepEqual(planSweep([stuck("a", T - 7 * 3600 * 1000, null, 0)], T, RPOLICY).drop, ["a"]);
+});
+
+test("a thread genuinely past give-up is still dropped once capacity exists", () => {
+  const rec = { ...stuck("a", T - 7 * 3600 * 1000, null, 0), stalledMs: 30 * 60 * 1000 };
+  assert.deepEqual(planSweep([rec], T, RPOLICY).drop, ["a"], "6.5h of SERVABLE time is a real give-up");
+});
+
+test("the sweeper holds while cornered, then resumes when capacity returns", async () => {
+  let capacity = false;
+  const records = new Map<string, StuckThreadRecord>();
+  const attempts: string[] = [];
+  let clock = T;
+
+  const sweeper = createRecoverySweeper({
+    store: {
+      list: async () => [...records.values()],
+      upsert: async (r) => void records.set(r.threadId, r),
+      remove: async (id) => void records.delete(id),
+    },
+    status: { getStatus: async () => "error" },
+    recovery: {
+      attemptContinue: async (id) => {
+        attempts.push(id);
+        return capacity ? { outcome: "continued" } : { outcome: "error", message: "rate limited" };
+      },
+    },
+    hasCapacity: async () => capacity,
+    policy: RPOLICY,
+    now: () => clock,
+  });
+
+  await sweeper.onLimitFailure("thr_1", "claude-code");
+  await sweeper.onLimitFailure("thr_2", "claude-code");
+
+  for (let i = 0; i < 44; i++) {
+    clock = T + i * 120_000;
+    const r = await sweeper.sweep("periodic");
+    assert.equal(r.stalled, true);
+    assert.deepEqual(r.dropped, []);
+  }
+  assert.deepEqual(attempts, [], "87 minutes cornered without a single wasted attempt");
+  assert.equal(records.size, 2, "both threads still tracked and waiting");
+
+  capacity = true;
+  clock = T + 44 * 120_000;
+  const done = await sweeper.sweep("proactive-switch");
+  assert.deepEqual(done.continued.sort(), ["thr_1", "thr_2"]);
+  assert.equal(records.size, 0, "nothing left stuck");
+});

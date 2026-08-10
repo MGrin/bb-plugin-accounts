@@ -221,6 +221,13 @@ export interface StuckThreadRecord {
   lastAttemptAt: number | null;
   /** Count of attemptContinue calls that came back not-eligible/error. */
   attempts: number;
+  /**
+   * Milliseconds this thread has spent stuck while the MACHINE had no capacity
+   * — every account walled. Excluded from the give-up clock, because that clock
+   * is meant to measure "this thread looks unrecoverable", and a dry spell says
+   * nothing about the thread. Absent on records written before this existed.
+   */
+  stalledMs?: number;
 }
 
 export interface RecoveryPolicy {
@@ -237,9 +244,21 @@ export interface SweepPlan {
   attempt: StuckThreadRecord[];
   /** threadIds to stop tracking this tick (maxAttempts or giveUpAfterSec exceeded). */
   drop: string[];
-  /** threadIds still tracked but skipped this tick (under attemptCooldownSec). */
+  /** threadIds still tracked but skipped this tick (under attemptCooldownSec, or cornered). */
   waiting: string[];
+  /** ms to add to every tracked record's stalledMs. Nonzero only while cornered. */
+  stallCreditMs: number;
 }
+
+/** What the machine could serve right now, from the sweeper's point of view. */
+export interface SweepCapacity {
+  /** False when EVERY account is walled, so any attempt is doomed before it is made. */
+  available: boolean;
+  /** ms since the previous sweep — credited to stall time while unavailable. */
+  sinceLastSweepMs: number;
+}
+
+const FULL_CAPACITY: SweepCapacity = { available: true, sinceLastSweepMs: 0 };
 
 /**
  * Pure: no clock reads, no I/O. `now` and `candidates` are the entire input,
@@ -247,8 +266,32 @@ export interface SweepPlan {
  * this decision — that is a fact the impure sweep() re-checks per candidate
  * right before attempting, since it can change for reasons this module never
  * causes (provider-retry, a human, an earlier sweep).
+ *
+ * CAPACITY GATES EVERYTHING. When no account can serve a request, this returns
+ * no attempts and — critically — no drops.
+ *
+ * Both give-up rules measure "this thread looks unrecoverable". Neither means
+ * that while the whole machine is walled: an attempt that fails because every
+ * account is spent says nothing about the thread. Spending the budget anyway is
+ * how the 2026-08-10 shape ends badly — with the live defaults (5 attempts,
+ * 120s apart) every stuck thread was dropped 10 minutes in, while the soonest
+ * account reset was still 87 minutes away. The threads would have been given up
+ * on long before the capacity they were waiting for arrived.
  */
-export function planSweep(candidates: StuckThreadRecord[], now: number, policy: RecoveryPolicy): SweepPlan {
+export function planSweep(
+  candidates: StuckThreadRecord[],
+  now: number,
+  policy: RecoveryPolicy,
+  capacity: SweepCapacity = FULL_CAPACITY,
+): SweepPlan {
+  if (!capacity.available) {
+    return {
+      attempt: [],
+      drop: [],
+      waiting: candidates.map((c) => c.threadId),
+      stallCreditMs: Math.max(0, capacity.sinceLastSweepMs),
+    };
+  }
   const drop: string[] = [];
   const waiting: string[] = [];
   const eligible: StuckThreadRecord[] = [];
@@ -258,7 +301,8 @@ export function planSweep(candidates: StuckThreadRecord[], now: number, policy: 
       drop.push(c.threadId);
       continue;
     }
-    if (policy.giveUpAfterSec > 0 && now - c.firstFailedAt > policy.giveUpAfterSec * 1000) {
+    // Stuck time only counts while the machine could actually have served it.
+    if (policy.giveUpAfterSec > 0 && now - c.firstFailedAt - (c.stalledMs ?? 0) > policy.giveUpAfterSec * 1000) {
       drop.push(c.threadId);
       continue;
     }
@@ -270,7 +314,7 @@ export function planSweep(candidates: StuckThreadRecord[], now: number, policy: 
   }
 
   eligible.sort((a, b) => a.firstFailedAt - b.firstFailedAt || a.threadId.localeCompare(b.threadId));
-  return { attempt: eligible, drop, waiting };
+  return { attempt: eligible, drop, waiting, stallCreditMs: 0 };
 }
 
 export type ThreadStatus = "error" | "active" | "starting" | "idle" | "stopping" | "not-found";
@@ -304,6 +348,8 @@ export interface SweepResult {
   continued: string[];
   dropped: string[];
   waiting: number;
+  /** True when the sweep held because no account had capacity. */
+  stalled?: boolean;
 }
 
 export interface RecoverySweeper {
@@ -331,6 +377,12 @@ export interface RecoverySweeperDeps {
   status: ThreadStatusPort;
   recovery: ThreadRecoveryPort;
   policy: RecoveryPolicy;
+  /**
+   * Can ANY account serve a request right now? When this says no, the sweep
+   * holds instead of spending attempts on a doomed retry. Omitted = always
+   * available, which is the pre-capacity behaviour.
+   */
+  hasCapacity?: () => Promise<boolean>;
   now?: () => number;
   log?: (msg: string) => void;
 }
@@ -339,6 +391,7 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => {});
   let sweeping = false;
+  let lastSweepAt: number | null = null;
 
   async function onLimitFailure(threadId: string, providerId: string, at: number = now()): Promise<void> {
     const existing = (await deps.store.list()).find((r) => r.threadId === threadId);
@@ -358,8 +411,22 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
     sweeping = true;
     try {
       const candidates = await deps.store.list();
-      const plan = planSweep(candidates, at, deps.policy);
+      const available = deps.hasCapacity ? await deps.hasCapacity() : true;
+      const sinceLastSweepMs = lastSweepAt === null ? 0 : at - lastSweepAt;
+      lastSweepAt = at;
+
+      const plan = planSweep(candidates, at, deps.policy, { available, sinceLastSweepMs });
       result.waiting = plan.waiting.length;
+      result.stalled = !available;
+
+      // Bank the dry time against every tracked thread so the give-up clock
+      // does not run out during an outage the thread had no part in.
+      if (plan.stallCreditMs > 0) {
+        for (const c of candidates) {
+          await deps.store.upsert({ ...c, stalledMs: (c.stalledMs ?? 0) + plan.stallCreditMs });
+        }
+        log(`sweep(${trigger}): no account has capacity — holding ${candidates.length} thread(s), no attempts spent`);
+      }
 
       for (const threadId of plan.drop) {
         await deps.store.remove(threadId);

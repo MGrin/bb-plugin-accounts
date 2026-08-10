@@ -215,10 +215,26 @@ export default async function plugin(bb: BbPluginApi) {
   // Snapshotted at load, like the rest of this plugin's config surface
   // requires `bb plugin reload accounts` to pick up a settings change.
   const recoverySettings = await settings.get();
+
+  /**
+   * Could ANY account serve a request right now?
+   *
+   * A stale cache answers YES. A broken poller must not be able to freeze
+   * recovery — an attempt that turns out to be doomed only costs one retry,
+   * while refusing to attempt for hours costs the whole night.
+   */
+  async function anyAccountHasCapacity(): Promise<boolean> {
+    const { polledAt, accounts } = await readUsage();
+    if (accounts.length === 0 || (await isStale(polledAt))) return true;
+    const weeklyAt = Number(recoverySettings.weeklyAt);
+    return accounts.some((a) => (a.fiveHour ?? 100) < 100 && (a.sevenDay ?? 100) < weeklyAt);
+  }
+
   const sweeper = createRecoverySweeper({
     store: stuckThreadsStore,
     status: threadStatus,
     recovery: threadRecovery,
+    hasCapacity: anyAccountHasCapacity,
     policy: {
       attemptCooldownSec: Number(recoverySettings.recoveryCooldownSec),
       maxAttempts: Number(recoverySettings.recoveryMaxAttempts),
@@ -259,7 +275,26 @@ export default async function plugin(bb: BbPluginApi) {
   // to once per episode: a spent fleet would otherwise alarm every two minutes
   // all night, which trains you to ignore it.
   const CORNERED_RE = /no eligible alternative slot|is no better/;
-  async function alarmIfCornered(reason: string, active: Account, switchAt: number, weeklyAt: number) {
+  /**
+   * When every account is walled, the only useful thing left to say is WHEN
+   * that stops being true. Soonest 5h reset across all slots, since that is the
+   * window that actually frees up on a human timescale.
+   */
+  function nextCapacityAt(accounts: Account[]): Date | null {
+    const times = accounts
+      .map((a) => (a.fiveHourResetsAt ? Date.parse(a.fiveHourResetsAt) : NaN))
+      .filter((t) => !Number.isNaN(t) && t > Date.now())
+      .sort((a, b) => a - b);
+    return times.length ? new Date(times[0]!) : null;
+  }
+
+  async function alarmIfCornered(
+    reason: string,
+    active: Account,
+    accounts: Account[],
+    switchAt: number,
+    weeklyAt: number,
+  ) {
     const tripping = (active.fiveHour ?? 0) >= switchAt || (active.sevenDay ?? 0) >= weeklyAt;
     if (!tripping || !CORNERED_RE.test(reason)) {
       await bb.storage.kv.delete("cornered-since");
@@ -267,7 +302,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (await bb.storage.kv.get<number>("cornered-since")) return; // already alarmed this episode
     await bb.storage.kv.set("cornered-since", Date.now());
-    const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom. Threads will stall.`;
+    const next = nextCapacityAt(accounts);
+    const stuck = (await stuckThreadsStore.list()).length;
+    const eta = next
+      ? ` Next capacity ~${next.toISOString().slice(11, 16)}Z (${Math.round((next.getTime() - Date.now()) / 60000)} min).`
+      : "";
+    const held = stuck ? ` ${stuck} thread(s) held for resume.` : "";
+    const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom.${eta}${held}`;
     bb.log.warn(`cornered: ${msg} (${reason})`);
     try {
       await run("osascript", [
@@ -308,7 +349,7 @@ export default async function plugin(bb: BbPluginApi) {
       polledAt === null ? undefined : { polledAt, prev: prev ?? null },
     );
     if (decision.action === "none") {
-      await alarmIfCornered(decision.reason, active, Number(switchAt), Number(weeklyAt));
+      await alarmIfCornered(decision.reason, active, accounts, Number(switchAt), Number(weeklyAt));
       // No switch happened, but an account can regain capacity on its own
       // (5h/7d window rolling forward) with nothing to hang a sweep off of —
       // so sweep every watch tick regardless, not only right after a switch.
