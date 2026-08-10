@@ -20,7 +20,7 @@ import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
-import { decideSwitch, isLimitError, pickBest as pickBestOf, worst } from "./lib.ts";
+import { decideSwitch, isLimitError, pickBest as pickBestOf, type PrevSample, worst } from "./lib.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -87,6 +87,7 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
     switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "97" },
+    weeklyAt: { type: "string", label: "7d utilization % that triggers a switch (and caps destinations)", default: "95" },
     downgradeModel: { type: "string", label: "Model to continue Fable threads on when only Fable's own limit is hit", default: "claude-opus-5[1m]" },
     cooldownSec: { type: "string", label: "Minimum seconds between switches", default: "120" },
     spreadMargin: {
@@ -169,8 +170,39 @@ export default async function plugin(bb: BbPluginApi) {
   //     Guarded hard, because churn costs a Keychain swap under running threads:
   //     it fires only on a wide margin (default 25 points of max(5h,7d)) and no
   //     more often than spreadCooldownSec (default 30 min).
+  // The alarm that was missing on 2026-08-10.
+  //
+  // For hours the Python switcher logged "no candidate with headroom" every 180s
+  // and told nobody, while six threads sat stopped. Every account was spent, so
+  // no decision could have helped — the gap was not judgement, it was that
+  // wanting to move and being unable to is INFORMATION and it went only to a log
+  // file nobody reads at 07:00.
+  //
+  // Fire only when the active slot is actually over a trip line AND there is
+  // nowhere to go. An ordinary quiet "none" means nothing is wrong. Rate-limited
+  // to once per episode: a spent fleet would otherwise alarm every two minutes
+  // all night, which trains you to ignore it.
+  const CORNERED_RE = /no eligible alternative slot|is no better/;
+  async function alarmIfCornered(reason: string, active: Account, switchAt: number, weeklyAt: number) {
+    const tripping = (active.fiveHour ?? 0) >= switchAt || (active.sevenDay ?? 0) >= weeklyAt;
+    if (!tripping || !CORNERED_RE.test(reason)) {
+      await bb.storage.kv.delete("cornered-since");
+      return;
+    }
+    if (await bb.storage.kv.get<number>("cornered-since")) return; // already alarmed this episode
+    await bb.storage.kv.set("cornered-since", Date.now());
+    const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom. Threads will stall.`;
+    bb.log.warn(`cornered: ${msg} (${reason})`);
+    try {
+      await run("osascript", [
+        "-e",
+        `display notification ${JSON.stringify(msg)} with title ${JSON.stringify("Claude: out of accounts")}`,
+      ], { timeout: 5_000 });
+    } catch { /* a missing notifier must not break the watch */ }
+  }
+
   bb.background.schedule("watch", "*/2 * * * *", async () => {
-    const { autoSwitch, switchAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
+    const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
     if (!autoSwitch) return;
     const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return;
@@ -178,21 +210,34 @@ export default async function plugin(bb: BbPluginApi) {
     if (!active) return;
     if (!(await activeSlotIsTrustworthy(active.slot))) return;
 
+    // The velocity trip needs two samples of the SAME slot, so carry the last
+    // reading across ticks. decideSwitch stays pure; the state lives here.
+    const prev = await bb.storage.kv.get<PrevSample>("prev-sample");
+    if (polledAt !== null && active.fiveHour !== null) {
+      await bb.storage.kv.set("prev-sample", { slot: active.slot, fiveHour: active.fiveHour, polledAt });
+    }
+
     const last = await bb.storage.kv.get<{ at: number }>("last-switch");
     const sinceSec = last ? (Date.now() - last.at) / 1000 : Number.POSITIVE_INFINITY;
     const decision = decideSwitch(
       accounts,
       {
         switchAt: Number(switchAt),
+        weeklyAt: Number(weeklyAt),
         spreadMargin: Number(spreadMargin),
         cooldownSec: Number(cooldownSec),
         spreadCooldownSec: Number(spreadCooldownSec),
       },
       sinceSec,
+      polledAt === null ? undefined : { polledAt, prev: prev ?? null },
     );
-    if (decision.action === "none") return;
+    if (decision.action === "none") {
+      await alarmIfCornered(decision.reason, active, Number(switchAt), Number(weeklyAt));
+      return;
+    }
     const target = accounts.find((a) => a.slot === decision.to);
     if (!target) return;
+    await bb.storage.kv.delete("cornered-since");
     await switchTo(target, active.slot, decision.reason);
   });
 

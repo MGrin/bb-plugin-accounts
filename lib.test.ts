@@ -121,3 +121,78 @@ test("isLimitError ignores the ordinary ways a thread dies", () => {
     undefined,
   ]) assert.equal(isLimitError(e), false, `should not match: ${JSON.stringify(e)}`);
 });
+
+// ── the trips ported from the Python switcher (2026-08-10 consolidation) ──────
+// bb is the sole brain now, so the lessons the Python side had bought and bb had
+// not come across with it. Both cases below are real incidents.
+
+const T = 1_000_000; // fixed clock — Date.now() is not allowed to leak in here
+
+test("the 2026-07-31 weekly stranding: a spent WEEK trips urgent, not spread", () => {
+  // Active was quiet on 5h and completely out of week, while two slots idled.
+  // bb could only have moved this via spread — a 25pt gap AND a 30min cooldown —
+  // so a fresh-looking 5h window kept a dead account in place.
+  const d = decideSwitch(
+    [acct("withflare", 13, 100, true), acct("scani", 0, 33), acct("mr6r1n", 0, 15)],
+    POLICY,
+    300, // inside the spread cooldown: only an URGENT decision can escape here
+  );
+  if (d.action === "none") assert.fail(`expected urgent, got none: ${d.reason}`);
+  assert.equal(d.action, "urgent");
+  assert.equal(d.to, "mr6r1n");
+  assert.match(d.reason, /7d/);
+});
+
+test("the 2026-08-09 velocity wall: trips below the threshold on projection", () => {
+  // Read 90% and was walled before the next 180s poll. A static threshold assumes
+  // the next sample arrives in time; a fast burn means it does not.
+  const d = decideSwitch(
+    [acct("a", 90, 10, true), acct("b", 0, 5)],
+    POLICY,
+    300,
+    { polledAt: T, prev: { slot: "a", fiveHour: 78, polledAt: T - 180 } },
+  );
+  if (d.action === "none") assert.fail(`expected urgent, got none: ${d.reason}`);
+  assert.equal(d.action, "urgent");
+  assert.equal(d.to, "b");
+  assert.match(d.reason, /velocity/);
+});
+
+test("the velocity series resets across a switch — two slots are not one series", () => {
+  // Same numbers, but the previous sample belongs to a DIFFERENT slot. Comparing
+  // them invents a burn rate out of two unrelated accounts.
+  const d = decideSwitch(
+    [acct("a", 90, 10, true), acct("b", 0, 5)],
+    POLICY,
+    300,
+    { polledAt: T, prev: { slot: "somebody-else", fiveHour: 78, polledAt: T - 180 } },
+  );
+  assert.equal(d.action, "none");
+  assert.match(d.reason, /spread cooldown/);
+});
+
+test("a single sample has no velocity and must not invent one", () => {
+  const d = decideSwitch([acct("a", 90, 10, true), acct("b", 0, 5)], POLICY, 300,
+    { polledAt: T, prev: null });
+  assert.equal(d.action, "none");
+  assert.match(d.reason, /spread cooldown/);
+});
+
+test("a FALLING burn rate does not project upward", () => {
+  const d = decideSwitch(
+    [acct("a", 90, 10, true), acct("b", 0, 5)],
+    POLICY,
+    300,
+    { polledAt: T, prev: { slot: "a", fiveHour: 95, polledAt: T - 180 } },
+  );
+  assert.equal(d.action, "none");
+  assert.match(d.reason, /spread cooldown/);
+});
+
+test("will not switch INTO a slot at 99% of its week", () => {
+  // The old filter was `< 100`, which let bb move into a slot that trips again on
+  // the very next tick. Python capped candidates at 95.
+  const d = decideSwitch([acct("a", 98, 10, true), acct("b", 0, 99)], POLICY, 3600);
+  assert.equal(d.action, "none");
+  assert.equal(pickBest([acct("a", 98, 10, true), acct("b", 0, 99)], "a"), null);
+});
