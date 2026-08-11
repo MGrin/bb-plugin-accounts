@@ -46,6 +46,13 @@ import { ingestUsage } from "./analytics/ingest.ts";
 import { buildProfile } from "./analytics/profile.ts";
 import { scanTranscripts } from "./analytics/scan.ts";
 import { agentShape, prettyProject } from "./analytics/transcripts.ts";
+import {
+  envIdFromPath,
+  type KnownProject,
+  normalizeRemote,
+  resolveRepo,
+  threadIdFromPath,
+} from "./analytics/repos.ts";
 import { MIGRATIONS } from "./analytics/schema.ts";
 import { DEFAULT_POLICY, estimateSevenPerFive, type SimAccount } from "./analytics/simulate.ts";
 import {
@@ -61,7 +68,10 @@ import {
   readWindowPairs,
   readModelWeights,
   transcriptCoverage,
+  repoResolutionSources,
+  unresolvedCwds,
   writeCursor,
+  writeCwdRepo,
   writeModelWeights,
   writeTranscriptRows,
 } from "./analytics/store.ts";
@@ -120,6 +130,7 @@ export const rpcContract = defineRpcContract({
       byModel: z.array(burnSliceShape),
       byAgent: z.array(burnSliceShape),
       byProject: z.array(burnSliceShape),
+      byRepo: z.array(burnSliceShape),
       byHourOfWeek: z.array(z.object({ dayOfWeek: z.number(), hour: z.number(), weightedK: z.number() })),
     }),
   },
@@ -528,6 +539,91 @@ export default async function plugin(bb: BbPluginApi) {
   // anywhere near the path that decides whether to switch accounts. After the
   // backfill each run reads kilobytes, because a file whose (size, mtime) match
   // its stored cursor is never opened at all.
+  // ── cwd -> GitHub repo ───────────────────────────────────────────────────
+  //
+  // "Which repo did that go to" cannot be answered from the transcript alone:
+  // it records a working directory, and 65 of this machine's 145 directories
+  // no longer exist because bb worktrees are disposable. bb's own project
+  // records survive that, so they are asked first; git is the most
+  // authoritative source but the least available. resolveRepo owns the order
+  // and is tested; this function only fetches what it needs.
+
+  /** bb projects that actually map to a GitHub repo, keyed by project id. */
+  async function knownProjects(): Promise<{ list: KnownProject[]; byId: Map<string, string> }> {
+    const list: KnownProject[] = [];
+    const byId = new Map<string, string>();
+    try {
+      const res = (await bb.sdk.projects.list()) as unknown;
+      const rows = (Array.isArray(res) ? res : ((res as { projects?: unknown[] })?.projects ?? [])) as Array<{
+        id?: string;
+        name?: string;
+        gitRemoteUrl?: string | null;
+        sources?: Array<{ path?: string | null }>;
+      }>;
+      for (const row of rows) {
+        // No remote means no repo — bb's personal project is the case that
+        // matters, and labelling its 22% of burn with a repo name would be
+        // inventing one.
+        const name = normalizeRemote(row.gitRemoteUrl) ?? null;
+        if (!name) continue;
+        const paths = (row.sources ?? []).map((src) => src?.path).filter((p): p is string => !!p);
+        list.push({ name, paths });
+        if (row.id) byId.set(row.id, name);
+      }
+    } catch (e) {
+      bb.log.warn(`project list failed, repo attribution will fall back to git: ${e instanceof Error ? e.message : e}`);
+    }
+    return { list, byId };
+  }
+
+  async function projectForPath(cwd: string, byId: Map<string, string>): Promise<string | null> {
+    const envId = envIdFromPath(cwd);
+    if (envId) {
+      try {
+        const env = (await bb.sdk.environments.get({ environmentId: envId })) as { projectId?: string };
+        return env?.projectId ? (byId.get(env.projectId) ?? null) : null;
+      } catch {
+        return null; // a retired environment is expected, not exceptional
+      }
+    }
+    const threadId = threadIdFromPath(cwd);
+    if (threadId) {
+      try {
+        const thread = (await bb.sdk.threads.get({ threadId })) as { projectId?: string };
+        return thread?.projectId ? (byId.get(thread.projectId) ?? null) : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  async function gitRemoteFor(cwd: string): Promise<string | null> {
+    try {
+      const { stdout } = await run("git", ["-C", cwd, "config", "--get", "remote.origin.url"], { timeout: 5_000 });
+      return stdout.trim() || null;
+    } catch {
+      return null; // directory gone, or not a repo
+    }
+  }
+
+  /** Resolve every directory that has no cached answer. Cheap after the first pass. */
+  async function resolveRepos(): Promise<number> {
+    const pending = unresolvedCwds(db);
+    if (pending.length === 0) return 0;
+    const { list, byId } = await knownProjects();
+    const now = Math.floor(Date.now() / 1000);
+    for (const cwd of pending) {
+      const environmentProject = await projectForPath(cwd, byId);
+      // Only pay for a git call when the cheaper, durable layers came up empty.
+      const needsGit = !environmentProject;
+      const gitRemote = needsGit ? await gitRemoteFor(cwd) : null;
+      const { repo, source } = resolveRepo(cwd, { projects: list, environmentProject, gitRemote });
+      writeCwdRepo(db, cwd, repo, source, now);
+    }
+    return pending.length;
+  }
+
   const TRANSCRIPT_ROOT = `${os.homedir()}/.claude/projects`;
   let indexing = false;
 
@@ -549,10 +645,12 @@ export default async function plugin(bb: BbPluginApi) {
         written += writeTranscriptRows(db, rows);
         writeCursor(db, filePath, cursor);
       });
+      const resolved = await resolveRepos();
       const cov = transcriptCoverage(db);
       return (
         `indexed ${written} new message(s) from ${result.filesRead}/${result.filesSeen} transcript(s) ` +
-        `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} total`
+        `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} total` +
+        (resolved ? `, resolved ${resolved} new working director${resolved === 1 ? "y" : "ies"} to repos` : "")
       );
     } finally {
       indexing = false;
@@ -812,6 +910,7 @@ export default async function plugin(bb: BbPluginApi) {
         coverage: transcriptCoverage(db),
         byModel: burnBy(db, "model", since),
         byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((x) => ({ ...x, key: agentShape(x.key) }))),
+        byRepo: burnBy(db, "repo", since).slice(0, 12),
         byProject: mergeByKey(
           burnBy(db, "project", since).map((x) => ({ ...x, key: prettyProject(x.key) })),
         ).slice(0, 12),
@@ -914,6 +1013,8 @@ export default async function plugin(bb: BbPluginApi) {
           coverage: transcriptCoverage(db),
           byModel: burnBy(db, "model", since),
           byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((s) => ({ ...s, key: agentShape(s.key) }))),
+          byRepo: burnBy(db, "repo", since).slice(0, 15),
+          repoSources: repoResolutionSources(db),
           byProject: mergeByKey(
             burnBy(db, "project", since).map((s) => ({ ...s, key: prettyProject(s.key) })),
           ).slice(0, 15),
@@ -938,7 +1039,8 @@ export default async function plugin(bb: BbPluginApi) {
           "",
           ...section("by model", payload.byModel),
           ...section("by who spent it", payload.byAgent),
-          ...section("by project", payload.byProject),
+          ...section("by repo", payload.byRepo),
+          ...section("by directory", payload.byProject),
         ];
         return { exitCode: 0, stdout: out.join("\n") };
       }

@@ -252,12 +252,25 @@ export interface BurnSlice {
   weightedK: number;
 }
 
-export type BurnDimension = "model" | "entrypoint" | "project";
+export type BurnDimension = "model" | "entrypoint" | "project" | "repo";
 
 // `project` groups on cwd, which keeps its path separators — see prettyProject.
 
 /** Burn grouped by one of the breakdown dimensions, biggest first. */
 export function burnBy(db: Database, dimension: BurnDimension, sinceEpochSec: number): BurnSlice[] {
+  // Repo lives in its own table, so it is a join rather than a column.
+  if (dimension === "repo") {
+    const rows = db
+      .prepare(
+        `SELECT COALESCE(r.repo, 'unresolved') AS key, COUNT(*) AS messages,
+                SUM(${WEIGHTED}) / 1000.0 AS weighted_k
+           FROM transcript_msg m LEFT JOIN cwd_repo r ON r.cwd = m.cwd
+          WHERE m.ts >= ?
+          GROUP BY key ORDER BY weighted_k DESC`,
+      )
+      .all(sinceEpochSec) as { key: string; messages: number; weighted_k: number }[];
+    return rows.map((r) => ({ key: r.key, messages: r.messages, weightedK: r.weighted_k ?? 0 }));
+  }
   // The column name is chosen from a closed set, never interpolated from input.
   const column = dimension === "model" ? "model" : dimension === "entrypoint" ? "entrypoint" : "cwd";
   const rows = db
@@ -399,6 +412,31 @@ export function readModelWeights(db: Database): { weights: Record<string, number
     fittedAt = fittedAt === null ? r.fitted_at : Math.max(fittedAt, r.fitted_at);
   }
   return { weights, fittedAt };
+}
+
+/** Directories seen in transcripts that have no cached repo resolution yet. */
+export function unresolvedCwds(db: Database, limit = 500): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT m.cwd AS cwd FROM transcript_msg m
+         LEFT JOIN cwd_repo r ON r.cwd = m.cwd
+        WHERE m.cwd IS NOT NULL AND r.cwd IS NULL LIMIT ?`,
+    )
+    .all(limit) as { cwd: string }[];
+  return rows.map((r) => r.cwd);
+}
+
+export function writeCwdRepo(db: Database, cwd: string, repo: string, source: string, at: number): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO cwd_repo (cwd, repo, source, resolved_at) VALUES (?, ?, ?, ?)`,
+  ).run(cwd, repo, source, at);
+}
+
+/** How each layer of the resolver is doing — surfaced so a bad label is traceable. */
+export function repoResolutionSources(db: Database): Array<{ source: string; cwds: number }> {
+  return db
+    .prepare(`SELECT source, COUNT(*) AS cwds FROM cwd_repo GROUP BY source ORDER BY cwds DESC`)
+    .all() as Array<{ source: string; cwds: number }>;
 }
 
 export interface TranscriptCoverage {

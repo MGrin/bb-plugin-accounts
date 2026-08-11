@@ -142,4 +142,18 @@ export const MIGRATIONS: string[] = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_transcript_ts ON transcript_msg (ts)`,
   `CREATE INDEX IF NOT EXISTS idx_transcript_entrypoint ON transcript_msg (entrypoint)`,
+
+  // Working directory -> GitHub repo, resolved once and cached.
+  //
+  // Cached rather than computed per query because resolution is not pure: it
+  // shells out to git and asks bb about environments. `source` records WHICH
+  // layer answered, so a label that looks wrong can be traced instead of
+  // argued about. 65 of this machine's 145 directories no longer exist, so the
+  // durable layers matter more than git does.
+  `CREATE TABLE IF NOT EXISTS cwd_repo (
+     cwd TEXT PRIMARY KEY,
+     repo TEXT NOT NULL,
+     source TEXT NOT NULL,
+     resolved_at INTEGER NOT NULL
+   )`,
 ];
