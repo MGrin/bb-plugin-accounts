@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { UsagePanel } from "./app/panel.tsx";
 
 type Status = {
   polledAt: number | null;
@@ -24,10 +25,28 @@ function Meter({ value }: { value: number | null }) {
   );
 }
 
+type ForecastLine = {
+  confidence: "provisional" | "fitted" | "stale";
+  blackout: { earliest: number | null; likely: number | null; latest: number | null; endsAt: number | null };
+} | null;
+
+const hhmm = (ts: number | null) =>
+  ts === null ? "?" : new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
 function AccountsSection() {
   const rpc = useRpc<typeof rpcContract>();
   const [st, setSt] = useState<Status | null>(null);
-  const load = async () => setSt((await rpc.call("status", null)) as Status);
+  const [fc, setFc] = useState<ForecastLine>(null);
+  const load = async () => {
+    setSt((await rpc.call("status", null)) as Status);
+    // Its own await so a forecast failure cannot blank the tiles, which are
+    // the thing that is useful every single day.
+    try {
+      setFc((await rpc.call("forecast", null)) as ForecastLine);
+    } catch {
+      setFc(null);
+    }
+  };
   useEffect(() => {
     void load();
     const t = setInterval(() => void load(), 30_000);
@@ -54,6 +73,12 @@ function AccountsSection() {
         </div>
       ))}
       {st.stale && <div className="text-xs text-destructive">usage cache stale — check claude.usage-poll</div>}
+      {fc?.confidence === "fitted" && fc.blackout.likely !== null && (
+        <div className="text-xs text-destructive">
+          all accounts dry ~{hhmm(fc.blackout.likely)} ({hhmm(fc.blackout.earliest)}–{hhmm(fc.blackout.latest)}),
+          back ~{hhmm(fc.blackout.endsAt)}
+        </div>
+      )}
       {st.lastSwitch && (
         <div className="text-xs text-muted-foreground">
           last switch: {st.lastSwitch.from} → {st.lastSwitch.to} · {st.lastSwitch.reason}
@@ -65,4 +90,11 @@ function AccountsSection() {
 
 export default definePluginApp((app) => {
   app.slots.homepageSection({ id: "claude-accounts", title: "Claude accounts", component: AccountsSection });
+  app.slots.navPanel({
+    id: "usage",
+    title: "Claude usage",
+    icon: "ChartBar",
+    path: "usage",
+    component: UsagePanel,
+  });
 });

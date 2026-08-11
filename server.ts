@@ -39,6 +39,32 @@ import {
   type ThreadStatusPort,
   worst,
 } from "./lib.ts";
+import { buildObservations, fitModelWeights, SEED_PRIORS } from "./analytics/calibrate.ts";
+import { type AlertMemory, EMPTY_MEMORY, planAlerts } from "./analytics/alerts.ts";
+import { buildForecast, type Forecast } from "./analytics/forecast.ts";
+import { ingestUsage } from "./analytics/ingest.ts";
+import { buildProfile } from "./analytics/profile.ts";
+import { scanTranscripts } from "./analytics/scan.ts";
+import { agentShape, prettyProject } from "./analytics/transcripts.ts";
+import { MIGRATIONS } from "./analytics/schema.ts";
+import { DEFAULT_POLICY, estimateSevenPerFive, type SimAccount } from "./analytics/simulate.ts";
+import {
+  burnBy,
+  burnByHourOfWeek,
+  countDistinctPolls,
+  latestSampleAt,
+  readCalibratableIntervals,
+  readCursors,
+  readDemandSamples,
+  readMessages,
+  readSamples,
+  readWindowPairs,
+  readModelWeights,
+  transcriptCoverage,
+  writeCursor,
+  writeModelWeights,
+  writeTranscriptRows,
+} from "./analytics/store.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -55,7 +81,48 @@ const accountShape = z.object({
 });
 type Account = z.infer<typeof accountShape>;
 
+const burnSliceShape = z.object({ key: z.string(), messages: z.number(), weightedK: z.number() });
+
+const forecastShape = z.object({
+  confidence: z.enum(["provisional", "fitted", "stale"]),
+  coverage: z.object({
+    distinctPolls: z.number(),
+    latestSampleAt: z.number().nullable(),
+    staleAfterSec: z.number(),
+    demandSamples: z.number().optional(),
+    neededPolls: z.number(),
+  }),
+  generatedAt: z.number(),
+  horizonSec: z.number(),
+  blackout: z.object({
+    earliest: z.number().nullable(),
+    likely: z.number().nullable(),
+    latest: z.number().nullable(),
+    endsAt: z.number().nullable(),
+    expectedSec: z.number(),
+  }),
+  weeklyExhaustedAt: z.record(z.string(), z.number().nullable()),
+  timeline: z.array(z.object({ ts: z.number(), headroom: z.number(), blacked: z.boolean() })),
+  slotCurve: z.array(z.object({ slots: z.number(), blackoutHoursPerWeek: z.number() })),
+});
+
 export const rpcContract = defineRpcContract({
+  forecast: { input: z.null(), output: forecastShape.nullable() },
+  analytics: {
+    input: z.object({ days: z.number() }),
+    output: z.object({
+      days: z.number(),
+      coverage: z.object({
+        messages: z.number(),
+        firstTs: z.number().nullable(),
+        lastTs: z.number().nullable(),
+      }),
+      byModel: z.array(burnSliceShape),
+      byAgent: z.array(burnSliceShape),
+      byProject: z.array(burnSliceShape),
+      byHourOfWeek: z.array(z.object({ dayOfWeek: z.number(), hour: z.number(), weightedK: z.number() })),
+    }),
+  },
   status: {
     input: z.null(),
     output: z.object({
@@ -119,6 +186,11 @@ export default async function plugin(bb: BbPluginApi) {
     recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "5" },
     recoveryGiveUpAfterHours: { type: "string", label: "Give up resuming a thread this long after it first got stuck (0 = never)", default: "6" },
   });
+
+  // Analytics storage. Opened once at load; the host tracks the handle and
+  // closes it on dispose/reload. Migrations are append-only — see schema.ts.
+  const db = bb.storage.database();
+  bb.storage.migrate(db, MIGRATIONS);
 
   const isStale = async (polledAt: number | null) => {
     const { staleAfterMin } = await settings.get();
@@ -350,13 +422,60 @@ export default async function plugin(bb: BbPluginApi) {
     } catch { /* a missing notifier must not break the watch */ }
   }
 
+  /** The same osascript path alarmIfCornered uses — one notifier, one look. */
+  async function notify(title: string, message: string): Promise<void> {
+    try {
+      await run("osascript", [
+        "-e",
+        `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`,
+      ], { timeout: 5_000 });
+    } catch { /* a missing notifier must not break the watch */ }
+  }
+
+  /**
+   * Forecast-driven alerts. See analytics/alerts.ts for why these two exist and
+   * why they are not the thing the standing "never raise usage limits"
+   * instruction bans: they are about aggregate capacity, never one account, and
+   * never attached to a running task.
+   */
+  async function evaluateAlerts(): Promise<void> {
+    const forecast = await currentForecast();
+    if (!forecast) return;
+    const memory = (await bb.storage.kv.get<AlertMemory>("alert-memory")) ?? EMPTY_MEMORY;
+    const plan = planAlerts(forecast, memory, Math.floor(Date.now() / 1000));
+    if (plan.memory !== memory) await bb.storage.kv.set("alert-memory", plan.memory);
+    for (const alert of plan.fire) {
+      bb.log.warn(`alert(${alert.kind}): ${alert.message}`);
+      await notify(alert.title, alert.message);
+    }
+  }
+
   bb.background.schedule("watch", "*/2 * * * *", async () => {
     const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
+    const { polledAt, accounts } = await readUsage();
+
+    // RECORDING COMES FIRST, AND IS UNCONDITIONAL.
+    //
+    // Not gated on autoSwitch: a machine with auto-switch off still burns
+    // quota, and the history is the entire point. Not gated on staleness
+    // either — a stale poll is still a fact about what the poller last saw,
+    // and INSERT OR IGNORE makes re-reading the same polledAt free.
+    //
+    // Its own try/catch, deliberately. Everything below this line is the path
+    // that keeps rate-limited threads alive; an analytics bug must never be
+    // able to take that down with it.
+    try {
+      const { inserted, intervals } = ingestUsage(db, polledAt, accounts);
+      if (inserted) bb.log.debug(`analytics: poll ${polledAt} recorded (${inserted} rows, ${intervals} intervals)`);
+      await evaluateAlerts();
+    } catch (e) {
+      bb.log.warn(`analytics ingest failed: ${e instanceof Error ? e.message : e}`);
+    }
+
     if (!autoSwitch) return;
     // Before anything that can return early: a stale poller or an untrustworthy
     // active slot must not also stop us NOTICING what is stuck.
     await reconcile(Number(recoverySettings.recoveryGiveUpAfterHours) * 3600);
-    const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return;
     const active = accounts.find((a) => a.active);
     if (!active) return;
@@ -399,6 +518,153 @@ export default async function plugin(bb: BbPluginApi) {
     if (switched) {
       const swept = await sweeper.sweep("proactive-switch");
       if (swept.continued.length) bb.log.info(`proactive switch to ${target.slot} resumed: ${swept.continued.join(", ")}`);
+    }
+  });
+
+  // Transcript indexing — the retroactive half of the history.
+  //
+  // Deliberately its own schedule rather than a step in the watch tick: the
+  // first run walks ~550MB of ~2650 files, and nothing that slow belongs
+  // anywhere near the path that decides whether to switch accounts. After the
+  // backfill each run reads kilobytes, because a file whose (size, mtime) match
+  // its stored cursor is never opened at all.
+  const TRANSCRIPT_ROOT = `${os.homedir()}/.claude/projects`;
+  let indexing = false;
+
+  /** Returns a one-line summary, or null when a run was already in flight. */
+  async function indexTranscripts(): Promise<string | null> {
+    // The backfill can outlast the interval. Overlapping runs would fight over
+    // the same cursors and re-read the same bytes, so a run in flight simply
+    // wins and the caller gets nothing rather than a duplicate pass.
+    if (indexing) return null;
+    indexing = true;
+    const startedAt = Date.now();
+    try {
+      const cursors = readCursors(db);
+      let written = 0;
+      const result = await scanTranscripts(TRANSCRIPT_ROOT, cursors, (rows, filePath, cursor) => {
+        // Rows BEFORE the cursor, always. A crash between the two re-reads a
+        // batch, which the (session_id, message_id) key makes free; the other
+        // order would advance past messages that were never stored.
+        written += writeTranscriptRows(db, rows);
+        writeCursor(db, filePath, cursor);
+      });
+      const cov = transcriptCoverage(db);
+      return (
+        `indexed ${written} new message(s) from ${result.filesRead}/${result.filesSeen} transcript(s) ` +
+        `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} total`
+      );
+    } finally {
+      indexing = false;
+    }
+  }
+
+  bb.background.schedule("index-transcripts", "*/15 * * * *", async () => {
+    try {
+      const summary = await indexTranscripts();
+      if (summary && !summary.startsWith("indexed 0 ")) bb.log.info(`analytics: ${summary}`);
+    } catch (e) {
+      bb.log.warn(`transcript indexing failed: ${e instanceof Error ? e.message : e}`);
+    }
+  });
+
+  // ── Forecasting ──────────────────────────────────────────────────────────
+
+  /** How much demand history to feed the profile. */
+  const PROFILE_LOOKBACK_SEC = 42 * 86400;
+  /** Longest interval still trustworthy for calibration — beyond this a poll gap muddles attribution. */
+  const CALIBRATION_MAX_INTERVAL_SEC = 600;
+
+  /**
+   * Live account state as the simulator wants it.
+   *
+   * A null resetsAt means the window has never been touched, so the safest
+   * reading is a full window starting now — assuming it resets imminently
+   * would forecast capacity that does not exist.
+   */
+  function toSimAccounts(accounts: Account[], now: number): SimAccount[] {
+    const parse = (iso: string | null, fallbackSec: number): number => {
+      const t = iso ? Date.parse(iso) : Number.NaN;
+      return Number.isFinite(t) ? Math.floor(t / 1000) : now + fallbackSec;
+    };
+    return accounts.map((a) => ({
+      slot: a.slot,
+      fiveUtil: a.fiveHour ?? 0,
+      fiveResetsAt: parse(a.fiveHourResetsAt, DEFAULT_POLICY.fiveWindowSec),
+      sevenUtil: a.sevenDay ?? 0,
+      sevenResetsAt: parse(a.sevenDayResetsAt, DEFAULT_POLICY.sevenWindowSec),
+    }));
+  }
+
+  const readSamplesFor = (slot: string, sinceEpochSec: number) => readSamples(db, slot, sinceEpochSec);
+
+  /**
+   * Re-aggregate after relabelling. Grouping happens in SQL on the raw column,
+   * and two different cwds legitimately share a label — a repo and a worktree
+   * inside it both read as the same project — so without this the same name
+   * appears twice with its burn split across the rows.
+   */
+  const mergeByKey = (slices: { key: string; messages: number; weightedK: number }[]) => {
+    const merged = new Map<string, { key: string; messages: number; weightedK: number }>();
+    for (const s of slices) {
+      const prev = merged.get(s.key);
+      if (prev) {
+        prev.messages += s.messages;
+        prev.weightedK += s.weightedK;
+      } else {
+        merged.set(s.key, { ...s });
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.weightedK - a.weightedK);
+  };
+
+  async function currentForecast(): Promise<Forecast | null> {
+    const { switchAt, weeklyAt, staleAfterMin } = await settings.get();
+    const { accounts } = await readUsage();
+    if (accounts.length === 0) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const demandSamples = readDemandSamples(db, now - PROFILE_LOOKBACK_SEC);
+    const profile = buildProfile(demandSamples, now);
+    // How much weekly window one 5h-window point costs, measured rather than
+    // assumed. Assuming 1:1 predicted 324h of blackout in a 336h horizon.
+    const sevenPerFive = estimateSevenPerFive(readWindowPairs(db, now - PROFILE_LOOKBACK_SEC));
+    return buildForecast({
+      accounts: toSimAccounts(accounts, now),
+      profile,
+      policy: { switchAt: Number(switchAt), weeklyAt: Number(weeklyAt), ...DEFAULT_POLICY, sevenPerFive },
+      now,
+      coverage: {
+        distinctPolls: countDistinctPolls(db),
+        latestSampleAt: latestSampleAt(db),
+        staleAfterSec: Number(staleAfterMin) * 60,
+        demandSamples: demandSamples.length,
+      },
+    });
+  }
+
+  // Nightly refit of the tokens -> utilization weights. Off-hours because it
+  // reads the whole overlap period, and daily because the thing it is learning
+  // (relative model cost) moves on the timescale of Anthropic shipping models,
+  // not of anything that happens during a day.
+  bb.background.schedule("calibrate", "17 4 * * *", async () => {
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const since = now - PROFILE_LOOKBACK_SEC;
+      const intervals = readCalibratableIntervals(db, since, CALIBRATION_MAX_INTERVAL_SEC);
+      if (intervals.length === 0) {
+        bb.log.info("calibrate: no usable overlap yet — keeping seeded weights");
+        return;
+      }
+      const from = Math.min(...intervals.map((i) => i.t0));
+      const to = Math.max(...intervals.map((i) => i.t1));
+      const fit = fitModelWeights(buildObservations(intervals, readMessages(db, from, to)), SEED_PRIORS);
+      writeModelWeights(db, fit, now);
+      bb.log.info(
+        `calibrate: fitted ${Object.keys(fit.weights).length} families over ${fit.sampleCount} intervals ` +
+          `(residual ${fit.residual.toFixed(3)})`,
+      );
+    } catch (e) {
+      bb.log.warn(`calibration failed: ${e instanceof Error ? e.message : e}`);
     }
   });
 
@@ -534,6 +800,24 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    async forecast() {
+      return (await currentForecast()) ?? null;
+    },
+    async analytics({ days }) {
+      const now = Math.floor(Date.now() / 1000);
+      const since = now - Math.max(1, days) * 86400;
+      const offsetSec = -new Date().getTimezoneOffset() * 60;
+      return {
+        days,
+        coverage: transcriptCoverage(db),
+        byModel: burnBy(db, "model", since),
+        byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((x) => ({ ...x, key: agentShape(x.key) }))),
+        byProject: mergeByKey(
+          burnBy(db, "project", since).map((x) => ({ ...x, key: prettyProject(x.key) })),
+        ).slice(0, 12),
+        byHourOfWeek: burnByHourOfWeek(db, since, offsetSec),
+      };
+    },
     async status() {
       const { polledAt, accounts } = await readUsage();
       const lastSwitch =
@@ -550,9 +834,139 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
       { name: "log", summary: "Recent switch decisions", usage: "bb accounts log" },
+      { name: "forecast", summary: "When every account runs dry, and for how long", usage: "bb accounts forecast [--json]" },
+      { name: "stats", summary: "Where the quota went, by model/agent/project/hour", usage: "bb accounts stats [--days N] [--json]" },
+      { name: "history", summary: "Recorded utilization history", usage: "bb accounts history [--slot S] [--days N] [--json]" },
+      { name: "reindex", summary: "Scan Claude Code transcripts now instead of waiting for the schedule", usage: "bb accounts reindex" },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "list";
+      const json = argv.includes("--json");
+      const flag = (name: string, fallback: number): number => {
+        const i = argv.indexOf(`--${name}`);
+        const v = i >= 0 ? Number(argv[i + 1]) : Number.NaN;
+        return Number.isFinite(v) && v > 0 ? v : fallback;
+      };
+      const clock = (t: number | null): string =>
+        t === null ? "—" : new Date(t * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+      if (cmd === "forecast") {
+        const fc = await currentForecast();
+        if (!fc) return { exitCode: 1, stderr: "no accounts in the usage cache" };
+        if (json) return { exitCode: 0, stdout: JSON.stringify(fc) };
+        const lines: string[] = [];
+        if (fc.confidence === "stale") {
+          lines.push("⚠ STALE — the usage cache is behind; check the claude.usage-poll LaunchAgent.");
+        }
+        if (fc.confidence === "provisional") {
+          // Deliberately WITHOUT the times. A forecast off seven samples taken
+          // during one burst reads as authoritative if it is printed in the
+          // usual shape, and being confidently wrong by an order of magnitude
+          // is worse than saying nothing yet.
+          const { distinctPolls, neededPolls, demandSamples = 0 } = fc.coverage;
+          const pct = Math.min(100, Math.round((distinctPolls / neededPolls) * 100));
+          lines.push(
+            `⚠ NOT ENOUGH HISTORY YET — ${distinctPolls}/${neededPolls} polls recorded (${pct}%), ` +
+              `${demandSamples} usable demand sample(s).`,
+          );
+          lines.push("   Recording started today; a blackout forecast needs about 3 days of polls to mean anything.");
+          lines.push("   Run `bb accounts stats` for the retroactive breakdowns, which are ready now.");
+          return { exitCode: 0, stdout: lines.join("\n") };
+        }
+        lines.push(
+          fc.blackout.likely === null
+            ? `no blackout forecast in the next ${Math.round(fc.horizonSec / 86400)} days`
+            : `all accounts dry ~${clock(fc.blackout.likely)} (${clock(fc.blackout.earliest)} – ${clock(fc.blackout.latest)})` +
+              `, back ~${clock(fc.blackout.endsAt)}`,
+        );
+        if (fc.blackout.expectedSec > 0) {
+          lines.push(`expected downtime over the horizon: ${(fc.blackout.expectedSec / 3600).toFixed(1)}h`);
+        }
+        for (const [slot, at] of Object.entries(fc.weeklyExhaustedAt)) {
+          lines.push(`  ${slot.padEnd(24)} weekly window exhausted ${at === null ? "not within horizon" : clock(at)}`);
+        }
+        lines.push("");
+        lines.push("blackout hours per week by account count:");
+        for (const p of fc.slotCurve) {
+          lines.push(`  ${String(p.slots).padStart(2)} slots  ${p.blackoutHoursPerWeek.toFixed(1)}h`);
+        }
+        return { exitCode: 0, stdout: lines.join("\n") };
+      }
+
+      if (cmd === "reindex") {
+        try {
+          const summary = await indexTranscripts();
+          return summary === null
+            ? { exitCode: 0, stdout: "an index run is already in flight" }
+            : { exitCode: 0, stdout: summary };
+        } catch (e) {
+          return { exitCode: 1, stderr: `reindex failed: ${e instanceof Error ? e.message : e}` };
+        }
+      }
+
+      if (cmd === "stats") {
+        const days = flag("days", 7);
+        const now = Math.floor(Date.now() / 1000);
+        const since = now - days * 86400;
+        const offsetSec = -new Date().getTimezoneOffset() * 60;
+        const payload = {
+          days,
+          coverage: transcriptCoverage(db),
+          byModel: burnBy(db, "model", since),
+          byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((s) => ({ ...s, key: agentShape(s.key) }))),
+          byProject: mergeByKey(
+            burnBy(db, "project", since).map((s) => ({ ...s, key: prettyProject(s.key) })),
+          ).slice(0, 15),
+          byHourOfWeek: burnByHourOfWeek(db, since, offsetSec),
+          weights: readModelWeights(db),
+        };
+        if (json) return { exitCode: 0, stdout: JSON.stringify(payload) };
+        const section = (title: string, slices: { key: string; messages: number; weightedK: number }[]) => {
+          const total = slices.reduce((s, x) => s + x.weightedK, 0) || 1;
+          return [
+            `${title}:`,
+            ...slices.slice(0, 8).map((s) => {
+              const pct = (s.weightedK / total) * 100;
+              const n = Math.round(pct / 5);
+              return `  ${s.key.slice(0, 30).padEnd(31)}${"█".repeat(n).padEnd(20)} ${pct.toFixed(1).padStart(5)}%  ${Math.round(s.weightedK).toLocaleString()}k`;
+            }),
+            "",
+          ];
+        };
+        const out = [
+          `last ${days} day(s) — ${payload.coverage.messages.toLocaleString()} messages recorded`,
+          "",
+          ...section("by model", payload.byModel),
+          ...section("by who spent it", payload.byAgent),
+          ...section("by project", payload.byProject),
+        ];
+        return { exitCode: 0, stdout: out.join("\n") };
+      }
+
+      if (cmd === "history") {
+        const days = flag("days", 2);
+        const now = Math.floor(Date.now() / 1000);
+        const since = now - days * 86400;
+        const slotArg = argv.indexOf("--slot") >= 0 ? argv[argv.indexOf("--slot") + 1] : null;
+        const { accounts } = await readUsage();
+        const slots = slotArg ? [slotArg] : accounts.map((a) => a.slot);
+        const series = slots.map((slot) => ({ slot, samples: readSamplesFor(slot, since) }));
+        if (json) return { exitCode: 0, stdout: JSON.stringify({ days, series }) };
+        const spark = (values: number[]) => {
+          const chars = "▁▂▃▄▅▆▇█";
+          return values.map((v) => chars[Math.min(7, Math.max(0, Math.round((v / 100) * 7)))]).join("");
+        };
+        const lines = series.map((s) => {
+          if (s.samples.length === 0) return `${s.slot.padEnd(24)} (no history recorded yet)`;
+          // Downsample so a 2-day series fits a terminal line.
+          const step = Math.max(1, Math.ceil(s.samples.length / 60));
+          const five = s.samples.filter((_, i) => i % step === 0).map((x) => x.fiveUtil ?? 0);
+          return `${s.slot.padEnd(24)} 5h ${spark(five)} now ${s.samples[s.samples.length - 1]!.fiveUtil ?? 0}%`;
+        });
+        lines.push("", `${series.reduce((n, s) => n + s.samples.length, 0)} samples over ${days} day(s)`);
+        return { exitCode: 0, stdout: lines.join("\n") };
+      }
+
       if (cmd === "switch") {
         const slot = argv[1];
         if (!slot) return { exitCode: 1, stderr: "usage: bb accounts switch <slot>" };
