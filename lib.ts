@@ -272,6 +272,76 @@ export function shouldNudgeAfterIneligible(reason: string): boolean {
     reason === "input-not-accepted";
 }
 
+// ── Reconciliation — finding stuck threads the event stream never reported ──
+//
+// The store above is fed by onLimitFailure(), which is fed by thread.failed.
+// On 2026-08-11 that single dependency was found to have been broken for the
+// plugin's entire life by one upstream null, silently, with no alarm: see
+// isLimitFailure. Fixing the trigger fixes today's cause. It does not stop the
+// same SHAPE of failure — one quiet upstream change disabling recovery — from
+// happening again.
+//
+// So the watch tick also looks for itself. Any errored thread the store does
+// not know about is a candidate, confirmed by the same rateLimitRecovery
+// inspection the trigger uses, so adoption can never be laxer than detection.
+
+export interface ListedThread {
+  id: string;
+  status: string;
+  updatedAt: number;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
+}
+
+export interface AdoptionPlan {
+  /** Thread ids to inspect and, if genuinely limit-failed, adopt. */
+  inspect: string[];
+  /** The inspection memory to persist: threadId -> the updatedAt just examined. */
+  retain: Record<string, number>;
+}
+
+/**
+ * Which listed threads are worth an inspection call this tick?
+ *
+ * The trap here is a loop, and it is not hypothetical: a thread that is adopted,
+ * exhausts `maxAttempts` and gets dropped is still `error` and no longer
+ * tracked — so a naive scan re-adopts it on the very next tick, forever, and
+ * the attempts budget becomes decorative.
+ *
+ * The guard is `inspected`: the updatedAt of the last inspection per thread. A
+ * genuinely dead thread's updatedAt never moves again, so it costs exactly one
+ * inspection ever. A thread that really does change gets looked at again. That
+ * also keeps a machine full of long-dead error threads from costing an
+ * inspection each, every two minutes, all day.
+ */
+export function planAdoption(
+  listed: ListedThread[],
+  tracked: string[],
+  inspected: Record<string, number>,
+  now: number,
+  giveUpAfterSec: number,
+): AdoptionPlan {
+  const trackedSet = new Set(tracked);
+  const inspect: string[] = [];
+  const retain: Record<string, number> = {};
+
+  for (const t of listed) {
+    if (t.status !== "error" || t.archivedAt || t.deletedAt) continue;
+    // Carry the memory forward for every still-errored thread, so the map is
+    // pruned to reality rather than growing with every thread that ever failed.
+    const previous = inspected[t.id];
+    retain[t.id] = t.updatedAt;
+    if (trackedSet.has(t.id)) continue;
+    if (previous === t.updatedAt) continue;
+    // Already past the give-up clock: adopting it would spend an inspection
+    // only to drop it on the same sweep.
+    if (giveUpAfterSec > 0 && now - t.updatedAt > giveUpAfterSec * 1000) continue;
+    inspect.push(t.id);
+  }
+
+  return { inspect, retain };
+}
+
 // ── Recovery sweep — resuming EVERY stuck thread when capacity returns ──────
 //
 // `bb.sdk.threads.list` has no status/providerId filter, so "which threads

@@ -26,7 +26,9 @@ import {
   isLimitError,
   isLimitFailure,
   type LimitFailureSignal,
+  type ListedThread,
   pickBest as pickBestOf,
+  planAdoption,
   type PrevSample,
   type RecoveryAttemptResult,
   shouldNudgeAfterIneligible,
@@ -351,6 +353,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.schedule("watch", "*/2 * * * *", async () => {
     const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
     if (!autoSwitch) return;
+    // Before anything that can return early: a stale poller or an untrustworthy
+    // active slot must not also stop us NOTICING what is stuck.
+    await reconcile(Number(recoverySettings.recoveryGiveUpAfterHours) * 3600);
     const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return;
     const active = accounts.find((a) => a.active);
@@ -397,6 +402,58 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
+  /**
+   * Gather every signal about a dead thread. `error` alone is not enough — it
+   * is null on every real limit failure (see isLimitFailure) — so unless it
+   * settles the question on its own, ask bb's recovery inspection, which
+   * carries the provider rate-limit snapshot on every answer including refusals.
+   */
+  async function inspectFailure(threadId: string, error: string | null): Promise<LimitFailureSignal> {
+    if (isLimitError(error)) return { error };
+    try {
+      const status = await bb.sdk.threads.rateLimitRecovery({ threadId });
+      return { error, rateLimitStatus: status.rateLimits?.status ?? null, recoveryReason: status.reason };
+    } catch (e) {
+      // Expected for a destroyed environment, which answers
+      // thread_environment_unavailable rather than a status. Nothing to adopt.
+      bb.log.warn(`limit inspection failed for ${threadId}: ${e instanceof Error ? e.message : e}`);
+      return { error };
+    }
+  }
+
+  /**
+   * Find limit-failed threads the event stream never reported.
+   *
+   * Belt and braces, deliberately: the store is fed by thread.failed, and on
+   * 2026-08-11 that one dependency turned out to have been broken since the
+   * plugin's first commit — silently, with no alarm, because a store that is
+   * never written looks exactly like a machine with nothing stuck. This runs
+   * every watch tick so the same shape of failure is survivable next time.
+   */
+  async function reconcile(giveUpAfterSec: number): Promise<void> {
+    try {
+      const res = (await bb.sdk.threads.list({ archived: false })) as unknown;
+      const rows = (Array.isArray(res) ? res : ((res as { threads?: unknown[] })?.threads ?? [])) as ListedThread[];
+      const tracked = await stuckThreadsStore.list();
+      const inspected = (await bb.storage.kv.get<Record<string, number>>("adoption-inspected")) ?? {};
+      const plan = planAdoption(rows, tracked.map((r) => r.threadId), inspected, Date.now(), giveUpAfterSec);
+      // Persist BEFORE inspecting: a crash mid-loop must not leave a thread
+      // eligible for re-inspection on every tick forever.
+      await bb.storage.kv.set("adoption-inspected", plan.retain);
+
+      for (const threadId of plan.inspect) {
+        const row = rows.find((t) => t.id === threadId);
+        const signal = await inspectFailure(threadId, null);
+        if (!isLimitFailure(signal)) continue;
+        const providerId = (row as unknown as { providerId?: string })?.providerId ?? "claude-code";
+        bb.log.info(`adopted untracked stuck thread ${threadId} (${describeSignal(signal)}) — the event never reached us`);
+        await sweeper.onLimitFailure(threadId, providerId);
+      }
+    } catch (e) {
+      bb.log.warn(`reconcile failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
   /** Which signal actually caught this failure — the line that was missing all night. */
   const describeSignal = (s: LimitFailureSignal): string =>
     isLimitError(s.error)
@@ -418,20 +475,7 @@ export default async function plugin(bb: BbPluginApi) {
   //      the lowest-usage fresh account and auto-continue the thread there.
   bb.events.on("thread.failed", ({ thread, error }) => {
     void (async () => {
-      // `error` is null on every real limit failure — bb fills it only from
-      // `system/error` events and provider limits are `provider/error`. Proven
-      // 2026-08-11; see isLimitFailure in lib.ts. So when the string does not
-      // settle it, ask bb's own recovery inspection, which carries the
-      // provider rate-limit snapshot on every answer.
-      let signal: LimitFailureSignal = { error };
-      if (!isLimitError(error)) {
-        try {
-          const status = await bb.sdk.threads.rateLimitRecovery({ threadId: thread.id });
-          signal = { error, rateLimitStatus: status.rateLimits?.status ?? null, recoveryReason: status.reason };
-        } catch (e) {
-          bb.log.warn(`limit inspection failed for ${thread.id}: ${e instanceof Error ? e.message : e}`);
-        }
-      }
+      const signal = await inspectFailure(thread.id, error);
       if (!isLimitFailure(signal)) return;
       bb.log.info(`thread ${thread.id} failed on a provider limit (${describeSignal(signal)}) — tracking for recovery`);
       // Track this thread as stuck regardless of what happens below — a

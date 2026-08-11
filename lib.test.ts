@@ -11,7 +11,9 @@ import {
   decideSwitch,
   isLimitError,
   isLimitFailure,
+  type ListedThread,
   pickBest,
+  planAdoption,
   planSweep,
   type RecoveryAttemptResult,
   type RecoveryPolicy,
@@ -537,4 +539,85 @@ test("the sweeper holds while cornered, then resumes when capacity returns", asy
   const done = await sweeper.sweep("proactive-switch");
   assert.deepEqual(done.continued.sort(), ["thr_1", "thr_2"]);
   assert.equal(records.size, 0, "nothing left stuck");
+});
+
+// ── reconciliation: the store must not depend on one event firing ────────────
+//
+// The 2026-08-11 outage was ONE upstream null silently disabling the whole
+// reactive path, with no alarm, for the plugin's entire life. The trigger is
+// fixed, but a store fed only by thread.failed can be switched off the same way
+// again. So the watch tick also LOOKS: any errored thread bb never told us
+// about is a candidate, confirmed by the same rateLimitRecovery inspection.
+//
+// The hazard is a loop. An adopted thread that exhausts its attempts is
+// dropped, is still `error`, and would be adopted again on the next tick
+// forever. So adoption remembers the `updatedAt` it inspected: a dead thread's
+// updatedAt never moves, so it is inspected exactly once, and a thread that
+// genuinely changes is looked at again.
+
+const listed = (id: string, status: string, updatedAt: number, extra: Partial<ListedThread> = {}): ListedThread =>
+  ({ id, status, updatedAt, archivedAt: null, deletedAt: null, ...extra });
+
+test("adoption finds an errored thread bb never announced", () => {
+  const plan = planAdoption([listed("thr_lost", "error", 1000)], [], {}, 2000, 3600);
+  assert.deepEqual(plan.inspect, ["thr_lost"]);
+});
+
+test("adoption ignores threads that are not stopped in error", () => {
+  const plan = planAdoption(
+    [listed("thr_a", "idle", 1000), listed("thr_b", "active", 1000), listed("thr_c", "starting", 1000)],
+    [], {}, 2000, 3600,
+  );
+  assert.deepEqual(plan.inspect, []);
+});
+
+test("adoption ignores archived and deleted threads", () => {
+  const plan = planAdoption(
+    [listed("thr_arch", "error", 1000, { archivedAt: 1500 }), listed("thr_del", "error", 1000, { deletedAt: 1500 })],
+    [], {}, 2000, 3600,
+  );
+  assert.deepEqual(plan.inspect, []);
+});
+
+test("adoption leaves threads the event path already tracked alone", () => {
+  const plan = planAdoption([listed("thr_known", "error", 1000)], ["thr_known"], {}, 2000, 3600);
+  assert.deepEqual(plan.inspect, []);
+});
+
+test("a thread already inspected at this updatedAt is never re-adopted", () => {
+  // The drop/re-adopt loop: thr_dead exhausted its attempts and was dropped, so
+  // it is untracked AND still error. Without this it would be adopted forever.
+  const plan = planAdoption([listed("thr_dead", "error", 1000)], [], { thr_dead: 1000 }, 9000, 3600);
+  assert.deepEqual(plan.inspect, []);
+});
+
+test("a thread that has genuinely changed since inspection is looked at again", () => {
+  const plan = planAdoption([listed("thr_moved", "error", 4000)], [], { thr_moved: 1000 }, 5000, 3600);
+  assert.deepEqual(plan.inspect, ["thr_moved"]);
+});
+
+test("adoption ignores a thread already past the give-up window", () => {
+  // Adopting it would only spend an inspection to drop it on the same tick.
+  const plan = planAdoption([listed("thr_old", "error", 1000)], [], {}, 1000 + 3601_000, 3600);
+  assert.deepEqual(plan.inspect, []);
+});
+
+test("a give-up window of zero means never too old to adopt", () => {
+  const plan = planAdoption([listed("thr_ancient", "error", 1)], [], {}, 99_999_999, 0);
+  assert.deepEqual(plan.inspect, ["thr_ancient"]);
+});
+
+test("inspection memory is pruned to threads that are still errored", () => {
+  // Otherwise the map grows forever with every thread that ever failed.
+  const plan = planAdoption(
+    [listed("thr_still", "error", 1000), listed("thr_recovered", "idle", 1000)],
+    [], { thr_still: 1000, thr_recovered: 1000, thr_gone: 1000 }, 2000, 3600,
+  );
+  assert.deepEqual(plan.retain, { thr_still: 1000 });
+});
+
+test("adoption records the updatedAt it inspected, so the next tick skips it", () => {
+  const plan = planAdoption([listed("thr_new", "error", 1700)], [], {}, 2000, 3600);
+  assert.deepEqual(plan.inspect, ["thr_new"]);
+  assert.deepEqual(plan.retain, { thr_new: 1700 });
 });

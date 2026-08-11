@@ -40,9 +40,16 @@ which silently disabled this entire path from the plugin's first commit until 20
 The trigger now also consults bb's own recovery inspection and fires on a blocked
 rate-limit snapshot, so it no longer depends on wording bb never sends. See `isLimitFailure`.
 
+**Reconciliation** — the tracked set is fed by `thread.failed`, and a store fed by one
+event can be switched off by one upstream change, silently, which is exactly what happened.
+So every watch tick also *looks*: any non-archived `error` thread the store doesn't know
+about is inspected with the same `rateLimitRecovery` call the trigger uses, and adopted if
+it is genuinely limit-failed. Adoption remembers the `updatedAt` it inspected, so a
+permanently dead thread costs exactly one inspection ever instead of looping
+adopt → exhaust attempts → drop → adopt.
+
 **Recovery sweep** — resumes EVERY currently-stuck limit-failed thread, not just the one
-attached to whichever event fired. A thread that hit a limit is tracked (there is no
-server-side way to ask bb for "every errored thread"); every proactive tick and every
+attached to whichever event fired. A thread that hit a limit is tracked; every proactive tick and every
 reactive switch then sweeps the tracked set, re-verifying each thread is still `error`
 before attempting it, so a thread already fixed elsewhere (bb's own `provider-retry`, a
 human) quietly falls out of tracking instead of being retried. When bb has no replayable
