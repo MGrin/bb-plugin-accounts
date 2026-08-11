@@ -72,6 +72,42 @@ export function agentShape(entrypoint: string | null | undefined): string {
   }
 }
 
+/**
+ * A readable label for where work happened.
+ *
+ * Takes the REAL working directory, not the transcript's directory name. Claude
+ * Code encodes the path by replacing every separator with a dash, which makes
+ * `/Users/mgrin/Projects/mgrin/agentic-brain` and a project literally called
+ * `brain` indistinguishable — the first attempt at this collapsed
+ * "agentic-brain" to "brain" and "motion-client-dashboard-ops" to "ops". The
+ * cwd column keeps the separators, so it can be split honestly.
+ */
+export function prettyProject(cwd: string | null | undefined): string {
+  if (!cwd) return "unknown";
+  const segments = cwd.split("/").filter(Boolean);
+  const at = (name: string) => segments.indexOf(name);
+
+  // bb-managed environments: name the repo being worked on when there is one,
+  // otherwise the env id, so a worktree is never mistaken for its own project.
+  const worktrees = at("worktrees");
+  const workspaces = at("personal-workspaces");
+  for (const marker of [worktrees, workspaces]) {
+    if (marker >= 0) {
+      const tail = segments.slice(marker + 2);
+      return `bb env: ${tail.length > 0 ? tail.join("/") : (segments[marker + 1] ?? "?")}`;
+    }
+  }
+
+  // ~/Projects/<org>/<repo> and ~/Dev/<repo> are this machine's two layouts.
+  const projects = at("Projects");
+  if (projects >= 0 && segments.length > projects + 2) return segments[projects + 2]!;
+  const dev = at("Dev");
+  if (dev >= 0 && segments.length > dev + 1) return segments[dev + 1]!;
+
+  const leaf = segments[segments.length - 1];
+  return leaf === undefined ? "unknown" : leaf === "mgrin" ? "home" : leaf;
+}
+
 /** Coerce anything to a finite non-negative integer. Absent, null and "lots" all mean 0. */
 const num = (v: unknown): number => {
   const n = typeof v === "number" ? v : Number.NaN;

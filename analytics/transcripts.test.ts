@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { agentShape, parseTranscriptLine } from "./transcripts.ts";
+import { agentShape, parseTranscriptLine, prettyProject } from "./transcripts.ts";
 
 /** Shaped from a real record — see the TOP KEYS/MSG KEYS survey in the plan. */
 const REAL = JSON.stringify({
@@ -147,4 +147,25 @@ test("non-numeric token values are coerced to zero rather than NaN", () => {
   const row = parseTranscriptLine(line, "s", null);
   assert.equal(row!.inputTokens, 0);
   assert.ok(Number.isFinite(row!.inputTokens));
+});
+
+test("prettyProject splits real paths rather than dash-encoded names", () => {
+  // The bug this replaced: splitting the encoded directory name on dashes
+  // collapsed agentic-brain to "brain" and motion-client-dashboard-ops to "ops".
+  assert.equal(prettyProject("/Users/mgrin/Projects/mgrin/agentic-brain"), "agentic-brain");
+  assert.equal(
+    prettyProject("/Users/mgrin/Projects/flare/motion-client-dashboard-ops"),
+    "motion-client-dashboard-ops",
+  );
+  assert.equal(prettyProject("/Users/mgrin/Dev/dotfiles"), "dotfiles");
+  assert.equal(prettyProject("/Users/mgrin"), "home");
+  assert.equal(prettyProject(null), "unknown");
+});
+
+test("prettyProject marks bb-managed environments", () => {
+  assert.equal(prettyProject("/Users/mgrin/.bb/worktrees/env_6h83ds4w87/dotfiles"), "bb env: dotfiles");
+  assert.equal(
+    prettyProject("/Users/mgrin/.bb/personal-workspaces/env_4dcqxu7kgg"),
+    "bb env: env_4dcqxu7kgg",
+  );
 });

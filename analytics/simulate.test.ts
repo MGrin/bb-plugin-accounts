@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildProfile, type DemandProfile } from "./profile.ts";
-import { DEFAULT_POLICY, simulate, type SimAccount, type SimPolicy, TICK_SEC } from "./simulate.ts";
+import {
+  DEFAULT_POLICY,
+  DEFAULT_SEVEN_PER_FIVE,
+  estimateSevenPerFive,
+  simulate,
+  type SimAccount,
+  type SimPolicy,
+  TICK_SEC,
+} from "./simulate.ts";
 
 const NOW = 1_786_000_000;
 const HOUR = 3600;
@@ -100,12 +108,12 @@ test("demand lands on the slot pickBest would choose — the roomiest", () => {
     HOUR,
     "p50",
   );
-  // One hour at 10 points/hour, all of it on "idle" since it starts roomier.
-  const last = res.timeline[res.timeline.length - 1]!;
-  assert.ok(last.headroom < (97 - 50) + 97, "headroom must have been consumed");
-  // "busy" untouched means total headroom fell by ~10, not by more.
-  const first = res.timeline[0]!;
-  assert.ok(Math.abs(first.headroom - last.headroom - 10 + 10 / 4) < 1.5);
+  const busy = res.finalAccounts.find((a) => a.slot === "busy")!;
+  const idle = res.finalAccounts.find((a) => a.slot === "idle")!;
+  // One hour at 10 points/hour. All of it belongs on "idle", which starts
+  // roomier on max(5h, 7d) — the rule pickBest actually applies.
+  assert.equal(busy.fiveUtil, 50, "the busier slot must be untouched");
+  assert.ok(Math.abs(idle.fiveUtil - 10) < 1e-9, `idle absorbed ${idle.fiveUtil}`);
 });
 
 test("the 5h window rolls repeatedly across a long horizon", () => {
@@ -192,4 +200,59 @@ test("the timeline covers the horizon at TICK_SEC resolution", () => {
   assert.equal(res.timeline.length, (4 * HOUR) / TICK_SEC);
   assert.equal(res.timeline[0]!.ts, NOW);
   assert.equal(res.timeline[1]!.ts - res.timeline[0]!.ts, TICK_SEC);
+});
+
+test("estimateSevenPerFive totals rather than averaging per-interval ratios", () => {
+  // The real shape: 1% granularity means many intervals read 1 point of 5h
+  // against 0 of 7d. Averaging those ratios would answer near zero; summing
+  // first lets the quantisation cancel.
+  const pairs = [
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 1, deltaSeven: 0 },
+    { deltaFive: 24, deltaSeven: 4 },
+  ];
+  const ratio = estimateSevenPerFive(pairs);
+  assert.ok(Math.abs(ratio - 4 / 30) < 1e-9, `ratio was ${ratio}`);
+});
+
+test("estimateSevenPerFive keeps the fallback until there is real signal", () => {
+  assert.equal(estimateSevenPerFive([]), DEFAULT_SEVEN_PER_FIVE);
+  assert.equal(estimateSevenPerFive([{ deltaFive: 3, deltaSeven: 1 }]), DEFAULT_SEVEN_PER_FIVE);
+  assert.equal(estimateSevenPerFive([{ deltaFive: 19, deltaSeven: 2 }]), DEFAULT_SEVEN_PER_FIVE);
+});
+
+test("estimateSevenPerFive matches this machine's recorded numbers", () => {
+  // 29.0 points of 5h window cost 4.0 points of weekly window.
+  const ratio = estimateSevenPerFive([{ deltaFive: 29, deltaSeven: 4 }]);
+  assert.ok(Math.abs(ratio - 0.1379) < 0.001, `ratio was ${ratio}`);
+});
+
+test("a weekly window is spent far slower than a 5h window", () => {
+  // The bug this guards: adding demand 1:1 to both windows made the weekly
+  // window the binding constraint within hours and predicted near-permanent
+  // blackout no matter how many accounts existed.
+  const profile = flatProfile(20);
+  const oneToOne = simulate([account()], profile, policy({ sevenPerFive: 1 }), NOW, 7 * DAY, "p50");
+  const realistic = simulate([account()], profile, policy(), NOW, 7 * DAY, "p50");
+  assert.ok(
+    realistic.blackoutSec < oneToOne.blackoutSec,
+    `realistic ${realistic.blackoutSec}s vs 1:1 ${oneToOne.blackoutSec}s`,
+  );
+  // The sharper statement: the week lasts several times longer before it walls.
+  const ratio = realistic.weeklyExhaustedAt.a! - NOW;
+  const naive = oneToOne.weeklyExhaustedAt.a! - NOW;
+  assert.ok(ratio > naive * 5, `weekly lasted ${ratio}s vs ${naive}s under a 1:1 model`);
+});
+
+test("more accounts helps meaningfully once the weekly ratio is right", () => {
+  const profile = flatProfile(20);
+  const mk = (n: number): SimAccount[] =>
+    Array.from({ length: n }, (_, i) => account({ slot: `s${i}` }));
+  const one = simulate(mk(1), profile, policy(), NOW, 7 * DAY, "p50").blackoutSec;
+  const three = simulate(mk(3), profile, policy(), NOW, 7 * DAY, "p50").blackoutSec;
+  assert.ok(three < one, `3 slots (${three}s) should beat 1 (${one}s)`);
 });
