@@ -104,4 +104,42 @@ export const MIGRATIONS: string[] = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_transcript_ts ON transcript_msg (ts)`,
   `CREATE INDEX IF NOT EXISTS idx_transcript_model ON transcript_msg (model)`,
+
+  // ── Correction: is_sidechain is dead on this machine, entrypoint is not ──
+  //
+  // The "who burned it — me or an agent" breakdown was going to come from
+  // `isSidechain`. It cannot: across the whole archive that field is `false`
+  // on all 96,985 records and `true` on exactly zero. Claude Code sets it for
+  // its own Task-tool subagents, and on this machine agent work is bb threads
+  // instead — each of which gets its own transcript file, not a sidechain.
+  //
+  // `entrypoint` carries the distinction that actually exists here:
+  //   sdk-cli       33689   bb-spawned agent threads
+  //   cli            8497   a human typing in a terminal
+  //   sdk-ts         4431   SDK / workflow agents
+  //   claude-vscode    86   the IDE extension
+  //
+  // Drop and rebuild rather than ALTER: existing rows are written with
+  // INSERT OR IGNORE, so adding a column would leave all 24k of them NULL
+  // forever. Clearing the cursors forces a full re-index, which measured 11
+  // seconds for the entire 550MB archive.
+  `DROP TABLE IF EXISTS transcript_msg`,
+  `DELETE FROM ingest_cursor`,
+  `CREATE TABLE IF NOT EXISTS transcript_msg (
+     session_id TEXT NOT NULL,
+     message_id TEXT NOT NULL,
+     ts INTEGER NOT NULL,
+     cwd TEXT,
+     project TEXT,
+     model TEXT,
+     entrypoint TEXT,
+     is_sidechain INTEGER NOT NULL DEFAULT 0,
+     input_tokens INTEGER NOT NULL DEFAULT 0,
+     output_tokens INTEGER NOT NULL DEFAULT 0,
+     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (session_id, message_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_transcript_ts ON transcript_msg (ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_transcript_entrypoint ON transcript_msg (entrypoint)`,
 ];

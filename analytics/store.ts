@@ -167,9 +167,9 @@ export function writeTranscriptRows(db: Database, rows: TranscriptRow[]): number
   if (rows.length === 0) return 0;
   const stmt = db.prepare(
     `INSERT OR IGNORE INTO transcript_msg
-       (session_id, message_id, ts, cwd, project, model, is_sidechain,
+       (session_id, message_id, ts, cwd, project, model, entrypoint, is_sidechain,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const writeAll = db.transaction((batch: TranscriptRow[]) => {
     let n = 0;
@@ -181,6 +181,7 @@ export function writeTranscriptRows(db: Database, rows: TranscriptRow[]): number
         r.cwd,
         r.project,
         r.model,
+        r.entrypoint,
         r.isSidechain ? 1 : 0,
         r.inputTokens,
         r.outputTokens,

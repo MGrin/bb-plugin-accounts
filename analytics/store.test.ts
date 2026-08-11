@@ -144,6 +144,7 @@ const tRow = (over: Partial<TranscriptRow> = {}): TranscriptRow => ({
   cwd: "/tmp",
   project: "p",
   model: "claude-opus-5",
+  entrypoint: "sdk-cli",
   isSidechain: false,
   inputTokens: 1,
   outputTokens: 2,

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseTranscriptLine } from "./transcripts.ts";
+import { agentShape, parseTranscriptLine } from "./transcripts.ts";
 
 /** Shaped from a real record — see the TOP KEYS/MSG KEYS survey in the plan. */
 const REAL = JSON.stringify({
@@ -8,6 +8,7 @@ const REAL = JSON.stringify({
   timestamp: "2026-07-30T05:37:15.869Z",
   cwd: "/Users/mgrin/Projects/mgrin/bb-plugin-accounts",
   sessionId: "sess-from-record",
+  entrypoint: "sdk-cli",
   isSidechain: false,
   requestId: "req_1",
   message: {
@@ -38,6 +39,24 @@ test("parses a real assistant record", () => {
   assert.equal(row.cacheReadTokens, 22860);
   assert.equal(row.outputTokens, 1062);
   assert.equal(row.isSidechain, false);
+  assert.equal(row.entrypoint, "sdk-cli");
+});
+
+test("entrypoint is null when absent rather than guessed", () => {
+  const line = JSON.stringify({
+    timestamp: "2026-08-11T10:00:00Z",
+    message: { id: "m", usage: { output_tokens: 1 } },
+  });
+  assert.equal(parseTranscriptLine(line, "s", null)!.entrypoint, null);
+});
+
+test("agentShape maps entrypoints to who actually spent it", () => {
+  assert.equal(agentShape("sdk-cli"), "bb-agent");
+  assert.equal(agentShape("cli"), "terminal");
+  assert.equal(agentShape("sdk-ts"), "sdk");
+  assert.equal(agentShape("claude-vscode"), "ide");
+  assert.equal(agentShape(null), "other");
+  assert.equal(agentShape("something-new"), "other");
 });
 
 test("prefers the record's own sessionId over the filename", () => {

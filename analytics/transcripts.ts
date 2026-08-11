@@ -27,12 +27,49 @@ export interface TranscriptRow {
   /** The transcript's parent directory name, which encodes the project path. */
   project: string | null;
   model: string | null;
-  /** True for subagent / fleet fan-out messages, false for the main thread. */
+  /**
+   * How this session was launched: `sdk-cli` (a bb-spawned agent thread),
+   * `cli` (a human in a terminal), `sdk-ts`, `claude-vscode`. This is the
+   * agent-shape signal — see agentShape() — because `isSidechain` is not one.
+   */
+  entrypoint: string | null;
+  /**
+   * Claude Code's own Task-tool subagent flag.
+   *
+   * Recorded for completeness but NOT usable as the agent-shape breakdown on
+   * this machine: it is `false` on all 96,985 archived records and `true` on
+   * none of them, because agent work here runs as bb threads, each with its
+   * own transcript, rather than as in-process sidechains.
+   */
   isSidechain: boolean;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+}
+
+/**
+ * Who actually spent this — the breakdown mgrin asked for as "main vs
+ * subagent vs fleet", expressed in the terms this machine has.
+ *
+ * `sdk-cli` is how bb launches an agent thread, so it is every fleet worker,
+ * every automation, and every spawned child. `cli` is a human at a terminal.
+ * The distinction matters because it is the one that changes behaviour: a
+ * fleet is what burns a 5-hour window inside a single poll interval.
+ */
+export function agentShape(entrypoint: string | null | undefined): string {
+  switch (entrypoint) {
+    case "sdk-cli":
+      return "bb-agent";
+    case "cli":
+      return "terminal";
+    case "sdk-ts":
+      return "sdk";
+    case "claude-vscode":
+      return "ide";
+    default:
+      return "other";
+  }
 }
 
 /** Coerce anything to a finite non-negative integer. Absent, null and "lots" all mean 0. */
@@ -90,6 +127,7 @@ export function parseTranscriptLine(
     cwd: typeof record.cwd === "string" ? record.cwd : null,
     project,
     model: typeof message?.model === "string" ? message.model : null,
+    entrypoint: typeof record.entrypoint === "string" ? record.entrypoint : null,
     isSidechain: record.isSidechain === true,
     inputTokens,
     outputTokens,
