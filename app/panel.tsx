@@ -24,6 +24,7 @@ type Analytics = {
   byModel: { key: string; messages: number; weightedK: number }[];
   byAgent: { key: string; messages: number; weightedK: number }[];
   byProject: { key: string; messages: number; weightedK: number }[];
+  byRepo: { key: string; messages: number; weightedK: number }[];
   byHourOfWeek: { dayOfWeek: number; hour: number; weightedK: number }[];
 };
 
@@ -144,6 +145,7 @@ export function UsagePanel() {
   const modelOrder = (data?.byModel ?? []).map((s) => s.key);
   const agentOrder = (data?.byAgent ?? []).map((s) => s.key);
   const projectOrder = (data?.byProject ?? []).map((s) => s.key);
+  const repoOrder = (data?.byRepo ?? []).map((s) => s.key);
 
   return (
     <div className="acct-viz p-4 space-y-4 max-w-4xl mx-auto">
@@ -201,7 +203,14 @@ export function UsagePanel() {
         </Section>
       </div>
 
-      <Section title="By project">
+      <Section
+        title="By repo"
+        hint="Resolved from bb's own project records first, then the environment, then git — a bb worktree is disposable, so most of these directories no longer exist. (no repo) is work that genuinely belongs to none: personal workspaces and your home directory."
+      >
+        {data ? <BarList slices={data.byRepo} order={repoOrder} /> : null}
+      </Section>
+
+      <Section title="By directory" hint="The working directory itself, for when the repo is not the interesting part.">
         {data ? <BarList slices={data.byProject} order={projectOrder} /> : null}
       </Section>
 
