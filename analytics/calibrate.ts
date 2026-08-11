@@ -63,6 +63,45 @@ export const SEED_PRIORS: Record<string, number> = {
   other: 0.02,
 };
 
+/**
+ * Join the two spines: for each burn interval, what tokens were spent inside
+ * it, by family, in thousands of weighted tokens.
+ *
+ * Attribution is unambiguous for one reason only — a single Keychain means
+ * exactly one account is billable at a time, so every token spent between t0
+ * and t1 was spent on whichever slot was active then. The caller is
+ * responsible for having already excluded intervals where that was not
+ * continuously true.
+ *
+ * Messages are matched by a merge walk rather than a scan per interval:
+ * intervals arrive sorted by t1 and messages by ts, and the archive is large
+ * enough that the quadratic version is not a theoretical concern.
+ */
+export function buildObservations(
+  intervals: Array<{ t0: number; t1: number; deltaUtil: number }>,
+  messages: Array<{ ts: number; model: string | null } & TokenCounts>,
+): FitObservation[] {
+  const sortedIntervals = [...intervals].sort((a, b) => a.t0 - b.t0 || a.t1 - b.t1);
+  const sortedMessages = [...messages].sort((a, b) => a.ts - b.ts);
+
+  const out: FitObservation[] = [];
+  let cursor = 0;
+  for (const iv of sortedIntervals) {
+    // Intervals can overlap across slots, so the cursor only ever advances
+    // past messages older than the EARLIEST interval still to be processed.
+    while (cursor < sortedMessages.length && sortedMessages[cursor]!.ts < iv.t0) cursor++;
+    const tokensByModel: Record<string, number> = {};
+    for (let i = cursor; i < sortedMessages.length; i++) {
+      const m = sortedMessages[i]!;
+      if (m.ts >= iv.t1) break;
+      const family = modelFamily(m.model);
+      tokensByModel[family] = (tokensByModel[family] ?? 0) + weightedTokens(m) / 1000;
+    }
+    out.push({ deltaUtil: iv.deltaUtil, tokensByModel });
+  }
+  return out;
+}
+
 export interface FitObservation {
   /** Utilization points consumed over this interval. */
   deltaUtil: number;

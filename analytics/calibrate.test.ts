@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fitModelWeights, modelFamily, SEED_PRIORS, weightedTokens } from "./calibrate.ts";
+import { buildObservations, fitModelWeights, modelFamily, SEED_PRIORS, weightedTokens } from "./calibrate.ts";
 
 test("weightedTokens discounts cache reads and weights output up", () => {
   const z = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
@@ -78,6 +78,70 @@ test("no observations at all returns the priors unchanged", () => {
 test("observations with no tokens at all cannot move a weight", () => {
   const fit = fitModelWeights([{ deltaUtil: 50, tokensByModel: {} }], { a: 1.0 });
   assert.equal(fit.weights.a, 1.0);
+});
+
+const message = (ts: number, model: string | null, outputTokens: number) => ({
+  ts,
+  model,
+  inputTokens: 0,
+  outputTokens,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+});
+
+test("buildObservations attributes messages to the interval containing them", () => {
+  const obs = buildObservations(
+    [{ t0: 0, t1: 100, deltaUtil: 5 }, { t0: 100, t1: 200, deltaUtil: 9 }],
+    [message(10, "claude-opus-5", 250), message(150, "claude-sonnet-5", 500)],
+  );
+  assert.equal(obs.length, 2);
+  // 250 output tokens * 4 / 1000 = 1.0 thousand weighted
+  assert.deepEqual(obs[0], { deltaUtil: 5, tokensByModel: { opus: 1 } });
+  assert.deepEqual(obs[1], { deltaUtil: 9, tokensByModel: { sonnet: 2 } });
+});
+
+test("buildObservations is half-open: t0 inclusive, t1 exclusive", () => {
+  const obs = buildObservations(
+    [{ t0: 100, t1: 200, deltaUtil: 1 }],
+    [message(99, "claude-opus-5", 250), message(100, "claude-opus-5", 250), message(200, "claude-opus-5", 250)],
+  );
+  assert.deepEqual(obs[0]!.tokensByModel, { opus: 1 });
+});
+
+test("buildObservations sums several models inside one interval", () => {
+  const obs = buildObservations(
+    [{ t0: 0, t1: 100, deltaUtil: 5 }],
+    [message(10, "claude-opus-5", 250), message(20, "claude-opus-5", 250), message(30, "claude-haiku-4-5", 250)],
+  );
+  assert.deepEqual(obs[0]!.tokensByModel, { opus: 2, haiku: 1 });
+});
+
+test("buildObservations yields an empty token map for an interval with no messages", () => {
+  const obs = buildObservations([{ t0: 0, t1: 100, deltaUtil: 3 }], []);
+  assert.deepEqual(obs, [{ deltaUtil: 3, tokensByModel: {} }]);
+});
+
+test("buildObservations handles overlapping intervals from different slots", () => {
+  // Two slots can produce intervals covering the same wall-clock span.
+  const obs = buildObservations(
+    [{ t0: 0, t1: 100, deltaUtil: 5 }, { t0: 0, t1: 100, deltaUtil: 0 }],
+    [message(50, "claude-opus-5", 250)],
+  );
+  assert.deepEqual(obs[0]!.tokensByModel, { opus: 1 });
+  assert.deepEqual(obs[1]!.tokensByModel, { opus: 1 });
+});
+
+test("a fit over buildObservations output recovers a planted weight", () => {
+  const perThousand = 2.5;
+  const intervals = [];
+  const messages = [];
+  for (let i = 0; i < 8; i++) {
+    const tokens = 250 * (i + 1); // -> (i+1) thousand weighted
+    intervals.push({ t0: i * 100, t1: i * 100 + 100, deltaUtil: (i + 1) * perThousand });
+    messages.push(message(i * 100 + 10, "claude-opus-5", tokens));
+  }
+  const fit = fitModelWeights(buildObservations(intervals, messages), {});
+  assert.ok(Math.abs(fit.weights.opus! - perThousand) < 0.01, `opus was ${fit.weights.opus}`);
 });
 
 test("the seed priors order the families the way pricing does", () => {
