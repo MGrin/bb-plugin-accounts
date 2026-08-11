@@ -1,5 +1,12 @@
 // The usage dashboard. Its own route, so it owns the whole page.
 //
+// SCROLLING IS THE PANEL'S JOB. bb hands a nav panel a fixed-height container,
+// so a root that just grows is silently clipped at the viewport — which is
+// exactly what happened here: everything below the heatmap was unreachable.
+// The root owns the scroll (h-full + overflow-y-auto) and the padded, centred
+// column sits inside it, so the scrollbar tracks the panel edge rather than
+// the middle of the content.
+//
 // Responsive because this has to work from a phone over bb.scani.xyz, and any
 // state that must outlive navigation goes to localStorage — a route-scoped
 // panel unmounts on every navigation, so a useRef would silently reset.
@@ -148,8 +155,9 @@ export function UsagePanel() {
   const repoOrder = (data?.byRepo ?? []).map((s) => s.key);
 
   return (
-    <div className="acct-viz p-4 space-y-4 max-w-4xl mx-auto">
+    <div className="acct-viz h-full overflow-y-auto">
       <PaletteVars />
+      <div className="p-4 pb-10 space-y-4 max-w-4xl mx-auto">
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
@@ -186,6 +194,14 @@ export function UsagePanel() {
           title="Would more accounts help?"
           hint="The same simulation re-run with a different number of subscriptions. Assumes an added account has identical limits and that demand does not grow to fill the extra headroom — the second is the weaker assumption."
         >
+          {fc.confidence !== "fitted" && (
+            // The curve comes from the same demand profile whose blackout times
+            // are withheld above. Showing it unmarked would let a number built
+            // on a few hours of history argue for buying a subscription.
+            <div className="mb-3 rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
+              Built on the same thin history as the forecast above — read the shape, not the hours.
+            </div>
+          )}
           <SlotCurve points={fc.slotCurve} actual={Object.keys(fc.weeklyExhaustedAt).length} />
         </Section>
       )}
@@ -214,7 +230,8 @@ export function UsagePanel() {
         {data ? <BarList slices={data.byProject} order={projectOrder} /> : null}
       </Section>
 
-      {loading && <div className="text-xs text-muted-foreground">refreshing…</div>}
+        {loading && <div className="text-xs text-muted-foreground">refreshing…</div>}
+      </div>
     </div>
   );
 }
