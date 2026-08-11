@@ -24,9 +24,12 @@ import {
   createRecoverySweeper,
   decideSwitch,
   isLimitError,
+  isLimitFailure,
+  type LimitFailureSignal,
   pickBest as pickBestOf,
   type PrevSample,
   type RecoveryAttemptResult,
+  shouldNudgeAfterIneligible,
   type StuckThreadRecord,
   type StuckThreadStore,
   type ThreadRecoveryPort,
@@ -202,9 +205,36 @@ export default async function plugin(bb: BbPluginApi) {
     async attemptContinue(threadId): Promise<RecoveryAttemptResult> {
       try {
         const status = await bb.sdk.threads.rateLimitRecovery({ threadId });
-        if (status.reason !== "eligible" || !status.candidate) return { outcome: "not-eligible", reason: status.reason };
+        if (status.reason === "eligible" && status.candidate) {
+          await new Promise((r) => setTimeout(r, 3000));
+          await bb.sdk.threads.continueAfterRateLimit({ threadId, failedRequestId: status.candidate.failedRequestId });
+          return { outcome: "continued" };
+        }
+        // bb has no replayable candidate. That is not the same as "unrecoverable":
+        // thr_3waqz7vb9w sat dead for ten hours on 2026-08-11 with reason
+        // "no-rate-limit-state", because its limit arrived as an agentMessage
+        // rather than a stored failed request. A plain follow-up message — what
+        // a human would send — started it again immediately.
+        if (!shouldNudgeAfterIneligible(status.reason)) {
+          return { outcome: "not-eligible", reason: status.reason };
+        }
         await new Promise((r) => setTimeout(r, 3000));
-        await bb.sdk.threads.continueAfterRateLimit({ threadId, failedRequestId: status.candidate.failedRequestId });
+        // mode "auto", not the default "steer": bb rejects a steer into a thread
+        // that is not active with HTTP 409 "Thread is not active", which is
+        // exactly the state every stuck thread is in.
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "auto",
+          input: [{
+            type: "text",
+            mentions: [],
+            text:
+              "[accounts] Provider capacity is back and this thread was stopped by a rate limit. " +
+              "bb had no replayable request for it, so this is a plain restart rather than a retry of the failed call. " +
+              "Continue from where you left off — re-check anything whose result you never saw before acting on it.",
+          }],
+        });
+        bb.log.info(`recovery: nudged ${threadId} back to life (bb reason: ${status.reason})`);
         return { outcome: "continued" };
       } catch (e) {
         return { outcome: "error", message: e instanceof Error ? e.message : String(e) };
@@ -367,6 +397,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
+  /** Which signal actually caught this failure — the line that was missing all night. */
+  const describeSignal = (s: LimitFailureSignal): string =>
+    isLimitError(s.error)
+      ? `error: ${s.error}`
+      : s.rateLimitStatus === "blocked"
+      ? `rate limits blocked, bb reason ${s.recoveryReason}`
+      : `bb reason ${s.recoveryReason}`;
+
   // Reactive path — the optimization ladder. Goal: maximize usage across all
   // accounts × model tiers; never leave window tokens stranded.
   //
@@ -380,8 +418,22 @@ export default async function plugin(bb: BbPluginApi) {
   //      the lowest-usage fresh account and auto-continue the thread there.
   bb.events.on("thread.failed", ({ thread, error }) => {
     void (async () => {
-      // isLimitError lives in lib.ts under test — see the 2026-08-10 note there.
-      if (!isLimitError(error)) return;
+      // `error` is null on every real limit failure — bb fills it only from
+      // `system/error` events and provider limits are `provider/error`. Proven
+      // 2026-08-11; see isLimitFailure in lib.ts. So when the string does not
+      // settle it, ask bb's own recovery inspection, which carries the
+      // provider rate-limit snapshot on every answer.
+      let signal: LimitFailureSignal = { error };
+      if (!isLimitError(error)) {
+        try {
+          const status = await bb.sdk.threads.rateLimitRecovery({ threadId: thread.id });
+          signal = { error, rateLimitStatus: status.rateLimits?.status ?? null, recoveryReason: status.reason };
+        } catch (e) {
+          bb.log.warn(`limit inspection failed for ${thread.id}: ${e instanceof Error ? e.message : e}`);
+        }
+      }
+      if (!isLimitFailure(signal)) return;
+      bb.log.info(`thread ${thread.id} failed on a provider limit (${describeSignal(signal)}) — tracking for recovery`);
       // Track this thread as stuck regardless of what happens below — a
       // fable-downgrade or a switch that itself fails must not lose it.
       await sweeper.onLimitFailure(thread.id, thread.providerId);

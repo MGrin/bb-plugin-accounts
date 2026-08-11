@@ -10,12 +10,14 @@ import {
   createRecoverySweeper,
   decideSwitch,
   isLimitError,
+  isLimitFailure,
   pickBest,
   planSweep,
   type RecoveryAttemptResult,
   type RecoveryPolicy,
   type StuckThreadRecord,
   type StuckThreadStore,
+  shouldNudgeAfterIneligible,
   type SwitchPolicy,
   type ThreadStatus,
   type ThreadStatusPort,
@@ -135,6 +137,82 @@ test("isLimitError ignores the ordinary ways a thread dies", () => {
     null,
     undefined,
   ]) assert.equal(isLimitError(e), false, `should not match: ${JSON.stringify(e)}`);
+});
+
+// ── the 2026-08-11 outage: the trigger never fired at all ────────────────────
+//
+// Proven from ~/.bb/logs/server.*.log and bb.db that morning: grep for
+// "reactive" across every bb server log this machine has ever written returns
+// ZERO hits, the kv key "stuck-threads" had never once existed, and all 39
+// sweep lines ever logged say "holding 0 thread(s)". Cause: bb's
+// emitThreadFailed fills `error` from getLastThreadErrorMessage(), which
+// queries ONLY events of type "system/error" — while every provider rate limit
+// is stored as type "provider/error". Census of the whole event table that
+// morning: 100 provider/error rows against 1 system/error row. So `error` is
+// null on every real limit failure and isLimitError(null) is false, forever.
+//
+// isLimitError is not wrong; it is simply never handed a string. The fix is a
+// second signal, so the trigger stops depending on a field bb does not fill.
+
+test("a limit failure is recognised from the rate-limit snapshot when bb sends error:null", () => {
+  // The exact shape of the 2026-08-11 loss: thr_3waqz7vb9w died on "You've hit
+  // your session limit · resets 2:10am" recorded as provider/error, so
+  // thread.failed carried error:null — but the preceding
+  // provider/rateLimits/updated event had status "blocked".
+  assert.ok(isLimitFailure({ error: null, rateLimitStatus: "blocked" }));
+});
+
+test("a limit failure is recognised when bb itself rules the thread recoverable", () => {
+  assert.ok(isLimitFailure({ error: null, recoveryReason: "eligible" }));
+});
+
+test("the error string still decides on its own when bb does fill it in", () => {
+  assert.ok(isLimitFailure({ error: "You've hit your session limit · resets 6pm" }));
+  assert.ok(isLimitFailure({ error: "HTTP 429 Too Many Requests", rateLimitStatus: "allowed" }));
+});
+
+test("an ordinary crash is not a limit failure just because it was inspected", () => {
+  // spawn codex ENOENT killed a thread the same night. Tracking it would spend
+  // five resume attempts on a binary that is still missing.
+  for (const signal of [
+    { error: "Provider \"codex\" failed to start: spawn codex ENOENT" },
+    { error: null, rateLimitStatus: "allowed" },
+    { error: null, rateLimitStatus: null, recoveryReason: "no-terminal-rate-limit-error" },
+    { error: null },
+    {},
+  ]) assert.equal(isLimitFailure(signal), false, `should not match: ${JSON.stringify(signal)}`);
+});
+
+// ── the second half of the same outage: detection is not resumption ──────────
+//
+// Even with detection fixed, thr_3waqz7vb9w could not have been resumed:
+// `bb thread retry` refused it with "no-rate-limit-state", because the limit
+// arrived as an agentMessage rather than a stored recovery candidate. The
+// sweeper would have spent all five attempts on continueAfterRateLimit and
+// then dropped the thread. What actually revived it by hand was an ordinary
+// follow-up message (`bb thread tell --mode auto`), so the sweeper needs that
+// as its fallback.
+
+test("a thread bb has no recovery candidate for is still worth a plain nudge", () => {
+  assert.ok(shouldNudgeAfterIneligible("no-rate-limit-state"));
+  assert.ok(shouldNudgeAfterIneligible("no-terminal-rate-limit-error"));
+  assert.ok(shouldNudgeAfterIneligible("input-not-accepted"));
+});
+
+test("a nudge is withheld wherever bb has already ruled on the thread", () => {
+  // Each of these is bb saying something specific that a nudge would override:
+  // it is already retrying, the thread is alive, the turn did work we would
+  // duplicate, a human asked to drive, or the environment is gone.
+  for (const reason of [
+    "provider-will-retry",
+    "thread-not-failed",
+    "output-or-side-effect-observed",
+    "manual-only",
+    "superseded",
+    "execution-unavailable",
+    "no-failed-turn",
+    "eligible",
+  ]) assert.equal(shouldNudgeAfterIneligible(reason), false, `should not nudge on: ${reason}`);
 });
 
 // ── the trips ported from the Python switcher (2026-08-10 consolidation) ──────
