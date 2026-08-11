@@ -40,6 +40,7 @@ import {
   worst,
 } from "./lib.ts";
 import { buildObservations, fitModelWeights, SEED_PRIORS } from "./analytics/calibrate.ts";
+import { type AlertMemory, EMPTY_MEMORY, planAlerts } from "./analytics/alerts.ts";
 import { buildForecast, type Forecast } from "./analytics/forecast.ts";
 import { ingestUsage } from "./analytics/ingest.ts";
 import { buildProfile } from "./analytics/profile.ts";
@@ -80,7 +81,48 @@ const accountShape = z.object({
 });
 type Account = z.infer<typeof accountShape>;
 
+const burnSliceShape = z.object({ key: z.string(), messages: z.number(), weightedK: z.number() });
+
+const forecastShape = z.object({
+  confidence: z.enum(["provisional", "fitted", "stale"]),
+  coverage: z.object({
+    distinctPolls: z.number(),
+    latestSampleAt: z.number().nullable(),
+    staleAfterSec: z.number(),
+    demandSamples: z.number().optional(),
+    neededPolls: z.number(),
+  }),
+  generatedAt: z.number(),
+  horizonSec: z.number(),
+  blackout: z.object({
+    earliest: z.number().nullable(),
+    likely: z.number().nullable(),
+    latest: z.number().nullable(),
+    endsAt: z.number().nullable(),
+    expectedSec: z.number(),
+  }),
+  weeklyExhaustedAt: z.record(z.string(), z.number().nullable()),
+  timeline: z.array(z.object({ ts: z.number(), headroom: z.number(), blacked: z.boolean() })),
+  slotCurve: z.array(z.object({ slots: z.number(), blackoutHoursPerWeek: z.number() })),
+});
+
 export const rpcContract = defineRpcContract({
+  forecast: { input: z.null(), output: forecastShape.nullable() },
+  analytics: {
+    input: z.object({ days: z.number() }),
+    output: z.object({
+      days: z.number(),
+      coverage: z.object({
+        messages: z.number(),
+        firstTs: z.number().nullable(),
+        lastTs: z.number().nullable(),
+      }),
+      byModel: z.array(burnSliceShape),
+      byAgent: z.array(burnSliceShape),
+      byProject: z.array(burnSliceShape),
+      byHourOfWeek: z.array(z.object({ dayOfWeek: z.number(), hour: z.number(), weightedK: z.number() })),
+    }),
+  },
   status: {
     input: z.null(),
     output: z.object({
@@ -380,6 +422,34 @@ export default async function plugin(bb: BbPluginApi) {
     } catch { /* a missing notifier must not break the watch */ }
   }
 
+  /** The same osascript path alarmIfCornered uses — one notifier, one look. */
+  async function notify(title: string, message: string): Promise<void> {
+    try {
+      await run("osascript", [
+        "-e",
+        `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`,
+      ], { timeout: 5_000 });
+    } catch { /* a missing notifier must not break the watch */ }
+  }
+
+  /**
+   * Forecast-driven alerts. See analytics/alerts.ts for why these two exist and
+   * why they are not the thing the standing "never raise usage limits"
+   * instruction bans: they are about aggregate capacity, never one account, and
+   * never attached to a running task.
+   */
+  async function evaluateAlerts(): Promise<void> {
+    const forecast = await currentForecast();
+    if (!forecast) return;
+    const memory = (await bb.storage.kv.get<AlertMemory>("alert-memory")) ?? EMPTY_MEMORY;
+    const plan = planAlerts(forecast, memory, Math.floor(Date.now() / 1000));
+    if (plan.memory !== memory) await bb.storage.kv.set("alert-memory", plan.memory);
+    for (const alert of plan.fire) {
+      bb.log.warn(`alert(${alert.kind}): ${alert.message}`);
+      await notify(alert.title, alert.message);
+    }
+  }
+
   bb.background.schedule("watch", "*/2 * * * *", async () => {
     const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
     const { polledAt, accounts } = await readUsage();
@@ -397,6 +467,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const { inserted, intervals } = ingestUsage(db, polledAt, accounts);
       if (inserted) bb.log.debug(`analytics: poll ${polledAt} recorded (${inserted} rows, ${intervals} intervals)`);
+      await evaluateAlerts();
     } catch (e) {
       bb.log.warn(`analytics ingest failed: ${e instanceof Error ? e.message : e}`);
     }
@@ -526,6 +597,26 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const readSamplesFor = (slot: string, sinceEpochSec: number) => readSamples(db, slot, sinceEpochSec);
+
+  /**
+   * Re-aggregate after relabelling. Grouping happens in SQL on the raw column,
+   * and two different cwds legitimately share a label — a repo and a worktree
+   * inside it both read as the same project — so without this the same name
+   * appears twice with its burn split across the rows.
+   */
+  const mergeByKey = (slices: { key: string; messages: number; weightedK: number }[]) => {
+    const merged = new Map<string, { key: string; messages: number; weightedK: number }>();
+    for (const s of slices) {
+      const prev = merged.get(s.key);
+      if (prev) {
+        prev.messages += s.messages;
+        prev.weightedK += s.weightedK;
+      } else {
+        merged.set(s.key, { ...s });
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.weightedK - a.weightedK);
+  };
 
   async function currentForecast(): Promise<Forecast | null> {
     const { switchAt, weeklyAt, staleAfterMin } = await settings.get();
@@ -709,6 +800,24 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    async forecast() {
+      return (await currentForecast()) ?? null;
+    },
+    async analytics({ days }) {
+      const now = Math.floor(Date.now() / 1000);
+      const since = now - Math.max(1, days) * 86400;
+      const offsetSec = -new Date().getTimezoneOffset() * 60;
+      return {
+        days,
+        coverage: transcriptCoverage(db),
+        byModel: burnBy(db, "model", since),
+        byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((x) => ({ ...x, key: agentShape(x.key) }))),
+        byProject: mergeByKey(
+          burnBy(db, "project", since).map((x) => ({ ...x, key: prettyProject(x.key) })),
+        ).slice(0, 12),
+        byHourOfWeek: burnByHourOfWeek(db, since, offsetSec),
+      };
+    },
     async status() {
       const { polledAt, accounts } = await readUsage();
       const lastSwitch =
@@ -794,26 +903,6 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 1, stderr: `reindex failed: ${e instanceof Error ? e.message : e}` };
         }
       }
-
-      /**
-       * Re-aggregate after relabelling. Grouping happens in SQL on the raw
-       * column, and two different cwds legitimately share a label — a repo and
-       * a worktree inside it both read as the same project — so without this
-       * the same name appears twice with its burn split between the rows.
-       */
-      const mergeByKey = (slices: { key: string; messages: number; weightedK: number }[]) => {
-        const merged = new Map<string, { key: string; messages: number; weightedK: number }>();
-        for (const s of slices) {
-          const prev = merged.get(s.key);
-          if (prev) {
-            prev.messages += s.messages;
-            prev.weightedK += s.weightedK;
-          } else {
-            merged.set(s.key, { ...s });
-          }
-        }
-        return [...merged.values()].sort((a, b) => b.weightedK - a.weightedK);
-      };
 
       if (cmd === "stats") {
         const days = flag("days", 7);
