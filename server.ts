@@ -39,6 +39,8 @@ import {
   type ThreadStatusPort,
   worst,
 } from "./lib.ts";
+import { ingestUsage } from "./analytics/ingest.ts";
+import { MIGRATIONS } from "./analytics/schema.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -119,6 +121,11 @@ export default async function plugin(bb: BbPluginApi) {
     recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "5" },
     recoveryGiveUpAfterHours: { type: "string", label: "Give up resuming a thread this long after it first got stuck (0 = never)", default: "6" },
   });
+
+  // Analytics storage. Opened once at load; the host tracks the handle and
+  // closes it on dispose/reload. Migrations are append-only — see schema.ts.
+  const db = bb.storage.database();
+  bb.storage.migrate(db, MIGRATIONS);
 
   const isStale = async (polledAt: number | null) => {
     const { staleAfterMin } = await settings.get();
@@ -352,11 +359,29 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.schedule("watch", "*/2 * * * *", async () => {
     const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
+    const { polledAt, accounts } = await readUsage();
+
+    // RECORDING COMES FIRST, AND IS UNCONDITIONAL.
+    //
+    // Not gated on autoSwitch: a machine with auto-switch off still burns
+    // quota, and the history is the entire point. Not gated on staleness
+    // either — a stale poll is still a fact about what the poller last saw,
+    // and INSERT OR IGNORE makes re-reading the same polledAt free.
+    //
+    // Its own try/catch, deliberately. Everything below this line is the path
+    // that keeps rate-limited threads alive; an analytics bug must never be
+    // able to take that down with it.
+    try {
+      const { inserted, intervals } = ingestUsage(db, polledAt, accounts);
+      if (inserted) bb.log.debug(`analytics: poll ${polledAt} recorded (${inserted} rows, ${intervals} intervals)`);
+    } catch (e) {
+      bb.log.warn(`analytics ingest failed: ${e instanceof Error ? e.message : e}`);
+    }
+
     if (!autoSwitch) return;
     // Before anything that can return early: a stale poller or an untrustworthy
     // active slot must not also stop us NOTICING what is stuck.
     await reconcile(Number(recoverySettings.recoveryGiveUpAfterHours) * 3600);
-    const { polledAt, accounts } = await readUsage();
     if (await isStale(polledAt)) return;
     const active = accounts.find((a) => a.active);
     if (!active) return;
