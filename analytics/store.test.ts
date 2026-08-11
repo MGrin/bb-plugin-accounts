@@ -6,12 +6,17 @@ import {
   countDistinctPolls,
   insertSamples,
   latestSampleAt,
+  readCursors,
   readIntervals,
   readSamples,
+  transcriptCoverage,
   type UsageSampleRow,
+  writeCursor,
   writeIntervals,
+  writeTranscriptRows,
 } from "./store.ts";
 import type { BurnInterval } from "./intervals.ts";
+import type { TranscriptRow } from "./transcripts.ts";
 
 function freshDb() {
   const db = new Database(":memory:");
@@ -130,4 +135,55 @@ test("intervals for different slots at the same t1 coexist", () => {
   const db = freshDb();
   writeIntervals(db, [interval({ slot: "a" }), interval({ slot: "b" })]);
   assert.equal(readIntervals(db, "5h", 0).length, 2);
+});
+
+const tRow = (over: Partial<TranscriptRow> = {}): TranscriptRow => ({
+  sessionId: "s1",
+  messageId: "m1",
+  ts: 1000,
+  cwd: "/tmp",
+  project: "p",
+  model: "claude-opus-5",
+  isSidechain: false,
+  inputTokens: 1,
+  outputTokens: 2,
+  cacheReadTokens: 3,
+  cacheCreationTokens: 4,
+  ...over,
+});
+
+test("the same (sessionId, messageId) is written once — this is the dedupe", () => {
+  const db = freshDb();
+  assert.equal(writeTranscriptRows(db, [tRow()]), 1);
+  assert.equal(writeTranscriptRows(db, [tRow({ outputTokens: 999 })]), 0);
+  assert.equal(transcriptCoverage(db).messages, 1);
+});
+
+test("the same messageId in a different session is a different message", () => {
+  const db = freshDb();
+  writeTranscriptRows(db, [tRow({ sessionId: "s1" }), tRow({ sessionId: "s2" })]);
+  assert.equal(transcriptCoverage(db).messages, 2);
+});
+
+test("transcriptCoverage reports the recorded span", () => {
+  const db = freshDb();
+  assert.deepEqual(transcriptCoverage(db), { messages: 0, firstTs: null, lastTs: null });
+  writeTranscriptRows(db, [tRow({ messageId: "a", ts: 500 }), tRow({ messageId: "b", ts: 1500 })]);
+  assert.deepEqual(transcriptCoverage(db), { messages: 2, firstTs: 500, lastTs: 1500 });
+});
+
+test("cursors round-trip and overwrite by path", () => {
+  const db = freshDb();
+  assert.equal(readCursors(db).size, 0);
+  writeCursor(db, "/a.jsonl", { size: 10, mtime: 20, byteOffset: 5 });
+  writeCursor(db, "/b.jsonl", { size: 1, mtime: 2, byteOffset: 1 });
+  writeCursor(db, "/a.jsonl", { size: 30, mtime: 40, byteOffset: 25 });
+  const cursors = readCursors(db);
+  assert.equal(cursors.size, 2);
+  assert.deepEqual(cursors.get("/a.jsonl"), { size: 30, mtime: 40, byteOffset: 25 });
+});
+
+test("writeTranscriptRows on an empty batch is a no-op", () => {
+  const db = freshDb();
+  assert.equal(writeTranscriptRows(db, []), 0);
 });

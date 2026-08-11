@@ -3,6 +3,8 @@
 // judgement testable without a database.
 import type { Database } from "better-sqlite3";
 import type { BurnInterval, WindowKind } from "./intervals.ts";
+import type { ScanCursor } from "./scan.ts";
+import type { TranscriptRow } from "./transcripts.ts";
 
 export interface UsageSampleRow {
   /** Epoch SECONDS, taken from usage.json's own polledAt — not a local clock read. */
@@ -151,4 +153,71 @@ export function readIntervals(db: Database, window: WindowKind, sinceEpochSec: n
     .prepare(`SELECT * FROM burn_interval WHERE window = ? AND t1 >= ? ORDER BY t1 ASC, slot ASC`)
     .all(window, sinceEpochSec) as BurnIntervalDbRow[];
   return rows.map(toInterval);
+}
+
+// ── Transcript messages and scan cursors ───────────────────────────────────
+
+/**
+ * Persist parsed messages. IGNORE, not REPLACE: (session_id, message_id) is a
+ * stable identity and a re-read of the same bytes — after a rotation, or a
+ * crash between batch and cursor — must be a no-op rather than churn.
+ * Returns how many were actually new.
+ */
+export function writeTranscriptRows(db: Database, rows: TranscriptRow[]): number {
+  if (rows.length === 0) return 0;
+  const stmt = db.prepare(
+    `INSERT OR IGNORE INTO transcript_msg
+       (session_id, message_id, ts, cwd, project, model, is_sidechain,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const writeAll = db.transaction((batch: TranscriptRow[]) => {
+    let n = 0;
+    for (const r of batch) {
+      n += stmt.run(
+        r.sessionId,
+        r.messageId,
+        r.ts,
+        r.cwd,
+        r.project,
+        r.model,
+        r.isSidechain ? 1 : 0,
+        r.inputTokens,
+        r.outputTokens,
+        r.cacheReadTokens,
+        r.cacheCreationTokens,
+      ).changes;
+    }
+    return n;
+  });
+  return writeAll(rows);
+}
+
+export function readCursors(db: Database): Map<string, ScanCursor> {
+  const rows = db.prepare(`SELECT path, size, mtime, byte_offset FROM ingest_cursor`).all() as {
+    path: string;
+    size: number;
+    mtime: number;
+    byte_offset: number;
+  }[];
+  return new Map(rows.map((r) => [r.path, { size: r.size, mtime: r.mtime, byteOffset: r.byte_offset }]));
+}
+
+export function writeCursor(db: Database, path: string, cursor: ScanCursor): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO ingest_cursor (path, size, mtime, byte_offset) VALUES (?, ?, ?, ?)`,
+  ).run(path, cursor.size, cursor.mtime, cursor.byteOffset);
+}
+
+export interface TranscriptCoverage {
+  messages: number;
+  firstTs: number | null;
+  lastTs: number | null;
+}
+
+export function transcriptCoverage(db: Database): TranscriptCoverage {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n, MIN(ts) AS lo, MAX(ts) AS hi FROM transcript_msg`)
+    .get() as { n: number; lo: number | null; hi: number | null };
+  return { messages: row?.n ?? 0, firstTs: row?.lo ?? null, lastTs: row?.hi ?? null };
 }

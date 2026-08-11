@@ -40,7 +40,9 @@ import {
   worst,
 } from "./lib.ts";
 import { ingestUsage } from "./analytics/ingest.ts";
+import { scanTranscripts } from "./analytics/scan.ts";
 import { MIGRATIONS } from "./analytics/schema.ts";
+import { readCursors, transcriptCoverage, writeCursor, writeTranscriptRows } from "./analytics/store.ts";
 
 const run = promisify(execFile);
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
@@ -424,6 +426,46 @@ export default async function plugin(bb: BbPluginApi) {
     if (switched) {
       const swept = await sweeper.sweep("proactive-switch");
       if (swept.continued.length) bb.log.info(`proactive switch to ${target.slot} resumed: ${swept.continued.join(", ")}`);
+    }
+  });
+
+  // Transcript indexing — the retroactive half of the history.
+  //
+  // Deliberately its own schedule rather than a step in the watch tick: the
+  // first run walks ~550MB of ~2650 files, and nothing that slow belongs
+  // anywhere near the path that decides whether to switch accounts. After the
+  // backfill each run reads kilobytes, because a file whose (size, mtime) match
+  // its stored cursor is never opened at all.
+  const TRANSCRIPT_ROOT = `${os.homedir()}/.claude/projects`;
+  let indexing = false;
+  bb.background.schedule("index-transcripts", "*/15 * * * *", async () => {
+    // The backfill can outlast the interval. Overlapping runs would fight over
+    // the same cursors and re-read the same bytes, so a run in flight simply
+    // wins and the next tick becomes a no-op.
+    if (indexing) return;
+    indexing = true;
+    const startedAt = Date.now();
+    try {
+      const cursors = readCursors(db);
+      let written = 0;
+      const result = await scanTranscripts(TRANSCRIPT_ROOT, cursors, (rows, filePath, cursor) => {
+        // Rows BEFORE the cursor, always. A crash between the two re-reads a
+        // batch, which the (session_id, message_id) key makes free; the other
+        // order would advance past messages that were never stored.
+        written += writeTranscriptRows(db, rows);
+        writeCursor(db, filePath, cursor);
+      });
+      if (result.filesRead > 0) {
+        const cov = transcriptCoverage(db);
+        bb.log.info(
+          `analytics: indexed ${written} new message(s) from ${result.filesRead}/${result.filesSeen} transcript(s) ` +
+            `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} total`,
+        );
+      }
+    } catch (e) {
+      bb.log.warn(`transcript indexing failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      indexing = false;
     }
   });
 

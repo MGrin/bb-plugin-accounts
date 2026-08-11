@@ -415,8 +415,12 @@ git commit -m "feat(analytics): record every poll — stop losing usage history"
 
 **Interfaces:**
 - Produces:
-  - `interface TranscriptRow { sessionId: string; seq: number; ts: number; cwd: string | null; project: string | null; model: string | null; isSidechain: boolean; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }`
-  - `parseTranscriptLine(line: string, sessionId: string, seq: number, project: string | null): TranscriptRow | null`
+  - `interface TranscriptRow { sessionId: string; messageId: string; ts: number; cwd: string | null; project: string | null; model: string | null; isSidechain: boolean; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }`
+  - `parseTranscriptLine(line: string, fallbackSessionId: string, project: string | null): TranscriptRow | null`
+
+**CORRECTION made during implementation.** This task originally keyed rows on `(session_id, seq)` — the message's ordinal in the file. That is wrong. A transcript writes the *same* assistant message several times (one record per streaming update), each carrying a full, identical `usage` block. Measured over 60 real transcripts: **1142 usage-bearing records collapse to 625 distinct messages**, so an ordinal key double-counts most tokens — 2.07× inflation overall, 3.7× in the worst file sampled. Because the factor varies per file it cannot be divided out afterwards.
+
+`message.id` is the real identity: present on all 1142 records, never carrying conflicting usage for the same id, never spanning more than one `requestId` (which is itself occasionally absent, so it must not be part of the key). The schema change lands as an **appended** migration that drops and recreates `transcript_msg`, since migrations 0-7 have already run on the live database and editing a shipped statement would be a no-op there.
   - `scanTranscripts(root: string, cursors: Map<string, {size:number;mtime:number;byteOffset:number}>, onRows: (rows: TranscriptRow[], path: string, newCursor: {size:number;mtime:number;byteOffset:number}) => void): Promise<{filesScanned:number; rowsParsed:number}>`
 
 **Parsing is defensive throughout.** The transcript format is undocumented and a Claude Code upgrade can change it. A malformed line is skipped, never fatal.

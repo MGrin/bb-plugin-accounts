@@ -71,4 +71,37 @@ export const MIGRATIONS: string[] = [
      mtime INTEGER NOT NULL,
      byte_offset INTEGER NOT NULL
    )`,
+
+  // ── Correction, same day: transcript_msg was keyed on (session_id, seq) ──
+  //
+  // A transcript writes the SAME assistant message several times — one record
+  // per streaming update — each carrying a full, identical `usage` block.
+  // Measured over 60 real transcripts: 1142 usage-bearing records collapse to
+  // 625 distinct messages, so an ordinal key counts most tokens twice (2.07x
+  // inflation overall, 3.7x in the worst file sampled). Every downstream
+  // number — the calibration fit, the demand profile, the forecast — would
+  // have been silently wrong by a factor that varies per file, which is worse
+  // than being wrong by a constant.
+  //
+  // `message.id` is the real identity: present on every one of those 1142
+  // records, never carrying conflicting usage for the same id, and never
+  // spanning more than one requestId. Dropping and recreating is safe because
+  // nothing has ever written to this table — the scanner ships after it.
+  `DROP TABLE IF EXISTS transcript_msg`,
+  `CREATE TABLE IF NOT EXISTS transcript_msg (
+     session_id TEXT NOT NULL,
+     message_id TEXT NOT NULL,
+     ts INTEGER NOT NULL,
+     cwd TEXT,
+     project TEXT,
+     model TEXT,
+     is_sidechain INTEGER NOT NULL DEFAULT 0,
+     input_tokens INTEGER NOT NULL DEFAULT 0,
+     output_tokens INTEGER NOT NULL DEFAULT 0,
+     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (session_id, message_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_transcript_ts ON transcript_msg (ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_transcript_model ON transcript_msg (model)`,
 ];
