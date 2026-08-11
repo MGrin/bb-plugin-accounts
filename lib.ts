@@ -202,6 +202,146 @@ export function isLimitError(error: string | null | undefined): boolean {
     .test(error);
 }
 
+/**
+ * Everything the plugin knows about a thread.failed, from every source it has.
+ *
+ * `error` is bb's own field and is null on real limit failures — see
+ * isLimitFailure. The other two come from a follow-up
+ * `threads.rateLimitRecovery()` call, which returns its `rateLimits` snapshot
+ * on EVERY inspection, including the ones whose `reason` is a refusal.
+ */
+export interface LimitFailureSignal {
+  /** thread.failed's `error`. Null far more often than it looks. */
+  error?: string | null;
+  /** ProviderRateLimitRecoveryStatus.rateLimits?.status */
+  rateLimitStatus?: string | null;
+  /** ProviderRateLimitRecoveryStatus.reason */
+  recoveryReason?: string | null;
+}
+
+/**
+ * Is this dead thread dead because the account ran out of window?
+ *
+ * isLimitError above is a good judge of a bad witness. On 2026-08-11 it was
+ * proven that bb's thread.failed NEVER carries a rate-limit string: bb fills
+ * that field from getLastThreadErrorMessage(), which reads only events of type
+ * `system/error`, and provider limits are written as `provider/error`. The
+ * event table that morning held 100 provider/error rows and 1 system/error
+ * row. Consequence: the reactive path had never fired once in the plugin's
+ * life, the stuck-thread store had never held a single record, and every
+ * overnight rate limit was recovered by hand or not at all.
+ *
+ * So the trigger no longer depends on that field alone. Two more signals,
+ * both from bb's own recovery inspection, and either one is sufficient:
+ *
+ *  - `rateLimits.status === "blocked"` — bb saw the provider block this
+ *    thread's window. This is the one that catches the real case, because the
+ *    `provider/rateLimits/updated` event lands right before the failure.
+ *  - `reason === "eligible"` — bb has a resume candidate ready, which it only
+ *    ever builds for a terminal rate-limit error.
+ *
+ * Deliberately NOT a signal: any other `reason`. They describe why a resume is
+ * refused, not what killed the thread, and treating them as limit evidence
+ * would track every ENOENT on the machine.
+ */
+export function isLimitFailure(signal: LimitFailureSignal): boolean {
+  if (isLimitError(signal.error)) return true;
+  if (signal.rateLimitStatus === "blocked") return true;
+  return signal.recoveryReason === "eligible";
+}
+
+/**
+ * bb won't resume this thread by its own route — is a plain follow-up message
+ * still worth sending?
+ *
+ * continueAfterRateLimit replays a specific failed request, and it needs a
+ * stored candidate. thr_3waqz7vb9w had none: its limit arrived as an
+ * agentMessage, so `bb thread retry` refused with "no-rate-limit-state" and
+ * the thread sat dead for ten hours. What actually revived it was an ordinary
+ * message (`bb thread tell --mode auto`) — the same thing a human does.
+ *
+ * The three reasons below all mean "bb has no candidate, and the thread really
+ * is stopped in error". Every other reason is bb ruling on the thread in a way
+ * a nudge would override: it is already retrying it, the thread is alive
+ * again, the failed turn did work a nudge might duplicate, a human asked to
+ * drive, or the environment is gone. Those get left alone.
+ */
+export function shouldNudgeAfterIneligible(reason: string): boolean {
+  return reason === "no-rate-limit-state" ||
+    reason === "no-terminal-rate-limit-error" ||
+    reason === "input-not-accepted";
+}
+
+// ── Reconciliation — finding stuck threads the event stream never reported ──
+//
+// The store above is fed by onLimitFailure(), which is fed by thread.failed.
+// On 2026-08-11 that single dependency was found to have been broken for the
+// plugin's entire life by one upstream null, silently, with no alarm: see
+// isLimitFailure. Fixing the trigger fixes today's cause. It does not stop the
+// same SHAPE of failure — one quiet upstream change disabling recovery — from
+// happening again.
+//
+// So the watch tick also looks for itself. Any errored thread the store does
+// not know about is a candidate, confirmed by the same rateLimitRecovery
+// inspection the trigger uses, so adoption can never be laxer than detection.
+
+export interface ListedThread {
+  id: string;
+  status: string;
+  updatedAt: number;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
+}
+
+export interface AdoptionPlan {
+  /** Thread ids to inspect and, if genuinely limit-failed, adopt. */
+  inspect: string[];
+  /** The inspection memory to persist: threadId -> the updatedAt just examined. */
+  retain: Record<string, number>;
+}
+
+/**
+ * Which listed threads are worth an inspection call this tick?
+ *
+ * The trap here is a loop, and it is not hypothetical: a thread that is adopted,
+ * exhausts `maxAttempts` and gets dropped is still `error` and no longer
+ * tracked — so a naive scan re-adopts it on the very next tick, forever, and
+ * the attempts budget becomes decorative.
+ *
+ * The guard is `inspected`: the updatedAt of the last inspection per thread. A
+ * genuinely dead thread's updatedAt never moves again, so it costs exactly one
+ * inspection ever. A thread that really does change gets looked at again. That
+ * also keeps a machine full of long-dead error threads from costing an
+ * inspection each, every two minutes, all day.
+ */
+export function planAdoption(
+  listed: ListedThread[],
+  tracked: string[],
+  inspected: Record<string, number>,
+  now: number,
+  giveUpAfterSec: number,
+): AdoptionPlan {
+  const trackedSet = new Set(tracked);
+  const inspect: string[] = [];
+  const retain: Record<string, number> = {};
+
+  for (const t of listed) {
+    if (t.status !== "error" || t.archivedAt || t.deletedAt) continue;
+    // Carry the memory forward for every still-errored thread, so the map is
+    // pruned to reality rather than growing with every thread that ever failed.
+    const previous = inspected[t.id];
+    retain[t.id] = t.updatedAt;
+    if (trackedSet.has(t.id)) continue;
+    if (previous === t.updatedAt) continue;
+    // Already past the give-up clock: adopting it would spend an inspection
+    // only to drop it on the same sweep.
+    if (giveUpAfterSec > 0 && now - t.updatedAt > giveUpAfterSec * 1000) continue;
+    inspect.push(t.id);
+  }
+
+  return { inspect, retain };
+}
+
 // ── Recovery sweep — resuming EVERY stuck thread when capacity returns ──────
 //
 // `bb.sdk.threads.list` has no status/providerId filter, so "which threads

@@ -28,17 +28,34 @@ moves to the candidate with the lowest `max(5h, 7d)` among accounts whose usage 
 fresh, subject to a cooldown.
 
 **Reactive switching** — this is the useful part. bb emits `thread.failed`; when the
-error is a rate limit the plugin switches accounts and then sweeps every currently-stuck
+failure is a rate limit the plugin switches accounts and then sweeps every currently-stuck
 thread through bb's rate-limit recovery, so long-running work survives a limit instead of
 dying at it. It complements bb's builtin `provider-retry` plugin, which *waits* for the
 window to reset on the single account bb knows about; this one *moves*.
 
+Note what "when the failure is a rate limit" does **not** mean: reading `thread.failed`'s
+`error` string. bb fills that field from `system/error` events only, and every provider
+limit is written as `provider/error`, so on a real limit failure it is always `null` —
+which silently disabled this entire path from the plugin's first commit until 2026-08-11.
+The trigger now also consults bb's own recovery inspection and fires on a blocked
+rate-limit snapshot, so it no longer depends on wording bb never sends. See `isLimitFailure`.
+
+**Reconciliation** — the tracked set is fed by `thread.failed`, and a store fed by one
+event can be switched off by one upstream change, silently, which is exactly what happened.
+So every watch tick also *looks*: any non-archived `error` thread the store doesn't know
+about is inspected with the same `rateLimitRecovery` call the trigger uses, and adopted if
+it is genuinely limit-failed. Adoption remembers the `updatedAt` it inspected, so a
+permanently dead thread costs exactly one inspection ever instead of looping
+adopt → exhaust attempts → drop → adopt.
+
 **Recovery sweep** — resumes EVERY currently-stuck limit-failed thread, not just the one
-attached to whichever event fired. A thread that hit a limit is tracked (there is no
-server-side way to ask bb for "every errored thread"); every proactive tick and every
+attached to whichever event fired. A thread that hit a limit is tracked; every proactive tick and every
 reactive switch then sweeps the tracked set, re-verifying each thread is still `error`
 before attempting it, so a thread already fixed elsewhere (bb's own `provider-retry`, a
-human) quietly falls out of tracking instead of being retried. Bounded by
+human) quietly falls out of tracking instead of being retried. When bb has no replayable
+request for a thread (`no-rate-limit-state` — the limit arrived as an agent message rather
+than a failed call), the sweep falls back to sending an ordinary follow-up message, which
+is the only thing that revives that thread. Bounded by
 `recoveryCooldownSec`/`recoveryMaxAttempts`/`recoveryGiveUpAfterHours` so a thread that
 keeps failing for a non-limit reason is never retried forever.
 
