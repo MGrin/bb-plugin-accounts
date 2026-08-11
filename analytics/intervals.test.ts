@@ -48,6 +48,43 @@ test("a resetsAt change with no decrease is still a reset", () => {
   assert.equal(out[0]!.deltaUtil, 41);
 });
 
+test("microsecond jitter in resetsAt is NOT a reset", () => {
+  // Verbatim from the first three polls this plugin ever recorded. The poller
+  // derives resetsAt as roughly now + seconds_remaining, so the same 09:50:00
+  // reset arrives with a different sub-second component every time. Treating
+  // that as a new window credited the full 98 points as burn, every 3 minutes.
+  const out = deriveIntervals(
+    [
+      s(1786433268, 98, "2026-08-11T09:50:00.881236+00:00"),
+      s(1786433453, 98, "2026-08-11T09:50:00.406176+00:00"),
+      s(1786433638, 98, "2026-08-11T09:50:00.896950+00:00"),
+    ],
+    "5h",
+  );
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((i) => i.isReset), [false, false]);
+  assert.deepEqual(out.map((i) => i.deltaUtil), [0, 0]);
+});
+
+test("a resetsAt that moves by a whole window IS a reset", () => {
+  const out = deriveIntervals(
+    [
+      s(0, 40, "2026-08-11T09:50:00.100000+00:00"),
+      s(100, 41, "2026-08-11T14:50:00.900000+00:00"),
+    ],
+    "5h",
+  );
+  assert.equal(out[0]!.isReset, true);
+});
+
+test("an unparseable resetsAt falls back to the utilization signal", () => {
+  const rising = deriveIntervals([s(0, 40, "not-a-date"), s(100, 44, "also-not")], "5h");
+  assert.equal(rising[0]!.isReset, false);
+  assert.equal(rising[0]!.deltaUtil, 4);
+  const dropping = deriveIntervals([s(0, 90, "not-a-date"), s(100, 4, "also-not")], "5h");
+  assert.equal(dropping[0]!.isReset, true);
+});
+
 test("an unchanged resetsAt across a rise is not a reset", () => {
   const out = deriveIntervals(
     [s(0, 40, "2026-08-11T14:00:00Z"), s(100, 44, "2026-08-11T14:00:00Z")],
