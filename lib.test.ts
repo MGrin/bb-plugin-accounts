@@ -238,6 +238,53 @@ test("the 2026-07-31 weekly stranding: a spent WEEK trips urgent, not spread", (
   assert.match(d.reason, /7d/);
 });
 
+// --- DRAIN THE WEEK TO THE WALL (2026-08-13) ---------------------------------
+//
+// weeklyAt used to be 95, which abandoned an account with 5% of its week left AND
+// refused to switch INTO one. With four accounts that is a fifth of an account's
+// week never spent, and — the shape mgrin actually hit — once every slot passed
+// 95 the destination cap made pickBest return null, so nothing switched and
+// threads waited on tokens that existed. weeklyAt is now 100: the WALL, not a
+// safety margin. Nothing below 100 is a reason to move, and nothing below 100 is
+// an ineligible destination.
+
+test("a 99% week is not a reason to move — that 1% is real capacity", () => {
+  // Under weeklyAt=95 this tripped urgent and stranded the rest of the week.
+  const d = decideSwitch([acct("a", 10, 99, true), acct("b", 10, 90)], POLICY, 3600);
+  assert.equal(d.action, "none", "only the wall itself may end an account's week");
+});
+
+test("a 99% account is still a valid destination", () => {
+  // The destination cap is the wall too. Under weeklyAt=95 this returned null and
+  // froze the machine with capacity left in every slot.
+  assert.equal(pickBest([acct("b", 10, 99)], "none-active")?.slot, "b");
+  assert.equal(pickBest([acct("b", 10, 100)], "none-active"), null, "but a spent week is not");
+});
+
+test("the endgame: every account past 95 still rotates instead of freezing", () => {
+  // 2026-08-13, live: 98 / 99 / 95 and a fourth slot. Every one of them was above
+  // the old cap, so pickBest returned null, decideSwitch said "no eligible
+  // alternative slot", and the sweeper called the machine walled — while ~5% of
+  // four separate weeks sat unspent.
+  const d = decideSwitch(
+    [acct("mr6r1n", 99, 98, true), acct("scani", 39, 99), acct("withflare", 44, 96)],
+    POLICY,
+    3600,
+  );
+  if (d.action === "none") assert.fail(`expected a switch, got none: ${d.reason}`);
+  assert.equal(d.to, "withflare", "the least-spent survivor, not nobody");
+});
+
+test("at 100 the week is genuinely over and still trips urgent", () => {
+  // The 2026-07-31 regression, restated at the new threshold: draining to the wall
+  // means moving AT the wall, not sitting on a dead account forever.
+  const d = decideSwitch([acct("a", 13, 100, true), acct("b", 0, 99)], POLICY, 300);
+  if (d.action === "none") assert.fail(`expected urgent, got none: ${d.reason}`);
+  assert.equal(d.action, "urgent");
+  assert.equal(d.to, "b");
+  assert.match(d.reason, /7d/);
+});
+
 test("the 2026-08-09 velocity wall: trips below the threshold on projection", () => {
   // Read 90% and was walled before the next 180s poll. A static threshold assumes
   // the next sample arrives in time; a fast burn means it does not.
@@ -284,12 +331,21 @@ test("a FALLING burn rate does not project upward", () => {
   assert.match(d.reason, /spread cooldown/);
 });
 
-test("will not switch INTO a slot at 99% of its week", () => {
-  // The old filter was `< 100`, which let bb move into a slot that trips again on
-  // the very next tick. Python capped candidates at 95.
-  const d = decideSwitch([acct("a", 98, 10, true), acct("b", 0, 99)], POLICY, 3600);
-  assert.equal(d.action, "none");
-  assert.equal(pickBest([acct("a", 98, 10, true), acct("b", 0, 99)], "a"), null);
+test("will not switch INTO a slot whose week is actually gone, but 99% is fair game", () => {
+  // This test used to cap destinations at 95, on the reasoning that a 99% slot
+  // "trips again on the very next tick". That was only true while the TRIGGER was
+  // also 95 — it tripped on arrival. With the trigger at the wall, a 99% slot has
+  // 1% of a week left and is a perfectly good destination; arriving there and
+  // later hitting the wall is the intended trade, and the reactive path catches
+  // the thread that hits it. Only a spent week is disqualifying.
+  const spent = decideSwitch([acct("a", 98, 100, true), acct("b", 0, 100)], POLICY, 3600);
+  assert.equal(spent.action, "none", "100% is the wall — arriving there is arriving nowhere");
+
+  // Same dead active, but the destination has 1% of a week left. That 1% is the
+  // whole point of the change: it is capacity, and it gets spent.
+  const nearly = decideSwitch([acct("a", 98, 100, true), acct("b", 0, 99)], POLICY, 3600);
+  assert.equal(nearly.action, "urgent");
+  assert.equal(nearly.to, "b");
 });
 
 // ── recovery sweep: resuming every stuck thread, not just the one that just
