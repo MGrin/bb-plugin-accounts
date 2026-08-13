@@ -25,16 +25,27 @@ export interface SwitchPolicy {
   /** Seconds since the last switch below which only an URGENT switch may happen. */
   spreadCooldownSec: number;
   /**
-   * 7d % at which the active slot must be abandoned. Deliberately LOWER than
-   * switchAt: a 5-hour window can be waited out, a weekly one resets on a
-   * calendar date. Also caps which slots may be switched INTO.
+   * 7d % at which the active slot must be abandoned, and the cap on which slots
+   * may be switched INTO. This is the WALL (100), not a safety margin.
+   *
+   * It was 95 until 2026-08-13, which cost capacity at both ends: an account was
+   * abandoned with 5% of its week unspent, and — worse — no account above 95 was
+   * an eligible destination, so once every slot drifted past it pickBest returned
+   * null, nothing switched, and threads waited on tokens that demonstrably
+   * existed (observed live at 98/99/95). Unlike a 5-hour window, a 7-day one is
+   * the scarce resource; leaving a slice of it unspent on every account in
+   * rotation is the one thing this plugin must not do.
+   *
+   * 100 is safe as a TRIGGER because at 100 there is nothing left to strand, and
+   * the reactive path (isLimitFailure -> switch -> resume) already covers the
+   * threads that hit the wall between two polls.
    */
   weeklyAt?: number;
   /** Seconds ahead the burn rate is projected. Matches the poller's interval. */
   pollIntervalSec?: number;
 }
 
-const WEEKLY_AT = 95;
+const WEEKLY_AT = 100;
 const POLL_INTERVAL_S = 180;
 
 /** The previous 5h reading for the SAME slot, for measuring a burn rate. */

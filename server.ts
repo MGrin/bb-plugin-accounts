@@ -7,8 +7,10 @@
 //  - reads ~/.config/claude-usage/usage.json (the poller's cache)
 //  - `bb accounts` CLI + homepage usage tiles
 //  - schedule: proactive switch when the ACTIVE slot crosses switchAt (default
-//    85 — Fable 5 hits its wall before the reported 5h window reaches 95;
-//    learned 2026-08-09) to the freshest lowest-usage slot
+//    97) to the freshest lowest-usage slot. The 5-hour window is use-it-or-lose-it
+//    and refills every 5 hours, so it is worth leaving a sliver of; the 7-day
+//    window is not, so weeklyAt is the WALL (100) and every account is ridden to
+//    it. See the weeklyAt doc in lib.ts.
 //  - thread.failed: a provider rate-limit failure IS the trigger — switch
 //    immediately and auto-continue the failed thread via the SDK's
 //    rate-limit-recovery path. Utilization thresholds can lie; the 429 doesn't.
@@ -183,7 +185,11 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
     switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "97" },
-    weeklyAt: { type: "string", label: "7d utilization % that triggers a switch (and caps destinations)", default: "95" },
+    // 100 = the wall, not a margin. At 95 an account was abandoned with 5% of its
+    // week unspent AND was an illegal destination, so once every slot drifted past
+    // 95 nothing could switch at all and threads waited on tokens that existed.
+    // The 7-day window is the scarce resource; it gets spent to the last point.
+    weeklyAt: { type: "string", label: "7d utilization % that triggers a switch (and caps destinations)", default: "100" },
     downgradeModel: { type: "string", label: "Model to continue Fable threads on when only Fable's own limit is hit", default: "claude-opus-5[1m]" },
     cooldownSec: { type: "string", label: "Minimum seconds between switches", default: "120" },
     spreadMargin: {
@@ -194,7 +200,14 @@ export default async function plugin(bb: BbPluginApi) {
     spreadCooldownSec: { type: "string", label: "Minimum seconds between early (spread) switches", default: "1800" },
     staleAfterMin: { type: "string", label: "Treat usage data older than this (min) as stale", default: "15" },
     recoveryCooldownSec: { type: "string", label: "Minimum seconds between resume attempts on the SAME stuck thread", default: "120" },
-    recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "5" },
+    // Unlimited since 2026-08-13, when weeklyAt became the wall. Accounts are now
+    // ridden to 100%, so a stuck thread can legitimately fail several times in a
+    // row while it crosses slots with a sliver of week left — burning all 5
+    // attempts in 10 minutes and getting dropped for good, with capacity still
+    // arriving. recoveryGiveUpAfterHours plus the sweeper's stall credit (which
+    // does not count time the machine was walled) is the honest backstop; an
+    // attempt counter measures the machine's state, not the thread's health.
+    recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "0" },
     recoveryGiveUpAfterHours: { type: "string", label: "Give up resuming a thread this long after it first got stuck (0 = never)", default: "6" },
   });
 
