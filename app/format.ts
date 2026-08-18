@@ -19,6 +19,15 @@ export const clock = (ts: number | null): string =>
         minute: "2-digit",
       });
 
+/**
+ * The same, for a millisecond epoch. It exists because passing `Date.now()`
+ * to `clock()` silently renders a date around the year 58620 — and `clock()`
+ * deliberately omits the year, so the only visible symptom is a plausible
+ * wrong month. The plugin stores `polledAt` in SECONDS and `last-switch.at`
+ * in MILLISECONDS, so the unit has to be in the function name.
+ */
+export const clockMs = (ms: number | null): string => (ms === null ? "—" : clock(Math.floor(ms / 1000)));
+
 const hhmm = (d: Date): string => d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 
 /**

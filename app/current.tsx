@@ -15,7 +15,7 @@
 import { useEffect, useState } from "react";
 import { useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
-import { clock, formatPct, formatReset } from "./format.ts";
+import { clock, clockMs, formatPct, formatReset } from "./format.ts";
 import { Meter, Section } from "./ui.tsx";
 
 export type Status = {
@@ -189,7 +189,7 @@ export function CurrentUsage() {
       </div>
       {st.lastSwitch && (
         <div className="mt-3 text-xs text-muted-foreground">
-          last switch {clock(st.lastSwitch.at)}: {st.lastSwitch.from} → {st.lastSwitch.to} · {st.lastSwitch.reason}
+          last switch {clockMs(st.lastSwitch.at)}: {st.lastSwitch.from} → {st.lastSwitch.to} · {st.lastSwitch.reason}
         </div>
       )}
     </Section>
