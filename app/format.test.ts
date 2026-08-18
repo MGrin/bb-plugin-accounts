@@ -5,7 +5,7 @@
 // exact inverse of what a null means.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatPct, formatRelative, formatReset } from "./format.ts";
+import { clock, clockMs, formatPct, formatRelative, formatReset } from "./format.ts";
 
 test("formatPct: an unpolled account is unknown, never 0%", () => {
   assert.equal(formatPct(null), "unknown");
@@ -68,4 +68,14 @@ test("formatReset: a reset on another day keeps the day in the absolute form", (
   const near = formatReset("2026-08-24T03:59:59+00:00", Date.parse("2026-08-24T00:00:00Z"));
   assert.ok(near);
   assert.ok(far.at.length > near.at.length, `${far.at} should carry more than ${near.at}`);
+});
+
+test("clockMs: last-switch.at is a MILLISECOND epoch and must not go through clock()", () => {
+  // The real 2026-08-18T10:20:14Z switch. Fed to clock() as if it were
+  // seconds it lands around the year 58620 — and clock() prints no year, so
+  // the only symptom is a plausible-looking wrong month.
+  const ms = Date.parse("2026-08-18T10:20:14.835Z");
+  assert.notEqual(clockMs(ms), clock(ms));
+  assert.equal(clockMs(ms), clock(Math.floor(ms / 1000)));
+  assert.equal(clockMs(null), "—");
 });
