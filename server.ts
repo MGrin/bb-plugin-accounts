@@ -56,6 +56,11 @@ import {
   threadIdFromPath,
 } from "./analytics/repos.ts";
 import { MIGRATIONS } from "./analytics/schema.ts";
+import {
+  type PlacementPlan,
+  planPlacement,
+  weightForModel,
+} from "./analytics/placement.ts";
 import { DEFAULT_POLICY, estimateSevenPerFive, type SimAccount } from "./analytics/simulate.ts";
 import {
   burnBy,
@@ -209,6 +214,10 @@ export default async function plugin(bb: BbPluginApi) {
     // attempt counter measures the machine's state, not the thread's health.
     recoveryMaxAttempts: { type: "string", label: "Give up resuming a thread after this many failed attempts (0 = unlimited)", default: "0" },
     recoveryGiveUpAfterHours: { type: "string", label: "Give up resuming a thread this long after it first got stuck (0 = never)", default: "6" },
+    // Placement — see the thread.created handler for what this can and cannot do.
+    placeOnSpawn: { type: "boolean", label: "Check the account has room for a new thread's model before it starts", default: true },
+    placementMinUnits: { type: "string", label: "Thousand weighted tokens a new thread must fit before its account counts as usable", default: "20" },
+    placementPinMin: { type: "string", label: "Minutes a manually chosen account is left alone by placement", default: "60" },
   });
 
   // Analytics storage. Opened once at load; the host tracks the handle and
@@ -839,6 +848,120 @@ export default async function plugin(bb: BbPluginApi) {
       ? `rate limits blocked, bb reason ${s.recoveryReason}`
       : `bb reason ${s.recoveryReason}`;
 
+  // ── Placement: where should work START? ──────────────────────────────────
+  //
+  // WHAT BB ACTUALLY EXPOSES, because the shape of this follows from it:
+  // there is NO pre-spawn hook. `thread.created` fires AFTER the row exists,
+  // its handler returns void, and nothing a plugin returns can rewrite or
+  // refuse a spawn. There is also no per-thread account: one Keychain means
+  // the whole machine bills one slot at a time. So "route this spawn to
+  // account X" is not a thing that can be built — the nearest true thing is
+  // "before this thread's first turn burns anything, check the slot the
+  // machine is on can hold its model, and move the machine if it cannot".
+  //
+  // That leaves a real race: the provider process starts moments after the
+  // row, and a Keychain swap is only picked up when it starts. Most spawns
+  // land after the check, some will not. `bb accounts place` is the reliable
+  // half — an orchestrator about to fan out asks FIRST, then spawns.
+  async function planFor(model: string | null): Promise<{
+    plan: PlacementPlan;
+    accounts: Account[];
+    active: Account | null;
+    polledAt: number | null;
+    weight: number;
+  }> {
+    const { switchAt, weeklyAt, placementMinUnits, placementPinMin } = await settings.get();
+    const { polledAt, accounts } = await readUsage();
+    const { weights } = readModelWeights(db);
+    const active = accounts.find((a) => a.active) ?? null;
+    // An EXPLICIT choice is a human act this plugin recorded: `bb accounts
+    // switch`, `bb accounts auto`, `bb accounts place --switch`. A switch the
+    // watch tick or the reactive path made is not one, and neither is the
+    // Python poller's — it leaves no record here at all, which is the correct
+    // answer for the same reason: nobody chose it.
+    const last = await bb.storage.kv.get<{ at: number; to: string; reason: string }>("last-switch");
+    const pinned =
+      !!last &&
+      !!active &&
+      last.to === active.slot &&
+      /^manual/.test(last.reason) &&
+      Date.now() - last.at < Number(placementPinMin) * 60_000;
+    const weight = weightForModel(model, weights);
+    const plan = planPlacement({
+      accounts: accounts.map((a) => ({
+        slot: a.slot,
+        fiveUtil: a.fiveHour,
+        sevenUtil: a.sevenDay,
+        active: a.active,
+      })),
+      modelWeight: weight,
+      activeSlot: active?.slot ?? null,
+      activePinned: pinned,
+      switchAt: Number(switchAt),
+      weeklyAt: Number(weeklyAt),
+      minUnits: Number(placementMinUnits),
+      model: model ?? undefined,
+    });
+    return { plan, accounts, active, polledAt, weight };
+  }
+
+  /** The model a thread will run on, or null when bb cannot say yet. */
+  async function modelOf(threadId: string): Promise<string | null> {
+    try {
+      const exec = (await bb.sdk.threads.defaultExecutionOptions({ threadId })) as { model?: string };
+      return exec?.model ? String(exec.model) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  bb.events.on("thread.created", ({ thread }) => {
+    void (async () => {
+      const { autoSwitch, placeOnSpawn } = await settings.get();
+      if (!autoSwitch || !placeOnSpawn) return;
+      // Only Claude threads bill these accounts; a codex thread is none of our
+      // business and must not be allowed to move the machine.
+      if (!/claude/i.test(thread.providerId)) return;
+
+      const model = await modelOf(thread.id);
+      const { plan, accounts, active, polledAt } = await planFor(model);
+      if (plan.action === "none") return;
+      // Every guard the watch tick uses, for the same reasons — a stale cache
+      // or a slot we cannot confirm is not grounds for moving the machine, and
+      // the cooldown is what stops a fan-out of ten spawns switching ten times.
+      if (await isStale(polledAt)) {
+        bb.log.debug(`placement for ${thread.id}: usage cache stale, skipping`);
+        return;
+      }
+
+      if (plan.action === "warn") {
+        bb.log.warn(`placement(${thread.id}): ${plan.reason}`);
+        // Log every time; interrupt a human at most once a quarter hour. A
+        // notification per spawn during a fan-out teaches him to ignore them.
+        const lastWarn = (await bb.storage.kv.get<{ at: number }>("last-placement-warn"))?.at ?? 0;
+        if (Date.now() - lastWarn > 15 * 60_000) {
+          await bb.storage.kv.set("last-placement-warn", { at: Date.now() });
+          await notify("Claude: new thread on a full account", plan.reason);
+        }
+        return;
+      }
+
+      if (!active || !(await activeSlotIsTrustworthy(active.slot))) return;
+      if (await underCooldown()) {
+        bb.log.info(`placement for ${thread.id} wanted ${plan.to} but a switch is under cooldown — leaving it`);
+        return;
+      }
+      const target = accounts.find((a) => a.slot === plan.to);
+      if (!target) return;
+      const ok = await switchTo(target, active.slot, `${plan.reason} (thread ${thread.id})`);
+      if (!ok) return;
+      // A switch frees capacity for everything that was stuck on the old slot,
+      // exactly as the proactive path does.
+      const swept = await sweeper.sweep("placement");
+      if (swept.continued.length) bb.log.info(`placement switch to ${target.slot} resumed: ${swept.continued.join(", ")}`);
+    })();
+  });
+
   // Reactive path — the optimization ladder. Goal: maximize usage across all
   // accounts × model tiers; never leave window tokens stranded.
   //
@@ -946,6 +1069,11 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
       { name: "log", summary: "Recent switch decisions", usage: "bb accounts log" },
+      {
+        name: "place",
+        summary: "Where should work on this model START? Ask BEFORE spawning a thread",
+        usage: "bb accounts place [--model M] [--switch] [--json]",
+      },
       { name: "forecast", summary: "When every account runs dry, and for how long", usage: "bb accounts forecast [--json]" },
       { name: "stats", summary: "Where the quota went, by model/agent/project/hour", usage: "bb accounts stats [--days N] [--json]" },
       { name: "history", summary: "Recorded utilization history", usage: "bb accounts history [--slot S] [--days N] [--json]" },
@@ -1104,6 +1232,56 @@ export default async function plugin(bb: BbPluginApi) {
         if (!best) return { exitCode: 1, stderr: "no fresh alternative slot" };
         const ok = await switchTo(best, active.slot, "manual auto-evaluation");
         return ok ? { exitCode: 0, stdout: `switched to ${best.slot}` } : { exitCode: 1, stderr: "switch failed" };
+      }
+      // The pre-spawn consult, and the ONLY placement path with no race in it:
+      // bb has no pre-spawn hook, so an orchestrator that wants its fan-out to
+      // land somewhere specific asks here first and spawns second.
+      //
+      //   bb accounts place --model claude-fable-5 --switch && bb thread spawn ...
+      //
+      // Without --switch this only reports. That is deliberate: the caller
+      // keeps the decision, which is the same rule the automatic path follows
+      // when a human has chosen the account by hand.
+      if (cmd === "place") {
+        const i = argv.indexOf("--model");
+        const model = i >= 0 ? (argv[i + 1] ?? null) : null;
+        const { plan, accounts, active, polledAt, weight } = await planFor(model);
+        const stale = await isStale(polledAt);
+        const wants = plan.action === "switch";
+        let switched = false;
+        if (wants && argv.includes("--switch")) {
+          const target = accounts.find((a) => a.slot === plan.to);
+          if (!target || !active) return { exitCode: 1, stderr: `cannot switch: ${plan.to} not in the usage cache` };
+          switched = await switchTo(target, active.slot, `manual via bb accounts place (${model ?? "unspecified model"})`);
+          if (!switched) return { exitCode: 1, stderr: "switch failed — see bb plugin logs accounts" };
+        }
+        if (json) {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              model,
+              modelWeight: weight,
+              active: active?.slot ?? null,
+              stale,
+              action: plan.action,
+              recommended: plan.to ?? (plan.action === "none" ? (active?.slot ?? null) : null),
+              reason: plan.reason,
+              switched,
+            }),
+          };
+        }
+        const lines = [
+          `model     ${model ?? "(unspecified — priced as 'other')"}`,
+          `active    ${active?.slot ?? "(none)"}`,
+          `verdict   ${plan.action}${plan.to ? ` -> ${plan.to}` : ""}`,
+          `           ${plan.reason}`,
+        ];
+        if (switched) lines.push(`switched  ${active?.slot} -> ${plan.to}`);
+        else if (wants) lines.push(`           re-run with --switch to move the machine there`);
+        if (stale) lines.push("⚠ usage cache is stale — check the claude.usage-poll LaunchAgent");
+        // A capped fleet is the one case where the exit code should be usable
+        // as a gate: a spawn loop can stop rather than start work that cannot run.
+        return { exitCode: plan.action === "warn" && plan.to === null ? 2 : 0, stdout: lines.join("\n") };
       }
       if (cmd === "log") {
         const last = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch");

@@ -491,7 +491,7 @@ export interface ThreadRecoveryPort {
 }
 
 /** Tag for logging/observability only — must never change planSweep's judgement. */
-export type SweepTrigger = "reactive" | "proactive-switch" | "periodic";
+export type SweepTrigger = "reactive" | "proactive-switch" | "placement" | "periodic";
 
 export interface SweepResult {
   trigger: SweepTrigger;
