@@ -3,27 +3,12 @@ import { useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { UsagePanel } from "./app/panel.tsx";
-
-type Status = {
-  polledAt: number | null;
-  stale: boolean;
-  accounts: {
-    slot: string; email: string; active: boolean;
-    fiveHour: number | null; sevenDay: number | null;
-    fiveHourResetsAt: string | null; sevenDayResetsAt: string | null;
-  }[];
-  lastSwitch: { at: number; from: string; to: string; reason: string } | null;
-};
-
-function Meter({ value }: { value: number | null }) {
-  const v = Math.min(100, value ?? 0);
-  const cls = v >= 85 ? "bg-destructive" : v >= 70 ? "bg-primary/70" : "bg-primary";
-  return (
-    <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
-      <div className={`h-full rounded-full ${cls}`} style={{ width: `${v}%` }} />
-    </div>
-  );
-}
+// One Meter and one set of thresholds for both surfaces — the tiles here and
+// the big page. Two copies drift, and a meter that disagrees with the page it
+// links to is worse than no meter.
+import type { Status } from "./app/current.tsx";
+import { formatPct } from "./app/format.ts";
+import { Meter } from "./app/ui.tsx";
 
 type ForecastLine = {
   confidence: "provisional" | "fitted" | "stale";
@@ -62,13 +47,15 @@ function AccountsSection() {
             <span className="text-sm text-foreground">
               {a.active ? "● " : ""}{a.email}
             </span>
+            {/* `?? 0` here used to turn an UNPOLLED account into "0%", which
+                reads as completely free and is the inverse of the truth. */}
             <span className="text-xs text-muted-foreground tabular-nums">
-              5h {a.fiveHour ?? 0}% · 7d {a.sevenDay ?? 0}%
+              5h {formatPct(a.fiveHour)} · 7d {formatPct(a.sevenDay)}
             </span>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <Meter value={a.fiveHour} />
-            <Meter value={a.sevenDay} />
+            <Meter value={a.fiveHour} label="5-hour" />
+            <Meter value={a.sevenDay} label="7-day" />
           </div>
         </div>
       ))}
