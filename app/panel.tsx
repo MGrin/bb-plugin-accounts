@@ -10,10 +10,13 @@
 // Responsive because this has to work from a phone over bb.scani.xyz, and any
 // state that must outlive navigation goes to localStorage — a route-scoped
 // panel unmounts on every navigation, so a useRef would silently reset.
-import { type ReactNode, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
 import { BarList, Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
+import { CurrentUsage } from "./current.tsx";
+import { clock } from "./format.ts";
+import { Section } from "./ui.tsx";
 
 type Forecast = {
   confidence: "provisional" | "fitted" | "stale";
@@ -37,23 +40,6 @@ type Analytics = {
 
 const RANGES = [7, 14, 30] as const;
 const RANGE_KEY = "accounts.analytics.days";
-
-const clock = (ts: number | null) =>
-  ts === null
-    ? "—"
-    : new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-
-function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
-  return (
-    <section className="rounded-lg border border-border bg-card p-4">
-      <div className="mb-3">
-        <h2 className="text-sm font-medium text-foreground">{title}</h2>
-        {hint && <p className="text-xs text-muted-foreground mt-0.5">{hint}</p>}
-      </div>
-      {children}
-    </section>
-  );
-}
 
 function ForecastSection({ fc }: { fc: Forecast | null }) {
   if (!fc) return <Section title="Forecast">
@@ -186,6 +172,10 @@ export function UsagePanel() {
           ))}
         </div>
       </div>
+
+      {/* Current usage FIRST: it is the daily question ('can I start this now'),
+          the forecast is the occasional one. */}
+      <CurrentUsage />
 
       <ForecastSection fc={fc} />
 

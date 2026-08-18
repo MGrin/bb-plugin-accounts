@@ -31,6 +31,8 @@
     "server.ts",
     "lib.ts",
     "lib.test.ts",
+    "app.tsx",
+    "app",
     "types"
   ]
 }
