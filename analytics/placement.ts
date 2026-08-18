@@ -10,6 +10,8 @@
 // Pure by convention: every database read happens in server.ts and arrives here
 // as plain data.
 
+import { modelFamily, SEED_PRIORS } from "./calibrate.ts";
+
 export interface PlacementAccount {
   slot: string;
   /** 0..100, or null when the poller has not seen this account yet. */
@@ -29,6 +31,14 @@ export interface PlacementArgs {
   modelWeight: number;
   /** The auto-switch threshold. An account already past it is not a landing site. */
   switchAt?: number;
+  /**
+   * The 7-day wall, mirroring the plugin's `weeklyAt` setting. 100 by default
+   * because the weekly window is the scarce resource and gets ridden to the
+   * last point — see the weeklyAt doc in lib.ts. Taking it as an argument
+   * rather than hardcoding 100 is what keeps placement and decideSwitch from
+   * disagreeing about which accounts are legal destinations.
+   */
+  weeklyAt?: number;
   /** Work must fit at least this many units, or the slot is not worth starting on. */
   minUnits?: number;
 }
@@ -43,6 +53,7 @@ export interface Placement {
 }
 
 export const DEFAULT_SWITCH_AT = 97;
+export const DEFAULT_WEEKLY_AT = 100;
 export const DEFAULT_MIN_UNITS = 20;
 
 /**
@@ -52,10 +63,14 @@ export const DEFAULT_MIN_UNITS = 20;
  * written, and reading only the 5h window would have routed work straight into
  * a wall.
  */
-export function usableHeadroom(a: PlacementAccount, switchAt: number): number {
+export function usableHeadroom(
+  a: PlacementAccount,
+  switchAt: number,
+  weeklyAt: number = DEFAULT_WEEKLY_AT,
+): number {
   const five = a.fiveUtil ?? 100;
   const seven = a.sevenUtil ?? 100;
-  return Math.max(0, Math.min(switchAt - five, 100 - seven));
+  return Math.max(0, Math.min(switchAt - five, weeklyAt - seven));
 }
 
 /**
@@ -67,12 +82,13 @@ export function usableHeadroom(a: PlacementAccount, switchAt: number): number {
  */
 export function placeWork(args: PlacementArgs): Placement {
   const switchAt = args.switchAt ?? DEFAULT_SWITCH_AT;
+  const weeklyAt = args.weeklyAt ?? DEFAULT_WEEKLY_AT;
   const minUnits = args.minUnits ?? DEFAULT_MIN_UNITS;
   const weight = args.modelWeight > 0 ? args.modelWeight : Number.POSITIVE_INFINITY;
 
   const scored = args.accounts
     .map((a) => {
-      const headroom = usableHeadroom(a, switchAt);
+      const headroom = usableHeadroom(a, switchAt, weeklyAt);
       return { a, headroom, units: headroom / weight };
     })
     .filter((s) => s.headroom > 0);
@@ -103,4 +119,104 @@ export function placeWork(args: PlacementArgs): Placement {
         ? `tightest slot that fits ${minUnits}+ units (${best.headroom.toFixed(0)} pts headroom)`
         : `nothing fits ${minUnits} units; most capacity available is ${best.units.toFixed(0)}`,
   };
+}
+
+/**
+ * Points-per-unit for a concrete model id, from the fitted `model_weight`
+ * table, falling back to the seed priors.
+ *
+ * bb hands out ids like `claude-opus-5[1m]` and `claude-haiku-4-5-20251001`;
+ * the calibration is fitted per FAMILY for the reason modelFamily documents, so
+ * the lookup has to collapse the id first. An unknown family lands on `other`,
+ * which is deliberately expensive (0.02) — guessing cheap would route an
+ * unmeasured model onto scraps.
+ */
+export function weightForModel(
+  model: string | null | undefined,
+  weights: Readonly<Record<string, number>>,
+): number {
+  const family = modelFamily(model);
+  const fitted = weights[family];
+  if (typeof fitted === "number" && fitted > 0) return fitted;
+  return SEED_PRIORS[family] ?? SEED_PRIORS.other!;
+}
+
+export type PlacementPlan =
+  | { action: "none"; to: null; reason: string }
+  | { action: "switch"; to: string; reason: string }
+  | { action: "warn"; to: string | null; reason: string };
+
+export interface PlacementPlanArgs extends PlacementArgs {
+  /** The slot the machine is billing right now, or null when unknown. */
+  activeSlot: string | null;
+  /**
+   * True when the active slot is an EXPLICIT choice — a human ran
+   * `bb accounts switch`, or asked for a placement switch by hand — recently
+   * enough that it still stands.
+   */
+  activePinned?: boolean;
+  /** Model id, for the message only. The weight is passed separately. */
+  model?: string;
+}
+
+/**
+ * Should the machine move BEFORE this work starts, and is it allowed to?
+ *
+ * Two rules, and they are the whole design:
+ *
+ * 1. PLACEMENT ONLY MOVES WORK OFF A WALL, never toward a merely roomier
+ *    account. If the active slot can hold the work, the answer is `none` even
+ *    when something else has ten times the headroom. Spreading load across
+ *    slots is already decideSwitch's job (spreadMargin, its own cooldown), and
+ *    a second opinion firing on every thread creation would fight it.
+ *
+ * 2. AN EXPLICIT CHOICE IS NEVER SILENTLY OVERRIDDEN. When a human put the
+ *    machine on this account and it turns out to be a bad landing site, the
+ *    answer is `warn`, carrying the slot that would have been chosen — say the
+ *    choice looks wrong, do not quietly re-route around it. A switch that
+ *    undoes a deliberate act, logged only where nobody reads, is the
+ *    green-that-lies pattern: the caller believes it is on the account it
+ *    picked, and every conclusion after that is drawn about the wrong slot.
+ */
+export function planPlacement(args: PlacementPlanArgs): PlacementPlan {
+  const switchAt = args.switchAt ?? DEFAULT_SWITCH_AT;
+  const weeklyAt = args.weeklyAt ?? DEFAULT_WEEKLY_AT;
+  const minUnits = args.minUnits ?? DEFAULT_MIN_UNITS;
+  const weight = args.modelWeight > 0 ? args.modelWeight : Number.POSITIVE_INFINITY;
+  const what = args.model ? `${args.model} work` : "this work";
+
+  const active = args.accounts.find((a) => a.slot === args.activeSlot) ?? null;
+  const activeUnits = active ? usableHeadroom(active, switchAt, weeklyAt) / weight : 0;
+  if (active && activeUnits >= minUnits) {
+    return {
+      action: "none",
+      to: null,
+      reason: `active ${active.slot} holds ${activeUnits.toFixed(0)} units of ${what} (floor ${minUnits}) — placement does not move work off a slot that fits`,
+    };
+  }
+
+  const best = placeWork(args);
+  const short = active
+    ? `active ${active.slot} holds only ${activeUnits.toFixed(0)} units of ${what}`
+    : `no active slot in the usage cache`;
+
+  if (best.slot === null) {
+    return { action: "warn", to: null, reason: `${short}, and ${best.reason}` };
+  }
+  if (best.slot === args.activeSlot) {
+    return {
+      action: "none",
+      to: null,
+      reason: `${short}, but it is still the best available — ${best.reason}`,
+    };
+  }
+  const move = `${best.slot} holds ${best.units.toFixed(0)} (${best.headroom.toFixed(0)} pts)`;
+  if (args.activePinned) {
+    return {
+      action: "warn",
+      to: best.slot,
+      reason: `${short}; ${move}. NOT switching: ${args.activeSlot} was chosen explicitly`,
+    };
+  }
+  return { action: "switch", to: best.slot, reason: `placement: ${short}; ${move}` };
 }
