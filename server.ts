@@ -61,6 +61,16 @@ import {
   planPlacement,
   weightForModel,
 } from "./analytics/placement.ts";
+import {
+  advanceStreak,
+  assessOutage,
+  DEFAULT_CONFIRM_POLLS,
+  earliestUsable,
+  EMPTY_STREAK,
+  isConfirmed,
+  type OutageAccount,
+  type OutageStreak,
+} from "./analytics/outage.ts";
 import { DEFAULT_POLICY, estimateSevenPerFive, type SimAccount } from "./analytics/simulate.ts";
 import {
   burnBy,
@@ -218,6 +228,15 @@ export default async function plugin(bb: BbPluginApi) {
     placeOnSpawn: { type: "boolean", label: "Check the account has room for a new thread's model before it starts", default: true },
     placementMinUnits: { type: "string", label: "Thousand weighted tokens a new thread must fit before its account counts as usable", default: "20" },
     placementPinMin: { type: "string", label: "Minutes a manually chosen account is left alone by placement", default: "60" },
+    // See analytics/outage.ts. 3 distinct polls at 180s each is ~6-9 minutes of
+    // agreement before the machine is willing to call itself out — long enough
+    // that a switch mid-tick or a single bad read cannot produce the claim, short
+    // enough that whoever is waiting learns about it while it still matters.
+    outageConfirmPolls: {
+      type: "string",
+      label: "Distinct polls that must all show every account exhausted before it counts as confirmed",
+      default: String(DEFAULT_CONFIRM_POLLS),
+    },
   });
 
   // Analytics storage. Opened once at load; the host tracks the handle and
@@ -229,6 +248,37 @@ export default async function plugin(bb: BbPluginApi) {
     const { staleAfterMin } = await settings.get();
     return polledAt === null || Date.now() / 1000 - polledAt > Number(staleAfterMin) * 60;
   };
+
+  /** The poller's account shape, as the outage predicate wants it. */
+  const toOutageAccounts = (accounts: Account[]): OutageAccount[] =>
+    accounts.map((a) => ({
+      slot: a.slot,
+      fiveUtil: a.fiveHour,
+      sevenUtil: a.sevenDay,
+      active: a.active,
+      fiveResetsAt: a.fiveHourResetsAt,
+      sevenResetsAt: a.sevenDayResetsAt,
+    }));
+
+  /**
+   * The whole away-message answer in one read: is every account out, when does
+   * the first one come back, and how many distinct polls have agreed.
+   *
+   * READ-ONLY, deliberately. The streak is advanced by the `watch` tick and
+   * nowhere else, because it must count SCHEDULED observations: if asking the
+   * question also advanced it, calling this three times in a row would answer
+   * it, and one read masquerading as three is exactly the conclusion the
+   * consecutive-poll rule exists to prevent.
+   */
+  async function currentOutage(read?: { polledAt: number | null; accounts: Account[] }) {
+    const { polledAt, accounts } = read ?? (await readUsage());
+    const { weeklyAt, outageConfirmPolls } = await settings.get();
+    const stale = await isStale(polledAt);
+    const verdict = assessOutage(toOutageAccounts(accounts), { weeklyAt: Number(weeklyAt), stale });
+    const streak = (await bb.storage.kv.get<OutageStreak>("outage-streak")) ?? EMPTY_STREAK;
+    const requiredPolls = Number(outageConfirmPolls) || DEFAULT_CONFIRM_POLLS;
+    return { polledAt, stale, verdict, streak, requiredPolls, confirmed: isConfirmed(verdict, streak, requiredPolls) };
+  }
 
   async function pickBest(exceptSlot: string): Promise<Account | null> {
     const { polledAt, accounts } = await readUsage();
@@ -417,12 +467,20 @@ export default async function plugin(bb: BbPluginApi) {
    * that stops being true. Soonest 5h reset across all slots, since that is the
    * window that actually frees up on a human timescale.
    */
-  function nextCapacityAt(accounts: Account[]): Date | null {
-    const times = accounts
-      .map((a) => (a.fiveHourResetsAt ? Date.parse(a.fiveHourResetsAt) : NaN))
-      .filter((t) => !Number.isNaN(t) && t > Date.now())
-      .sort((a, b) => a - b);
-    return times.length ? new Date(times[0]!) : null;
+  /**
+   * When the first walled account comes back.
+   *
+   * This used to be the minimum of every future 5-HOUR reset, which answers a
+   * different question and answers it wrongly whenever an account is walled on
+   * its week: a slot at 5h 100% / 7d 100% whose 5-hour window rolls over in 20
+   * minutes is NOT back in 20 minutes, and "Next capacity ~10:19Z" in a
+   * notification is exactly the confidently-wrong ETA this plugin now has a
+   * rule against. The binding window decides, and a missing reset is UNKNOWN
+   * rather than skipped — see analytics/outage.ts.
+   */
+  function nextCapacityAt(accounts: Account[], weeklyAt: number): Date | null {
+    const { at } = earliestUsable(toOutageAccounts(accounts), weeklyAt);
+    return at ? new Date(at) : null;
   }
 
   async function alarmIfCornered(
@@ -439,11 +497,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (await bb.storage.kv.get<number>("cornered-since")) return; // already alarmed this episode
     await bb.storage.kv.set("cornered-since", Date.now());
-    const next = nextCapacityAt(accounts);
+    const next = nextCapacityAt(accounts, weeklyAt);
     const stuck = (await stuckThreadsStore.list()).length;
-    const eta = next
-      ? ` Next capacity ~${next.toISOString().slice(11, 16)}Z (${Math.round((next.getTime() - Date.now()) / 60000)} min).`
-      : "";
+    // A reset already in the past means the poller is behind, not that capacity
+    // is negative minutes away. Say nothing rather than print "-3 min".
+    const eta =
+      next && next.getTime() > Date.now()
+        ? ` Next capacity ~${next.toISOString().slice(11, 16)}Z (${Math.round((next.getTime() - Date.now()) / 60000)} min).`
+        : "";
     const held = stuck ? ` ${stuck} thread(s) held for resume.` : "";
     const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom.${eta}${held}`;
     bb.log.warn(`cornered: ${msg} (${reason})`);
@@ -484,7 +545,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.background.schedule("watch", "*/2 * * * *", async () => {
-    const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec } = await settings.get();
+    const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec, outageConfirmPolls } =
+      await settings.get();
     const { polledAt, accounts } = await readUsage();
 
     // RECORDING COMES FIRST, AND IS UNCONDITIONAL.
@@ -503,6 +565,37 @@ export default async function plugin(bb: BbPluginApi) {
       await evaluateAlerts();
     } catch (e) {
       bb.log.warn(`analytics ingest failed: ${e instanceof Error ? e.message : e}`);
+    }
+
+    // OUTAGE TRACKING — unconditional and fenced, for the same two reasons.
+    //
+    // This tick IS the scheduled component the away message depends on: when
+    // every account is out, the thing that would announce the outage is the
+    // thing that cannot run, so the fact has to be established by something
+    // already running and left somewhere cheap to read (`bb accounts outage`).
+    //
+    // Not gated on autoSwitch — a machine with switching off still goes dark.
+    // Not gated on staleness either: assessOutage is HANDED the stale flag so
+    // it can refuse, which is different from not asking, and skipping the tick
+    // would freeze a streak in place instead of breaking it.
+    try {
+      const verdict = assessOutage(toOutageAccounts(accounts), {
+        weeklyAt: Number(weeklyAt),
+        stale: await isStale(polledAt),
+      });
+      const before = (await bb.storage.kv.get<OutageStreak>("outage-streak")) ?? EMPTY_STREAK;
+      const streak = advanceStreak(before, verdict, polledAt);
+      // Re-reading the same poll is the common case (watch every 120s, poller
+      // every 180s) and must not cost a write.
+      if (streak.consecutive !== before.consecutive || streak.lastPolledAt !== before.lastPolledAt) {
+        await bb.storage.kv.set("outage-streak", streak);
+      }
+      const required = Number(outageConfirmPolls) || DEFAULT_CONFIRM_POLLS;
+      if (isConfirmed(verdict, streak, required) && !isConfirmed(verdict, before, required)) {
+        bb.log.warn(`outage confirmed after ${streak.consecutive} polls: ${verdict.reason}`);
+      }
+    } catch (e) {
+      bb.log.warn(`outage tracking failed: ${e instanceof Error ? e.message : e}`);
     }
 
     if (!autoSwitch) return;
@@ -1074,6 +1167,11 @@ export default async function plugin(bb: BbPluginApi) {
         summary: "Where should work on this model START? Ask BEFORE spawning a thread",
         usage: "bb accounts place [--model M] [--switch] [--json]",
       },
+      {
+        name: "outage",
+        summary: "Is EVERY account out, and when does the first come back? (exit 0 = yes, 1 = no, 2 = cannot tell)",
+        usage: "bb accounts outage [--json]",
+      },
       { name: "forecast", summary: "When every account runs dry, and for how long", usage: "bb accounts forecast [--json]" },
       { name: "stats", summary: "Where the quota went, by model/agent/project/hour", usage: "bb accounts stats [--days N] [--json]" },
       { name: "history", summary: "Recorded utilization history", usage: "bb accounts history [--slot S] [--days N] [--json]" },
@@ -1283,6 +1381,48 @@ export default async function plugin(bb: BbPluginApi) {
         // as a gate: a spawn loop can stop rather than start work that cannot run.
         return { exitCode: plan.action === "warn" && plan.to === null ? 2 : 0, stdout: lines.join("\n") };
       }
+      // The away-message question, for a SCHEDULED caller that wants a cheap,
+      // unambiguous answer and no prose to parse. Exit codes are the contract:
+      //   0  every account is out, confirmed over N distinct non-stale polls
+      //   1  at least one account has headroom — nothing to announce
+      //   2  cannot tell (stale poll, or not enough polls have agreed yet)
+      // so `if bb accounts outage >/dev/null; then ...` speaks only on 0, and
+      // both flavours of doubt fall to silence.
+      if (cmd === "outage") {
+        const o = await currentOutage();
+        const v = o.verdict;
+        if (json) {
+          return {
+            exitCode: v.allExhausted ? (o.confirmed ? 0 : 2) : o.stale ? 2 : 1,
+            stdout: JSON.stringify({
+              confirmed: o.confirmed,
+              allExhausted: v.allExhausted,
+              earliestUsableAt: v.earliestUsableAt,
+              earliestUsableSlot: v.earliestUsableSlot,
+              unknownReason: v.unknownReason,
+              reason: v.reason,
+              consecutivePolls: o.streak.consecutive,
+              requiredPolls: o.requiredPolls,
+              outageSincePolledAt: o.streak.sincePolledAt,
+              polledAt: o.polledAt,
+              stale: o.stale,
+              accounts: v.accounts,
+            }),
+          };
+        }
+        const lines = [
+          `verdict   ${o.confirmed ? "ALL ACCOUNTS EXHAUSTED" : v.allExhausted ? "all exhausted, not yet confirmed" : o.stale ? "unknown (stale)" : "accounts available"}`,
+          `reason    ${v.reason}`,
+          `polls     ${o.streak.consecutive}/${o.requiredPolls} consecutive`,
+          `back      ${v.earliestUsableAt ?? (v.allExhausted ? "UNKNOWN — no reset time on a binding window" : "—")}${v.earliestUsableSlot ? ` (${v.earliestUsableSlot})` : ""}`,
+        ];
+        for (const a of v.accounts) {
+          lines.push(
+            `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : "usable"}`,
+          );
+        }
+        return { exitCode: v.allExhausted ? (o.confirmed ? 0 : 2) : o.stale ? 2 : 1, stdout: lines.join("\n") };
+      }
       if (cmd === "log") {
         const last = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch");
         return {
@@ -1299,12 +1439,26 @@ export default async function plugin(bb: BbPluginApi) {
       // could show a different active account than bb was actually billing.
       // One surface, one answer.
       if (argv.includes("--json")) {
+        // `outage` rides along on the payload the widget already reads, from
+        // the SAME poll as the accounts beside it — a consumer that has this
+        // JSON never has to shell out twice or re-derive the predicate.
+        const o = await currentOutage({ polledAt, accounts });
         return {
           exitCode: 0,
           stdout: JSON.stringify({
             polledAt,
             stale,
             active: accounts.find((a) => a.active)?.slot ?? null,
+            outage: {
+              confirmed: o.confirmed,
+              allExhausted: o.verdict.allExhausted,
+              earliestUsableAt: o.verdict.earliestUsableAt,
+              earliestUsableSlot: o.verdict.earliestUsableSlot,
+              unknownReason: o.verdict.unknownReason,
+              reason: o.verdict.reason,
+              consecutivePolls: o.streak.consecutive,
+              requiredPolls: o.requiredPolls,
+            },
             accounts: accounts.map((a) => ({
               slot: a.slot,
               email: a.email,
