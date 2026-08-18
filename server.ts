@@ -14,7 +14,7 @@
 //  - thread.failed: a provider rate-limit failure IS the trigger — switch
 //    immediately and auto-continue the failed thread via the SDK's
 //    rate-limit-recovery path. Utilization thresholds can lie; the 429 doesn't.
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import { promisify } from "node:util";
@@ -94,6 +94,60 @@ import {
 } from "./analytics/store.ts";
 
 const run = promisify(execFile);
+
+/**
+ * Which commit is this PROCESS actually running? (MX-139)
+ *
+ * bb bundles a `path:` plugin FROM SOURCE at reload, so the revision read here — at module
+ * load, which is that same moment — is by construction the code now executing. Nothing else
+ * on the machine can answer this:
+ *   - `bb plugin list` prints `running` and the source PATH, never a revision.
+ *   - `bb plugin source` prints path/installed/history; for a path: source there is no
+ *     revision to record.
+ *   - dist/ is NOT the loaded artifact and its mtime LIES. Measured 2026-08-18:
+ *     dist/server.js stamped 11:25:44Z against an 11:40:15Z reload, while the running
+ *     process held a string that existed only in server.ts. Never reason from it.
+ *
+ * So a checkout can sit clean on main, every drift check green, while the process runs
+ * something else entirely — the last hop, invisible until now. That gap is how shipped
+ * code kept not running on this machine (four separate incidents on 2026-08-18).
+ *
+ * Read SYNCHRONOUSLY on purpose: the value must be fixed before anything can observe it,
+ * and it costs one git call once per load. Failure is not fatal and never guesses — a
+ * plugin installed from a tarball has no git dir, which is a legitimate `rev: null`, and
+ * `null` must stay distinguishable from "matches" so a checker reports UNKNOWN, not OK.
+ */
+const BUILD_STAMP: {
+  rev: string | null;
+  dirty: boolean | null;
+  sourceDir: string;
+  loadedAt: string;
+  why: string | null;
+} = (() => {
+  const sourceDir = import.meta.dirname;
+  const loadedAt = new Date().toISOString();
+  try {
+    const git = (args: string[]): string =>
+      execFileSync("git", ["-C", sourceDir, ...args], { encoding: "utf8", timeout: 5000 }).trim();
+    return {
+      rev: git(["rev-parse", "HEAD"]),
+      // Dirty matters as much as the revision: an edited working tree means the loaded
+      // bundle matches NO commit, so comparing revisions alone would report a false match.
+      dirty: git(["status", "--porcelain"]).length > 0,
+      sourceDir,
+      loadedAt,
+      why: null,
+    };
+  } catch (e) {
+    return {
+      rev: null,
+      dirty: null,
+      sourceDir,
+      loadedAt,
+      why: e instanceof Error ? e.message : String(e),
+    };
+  }
+})();
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
 const CLAUDE_ACCT = `${os.homedir()}/.local/bin/claude-acct`;
 
@@ -1176,10 +1230,28 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "stats", summary: "Where the quota went, by model/agent/project/hour", usage: "bb accounts stats [--days N] [--json]" },
       { name: "history", summary: "Recorded utilization history", usage: "bb accounts history [--slot S] [--days N] [--json]" },
       { name: "reindex", summary: "Scan Claude Code transcripts now instead of waiting for the schedule", usage: "bb accounts reindex" },
+      {
+        name: "build",
+        summary: "Which commit this RUNNING process was loaded from (not the checkout)",
+        usage: "bb accounts build [--json]",
+      },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "list";
       const json = argv.includes("--json");
+
+      // Deliberately answered BEFORE anything else touches the db or the usage cache:
+      // "what is running" must stay answerable when the thing running is broken.
+      if (cmd === "build") {
+        if (json) return { exitCode: 0, stdout: JSON.stringify(BUILD_STAMP) };
+        const rev = BUILD_STAMP.rev ?? "unknown";
+        const dirty = BUILD_STAMP.dirty === null ? "" : BUILD_STAMP.dirty ? " +dirty" : "";
+        const why = BUILD_STAMP.why ? `  (${BUILD_STAMP.why})` : "";
+        return {
+          exitCode: 0,
+          stdout: `loaded ${rev}${dirty} from ${BUILD_STAMP.sourceDir} at ${BUILD_STAMP.loadedAt}${why}`,
+        };
+      }
       const flag = (name: string, fallback: number): number => {
         const i = argv.indexOf(`--${name}`);
         const v = i >= 0 ? Number(argv[i + 1]) : Number.NaN;
