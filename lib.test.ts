@@ -21,6 +21,7 @@ import {
   type StuckThreadStore,
   shouldNudgeAfterIneligible,
   type SwitchPolicy,
+  capacityVerdict,
   type ThreadStatus,
   type ThreadStatusPort,
   worst,
@@ -676,4 +677,134 @@ test("adoption records the updatedAt it inspected, so the next tick skips it", (
   const plan = planAdoption([listed("thr_new", "error", 1700)], [], {}, 2000, 3600);
   assert.deepEqual(plan.inspect, ["thr_new"]);
   assert.deepEqual(plan.retain, { thr_new: 1700 });
+});
+
+// ---------------------------------------------------------------------------
+// MX-210 — usage credits.
+//
+// Every threshold in this file was chosen when reaching the wall meant work
+// STOPPED and the unspent tokens were lost. mgrin enabled Usage credits on ONE
+// of four accounts on 2026-08-20, and on that one, past the wall, work
+// CONTINUES and it spends money. The axis is no longer "capacity or stall" but
+// "free capacity, then paid capacity".
+//
+// The expensive failure is not the stall. It is parking work on the credit
+// account because it never 429s: that converts a free machine into a paid one
+// quietly enough that the bill is the first thing to say so. Every ordering
+// assertion below guards that direction.
+// ---------------------------------------------------------------------------
+
+const paid = (slot: string, fiveHour: number | null, sevenDay: number | null, active = false): AccountUsage =>
+  ({ slot, active, fiveHour, sevenDay, credits: "on" });
+const free = (slot: string, fiveHour: number | null, sevenDay: number | null, active = false): AccountUsage =>
+  ({ slot, active, fiveHour, sevenDay, credits: "off" });
+
+test("a free window outranks a credit account, however roomy the credit account looks", () => {
+  // The credit account's own windows are spent, so serving from it costs money.
+  // The alternative is nearly out of week and still wins: a 5h window is
+  // use-it-or-lose-it and refills in hours, money does not come back.
+  assert.equal(pickBest([paid("paid", 100, 100), free("busy", 90, 94)], "x")?.slot, "busy");
+});
+
+test("a spent credit account is a candidate at all — before MX-210 it was excluded", () => {
+  assert.equal(pickBest([paid("paid", 100, 100)], "x")?.slot, "paid");
+});
+
+test("a spent account without credits stays excluded", () => {
+  assert.equal(pickBest([free("done", 100, 100)], "x"), null);
+});
+
+test("UNKNOWN credit state is never promoted to a paid candidate", () => {
+  // `credits` absent = the poll never said. Not knowing is not a licence to spend.
+  assert.equal(pickBest([acct("dunno", 100, 100)], "x"), null);
+});
+
+test("an exact tie breaks AWAY from the credit account", () => {
+  // Equally roomy is not equally safe: work parked on the credit account starts
+  // billing the moment its window closes, up to a poll interval before anything
+  // notices. "a-paid" sorts first alphabetically, so only the tie-break can
+  // make "z-free" win.
+  assert.equal(pickBest([paid("a-paid", 30, 30), free("z-free", 30, 30)], "x")?.slot, "z-free");
+});
+
+test("a credit account whose own window is untouched is still FREE capacity", () => {
+  // "Credits rank last" is about paid capacity, not about the account. Refusing
+  // to spend an untouched 5h window would be the v3 stranding mistake in a new
+  // costume; money is only spent past that window's wall.
+  assert.equal(pickBest([paid("paid", 0, 0), free("busy", 60, 60)], "x")?.slot, "paid");
+});
+
+test("a walled machine moves onto credits instead of reporting no eligible slot", () => {
+  const decision = decideSwitch(
+    [free("out-a", 0, 100, true), free("out-b", 0, 100), paid("credit", 100, 12)],
+    POLICY,
+    Infinity,
+  );
+  assert.equal(decision.action, "urgent");
+  assert.equal(decision.action === "urgent" && decision.to, "credit");
+  assert.match(decision.reason, /credit/i);
+});
+
+test("it does NOT move onto credits while the active slot still has free window", () => {
+  // THE MUTATION THAT MATTERS. Active trips at 97 with no free alternative and
+  // the credit account sitting there never 429ing. Moving now strands three
+  // points of a use-it-or-lose-it window AND starts spending. Stay, wall, and
+  // let the reactive path move.
+  const decision = decideSwitch(
+    [free("burning", 97, 20, true), free("out", 0, 100), paid("credit", 100, 12)],
+    POLICY,
+    Infinity,
+  );
+  assert.equal(decision.action, "none");
+  assert.match(decision.reason, /free window/);
+});
+
+test("an unreadable active slot never authorises spending", () => {
+  // A failed poll must not be the thing that opens a bill.
+  const decision = decideSwitch(
+    [{ slot: "active-unknown", active: true, fiveHour: null, sevenDay: 100 }, paid("credit", 100, 12)],
+    POLICY,
+    Infinity,
+  );
+  assert.equal(decision.action, "none");
+});
+
+test("the credit account is left as soon as a free window reopens", () => {
+  // Credits are a last resort, not a place to park. The active slot here never
+  // 429s, so nothing but this rule moves work back onto free capacity.
+  const decision = decideSwitch([paid("credit", 100, 12, true), free("refilled", 0, 40)], POLICY, Infinity);
+  assert.equal(decision.action === "urgent" && decision.to, "refilled");
+});
+
+test("SPREAD never spends money — an optimization is not a reason to bill", () => {
+  // Active is merely WORSE, not walled, and the only roomier slot is paid.
+  //
+  // Reaching this needs weeklyAt below the wall, and that is the whole point of
+  // testing it: at weeklyAt 100 a tier-1 slot always scores >= 100, so no
+  // spread gap can ever open and the guard is unreachable. weeklyAt is a
+  // SETTING, so "unreachable today" is one config change from reachable — and
+  // the config change would arrive with no test to notice. Here the gap is
+  // 90 - 60 = 30, over the 25-point margin, so spread would fire onto paid
+  // capacity without the guard.
+  const policy: SwitchPolicy = { ...POLICY, weeklyAt: 50 };
+  const decision = decideSwitch([free("busy", 90, 10, true), paid("credit", 0, 60)], policy, Infinity);
+  assert.equal(decision.action, "none", `spread billed money as an optimization: ${decision.reason}`);
+  assert.match(decision.reason, /spread declined/);
+});
+
+test("capacityVerdict separates an outage from a machine with only paid capacity left", () => {
+  assert.equal(capacityVerdict([free("a", 10, 10)]), "free");
+  assert.equal(capacityVerdict([free("out", 0, 100), paid("credit", 100, 100)]), "paid-only");
+  assert.equal(capacityVerdict([free("out-a", 100, 100), free("out-b", 0, 100)]), "none");
+});
+
+test("capacityVerdict says UNKNOWN rather than none when an account could not be read", () => {
+  // A poll that failed knows nothing. Counting it as exhausted is the silent
+  // downgrade every other instrument here refuses to make.
+  assert.equal(capacityVerdict([free("out", 0, 100), acct("broken", null, null)]), "unknown");
+  assert.equal(capacityVerdict([]), "unknown");
+});
+
+test("a known paid path beats an unknown, because it is an answer", () => {
+  assert.equal(capacityVerdict([acct("broken", null, null), paid("credit", 100, 100)]), "paid-only");
 });

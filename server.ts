@@ -23,7 +23,11 @@ import { z } from "zod";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
 import {
+  type CapacityVerdict,
+  capacityVerdict,
   createRecoverySweeper,
+  type CreditSpend,
+  type CreditState,
   decideSwitch,
   isLimitError,
   isLimitFailure,
@@ -151,6 +155,13 @@ const BUILD_STAMP: {
 const USAGE = `${os.homedir()}/.config/claude-usage/usage.json`;
 const CLAUDE_ACCT = `${os.homedir()}/.local/bin/claude-acct`;
 
+const creditSpendShape = z.object({
+  used: z.number().nullable(),
+  limit: z.number().nullable(),
+  util: z.number().nullable(),
+  currency: z.string().nullable(),
+});
+
 const accountShape = z.object({
   slot: z.string(),
   email: z.string(),
@@ -159,6 +170,11 @@ const accountShape = z.object({
   sevenDay: z.number().nullable(),
   fiveHourResetsAt: z.string().nullable(),
   sevenDayResetsAt: z.string().nullable(),
+  // MX-210. "unknown" is a real answer, not a missing one: a poll that failed
+  // knows nothing about credits, and reading that as "off" is the silent
+  // downgrade to "exhausted" this plugin exists to avoid.
+  credits: z.enum(["on", "off", "unknown"]),
+  creditSpend: creditSpendShape.nullable(),
 });
 type Account = z.infer<typeof accountShape>;
 
@@ -227,7 +243,56 @@ interface RawUsage {
     active: boolean;
     fiveHour?: { util?: number | null; resetsAt?: string | null } | null;
     sevenDay?: { util?: number | null; resetsAt?: string | null } | null;
+    /** The oauth usage endpoint's `extra_usage`. The poller has captured it
+     *  since 2026-07-23 (claude_accounts.py:463) and nothing read it until
+     *  MX-210 — the credit state was one line away from the decision that
+     *  needed it the whole time. */
+    extraUsage?: {
+      is_enabled?: boolean | null;
+      monthly_limit?: number | null;
+      used_credits?: number | null;
+      utilization?: number | null;
+      currency?: string | null;
+      decimal_places?: number | null;
+      spend_limit_reached?: boolean | null;
+    } | null;
+    error?: string;
   }[];
+}
+
+type RawAccount = NonNullable<RawUsage["accounts"]>[number];
+
+/** Mirrors claude_accounts.credit_state — two brains over one Keychain must not
+ *  disagree about what "has credits" means. */
+function creditStateOf(a: RawAccount): CreditState {
+  if (a.error) return "unknown";
+  const xu = a.extraUsage;
+  if (!xu || xu.is_enabled === null || xu.is_enabled === undefined) return "unknown";
+  if (!xu.is_enabled || xu.spend_limit_reached) return "off";
+  return "on";
+}
+
+/**
+ * Spend in MAJOR currency units, or null when credits are not on.
+ *
+ * The endpoint reports minor units with the scale in `decimal_places`: a live
+ * read on 2026-08-20 gave used_credits 31.0 of monthly_limit 4000 at
+ * decimal_places 2 and called it utilization 0.775 — GBP 0.31 of GBP 40.00.
+ * Printing the raw 31 would read as GBP 31, wrong by 100x in the alarming
+ * direction.
+ */
+function creditSpendOf(a: RawAccount): CreditSpend | null {
+  if (creditStateOf(a) !== "on") return null;
+  const xu = a.extraUsage!;
+  const dp = xu.decimal_places;
+  const scale = typeof dp === "number" && dp >= 0 ? 10 ** dp : 1;
+  const major = (v: number | null | undefined) => (typeof v === "number" ? v / scale : null);
+  return {
+    used: major(xu.used_credits),
+    limit: major(xu.monthly_limit),
+    util: typeof xu.utilization === "number" ? xu.utilization : null,
+    currency: xu.currency ?? null,
+  };
 }
 
 async function readUsage(): Promise<{ polledAt: number | null; accounts: Account[] }> {
@@ -243,6 +308,8 @@ async function readUsage(): Promise<{ polledAt: number | null; accounts: Account
         sevenDay: a.sevenDay?.util ?? null,
         fiveHourResetsAt: a.fiveHour?.resetsAt ?? null,
         sevenDayResetsAt: a.sevenDay?.resetsAt ?? null,
+        credits: creditStateOf(a),
+        creditSpend: creditSpendOf(a),
       })),
     };
   } catch {
@@ -464,11 +531,32 @@ export default async function plugin(bb: BbPluginApi) {
    * recovery — an attempt that turns out to be doomed only costs one retry,
    * while refusing to attempt for hours costs the whole night.
    */
-  async function anyAccountHasCapacity(): Promise<boolean> {
+  /**
+   * free / paid-only / none / unknown — see capacityVerdict.
+   *
+   * A stale cache is UNKNOWN for the same reason a failed poll is: the
+   * instrument cannot see, so it asserts nothing. That was already this
+   * function's behaviour (it returned "available" when stale); MX-210 only gave
+   * the state a name so the two blind cases and the two sighted ones stop
+   * sharing one boolean.
+   */
+  async function machineCapacity(): Promise<CapacityVerdict> {
     const { polledAt, accounts } = await readUsage();
-    if (accounts.length === 0 || (await isStale(polledAt))) return true;
-    const weeklyAt = Number(recoverySettings.weeklyAt);
-    return accounts.some((a) => (a.fiveHour ?? 100) < 100 && (a.sevenDay ?? 100) < weeklyAt);
+    if (accounts.length === 0 || (await isStale(polledAt))) return "unknown";
+    return capacityVerdict(accounts, Number(recoverySettings.weeklyAt));
+  }
+
+  /**
+   * Can the sweeper get a thread served AT ALL right now?
+   *
+   * "only paid capacity left" is not an outage and must not hold the sweep —
+   * that verdict is exactly what MX-210 was filed for: a machine reporting
+   * itself walled while a paid path was open stalls work for no reason. It is
+   * still not a licence to PREFER credits; the destination order in pickBest is
+   * what keeps them last, and this answers a different question.
+   */
+  async function anyAccountHasCapacity(): Promise<boolean> {
+    return (await machineCapacity()) !== "none";
   }
 
   const sweeper = createRecoverySweeper({
@@ -1478,6 +1566,11 @@ export default async function plugin(bb: BbPluginApi) {
               outageSincePolledAt: o.streak.sincePolledAt,
               polledAt: o.polledAt,
               stale: o.stale,
+              // "every window is spent" and "there is nothing left" stopped
+              // being the same statement on 2026-08-20. allExhausted still
+              // means the first; `capacity` is the second, and a consumer that
+              // stops work on allExhausted alone now has the means not to.
+              capacity: await machineCapacity(),
               accounts: v.accounts,
             }),
           };
@@ -1488,6 +1581,8 @@ export default async function plugin(bb: BbPluginApi) {
           `polls     ${o.streak.consecutive}/${o.requiredPolls} consecutive`,
           `back      ${v.earliestUsableAt ?? (v.allExhausted ? "UNKNOWN — no reset time on a binding window" : "—")}${v.earliestUsableSlot ? ` (${v.earliestUsableSlot})` : ""}`,
         ];
+        const capacity = await machineCapacity();
+        lines.push(`capacity  ${capacity}${capacity === "paid-only" ? " — usable, and it BILLS" : ""}`);
         for (const a of v.accounts) {
           lines.push(
             `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : "usable"}`,
@@ -1531,12 +1626,19 @@ export default async function plugin(bb: BbPluginApi) {
               consecutivePolls: o.streak.consecutive,
               requiredPolls: o.requiredPolls,
             },
+            // free / paid-only / none / unknown. The widget's whole reason to
+            // show credits is that spend nobody can see is spend nobody will
+            // notice — so the verdict rides on the payload it already reads,
+            // from the same poll as the accounts beside it.
+            capacity: stale ? "unknown" : capacityVerdict(accounts, Number(recoverySettings.weeklyAt)),
             accounts: accounts.map((a) => ({
               slot: a.slot,
               email: a.email,
               active: a.active,
               fiveHour: { util: a.fiveHour, resetsAt: a.fiveHourResetsAt },
               sevenDay: { util: a.sevenDay, resetsAt: a.sevenDayResetsAt },
+              credits: a.credits,
+              creditSpend: a.creditSpend,
             })),
           }),
         };
@@ -1546,10 +1648,27 @@ export default async function plugin(bb: BbPluginApi) {
         const n = Math.round(f * 12);
         return "█".repeat(n) + "░".repeat(12 - n);
       };
+      // Credit state per account, never a machine-wide flag: credits are on
+      // ONE of four slots, and a summary line would be wrong for the other
+      // three. "?" is UNKNOWN — a poll that failed, not an account without
+      // credits.
+      const creditCell = (a: Account) => {
+        if (a.credits === "unknown") return "  credits ?";
+        if (a.credits !== "on") return "";
+        const sp = a.creditSpend;
+        if (!sp || sp.used === null) return "  CREDITS ON";
+        const cap = sp.limit === null ? "" : `/${sp.limit.toFixed(2)}`;
+        return `  CREDITS ${sp.used.toFixed(2)}${cap}${sp.currency ? ` ${sp.currency}` : ""}`;
+      };
       const lines = accounts.map(
         (a) =>
-          `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${String(a.fiveHour ?? 0).padStart(3)}%  7d ${bar(a.sevenDay)} ${String(a.sevenDay ?? 0).padStart(3)}%`,
+          `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${String(a.fiveHour ?? 0).padStart(3)}%  7d ${bar(a.sevenDay)} ${String(a.sevenDay ?? 0).padStart(3)}%${creditCell(a)}`,
       );
+      if (!stale && accounts.length > 0) {
+        const v = capacityVerdict(accounts, Number(recoverySettings.weeklyAt));
+        if (v === "paid-only") lines.push("⚠ no free window on any account — work here BILLS to usage credits");
+        if (v === "none") lines.push("⚠ every account is walled and no credits are enabled");
+      }
       if (stale) lines.push("⚠ usage cache is stale — check the claude.usage-poll LaunchAgent");
       return { exitCode: 0, stdout: lines.join("\n") || "no accounts captured (claude-acct capture)" };
     },
