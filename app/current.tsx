@@ -15,12 +15,22 @@
 import { useEffect, useState } from "react";
 import { useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
-import { clock, clockMs, formatPct, formatReset } from "./format.ts";
-import { Meter, Section } from "./ui.tsx";
+import type { CapacityVerdict, CreditSpend, CreditState } from "../lib.ts";
+import { capacityNotice, clock, clockMs, creditLabel, formatPct, formatReset } from "./format.ts";
+import { Meter, Notice, Section } from "./ui.tsx";
 
 export type Status = {
   polledAt: number | null;
   stale: boolean;
+  /**
+   * What this machine can serve, straight off the `status` RPC (MX-220).
+   *
+   * NOT re-derived here. The server computes it with `capacityOf()`, the same
+   * call behind `bb accounts outage` and the Übersicht widget's payload — so
+   * the three surfaces cannot tell mgrin three different things about whether
+   * work runs and whether it costs money.
+   */
+  capacity: CapacityVerdict;
   accounts: {
     slot: string;
     email: string;
@@ -29,6 +39,8 @@ export type Status = {
     sevenDay: number | null;
     fiveHourResetsAt: string | null;
     sevenDayResetsAt: string | null;
+    credits: CreditState;
+    creditSpend: CreditSpend | null;
   }[];
   lastSwitch: { at: number; from: string; to: string; reason: string } | null;
 };
@@ -156,6 +168,13 @@ export function CurrentUsage() {
             : `The usage cache is behind (last polled ${clock(st.polledAt)}). These numbers are old — check the claude.usage-poll LaunchAgent.`}
         </div>
       )}
+      {(() => {
+        // Rendered even when the poll failed: `capacity` is then "unknown",
+        // which is its own answer and the one a reader most needs — the last
+        // reading above it is old, so it must not be read as a verdict.
+        const n = capacityNotice(st.capacity);
+        return n ? <div className="mb-3"><Notice tone={n.tone}>{n.text}</Notice></div> : null;
+      })()}
       <div className="space-y-2">
         {st.accounts.map((a) => (
           <div key={a.slot} className="rounded-md border border-border bg-muted/20 p-3 space-y-2">
@@ -164,11 +183,29 @@ export function CurrentUsage() {
                 {a.active && <span className="text-primary">● </span>}
                 {a.email}
               </span>
-              {a.active && (
-                <span className="shrink-0 rounded-full border border-primary/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-primary">
-                  active
-                </span>
-              )}
+              <span className="flex shrink-0 items-center gap-2">
+                {(() => {
+                  // "off" renders nothing — a label on every row buries the
+                  // one row that matters. "unknown" renders `credits ?` and
+                  // never "off": a failed poll knows nothing about credits.
+                  const label = creditLabel(a.credits, a.creditSpend);
+                  return label ? (
+                    <span
+                      className={`whitespace-nowrap text-[10px] tabular-nums ${
+                        a.credits === "unknown" ? "italic text-muted-foreground" : "text-primary"
+                      }`}
+                      title={a.credits === "unknown" ? "the usage poll did not report a credit state" : "usage credits — work on this account BILLS"}
+                    >
+                      {label}
+                    </span>
+                  ) : null;
+                })()}
+                {a.active && (
+                  <span className="rounded-full border border-primary/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-primary">
+                    active
+                  </span>
+                )}
+              </span>
             </div>
             <Window
               label="5h"

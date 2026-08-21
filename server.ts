@@ -228,6 +228,12 @@ export const rpcContract = defineRpcContract({
       polledAt: z.number().nullable(),
       stale: z.boolean(),
       accounts: z.array(accountShape),
+      // What the machine can serve, for the app panel (MX-220). It is the
+      // SAME value `bb accounts outage` and the Übersicht widget read, from
+      // the same function — the panel must not re-derive it from `credits`
+      // and the two windows, because three surfaces quietly disagreeing is
+      // how a reader loses the ability to tell which one is stale.
+      capacity: z.enum(["free", "paid-only", "none", "unknown"]),
       lastSwitch: z
         .object({ at: z.number(), from: z.string(), to: z.string(), reason: z.string() })
         .nullable(),
@@ -1303,10 +1309,21 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     async status() {
+      // ONE read. The capacity verdict and the rows beside it have to be the
+      // same observation — MX-218 fixed exactly this in the outage command,
+      // where a second readUsage() let the verdict and the account list come
+      // from different polls and disagree on screen.
       const { polledAt, accounts } = await readUsage();
+      const { weeklyAt } = await settings.get();
       const lastSwitch =
         (await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch")) ?? null;
-      return { polledAt, stale: await isStale(polledAt), accounts, lastSwitch };
+      return {
+        polledAt,
+        stale: await isStale(polledAt),
+        accounts,
+        capacity: await capacityOf(polledAt, accounts, Number(weeklyAt)),
+        lastSwitch,
+      };
     },
   });
 
