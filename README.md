@@ -39,13 +39,15 @@ Note what "when the failure is a rate limit" does **not** mean: reading `thread.
 `error` string. bb fills that field from `system/error` events only, and every provider
 limit is written as `provider/error`, so on a real limit failure it is always `null` —
 which silently disabled this entire path from the plugin's first commit until 2026-08-11.
-The trigger now also consults bb's own recovery inspection and fires on a blocked
-rate-limit snapshot, so it no longer depends on wording bb never sends. See `isLimitFailure`.
+The trigger now also reads the thread's newest `provider/rateLimits/updated` event and
+fires on a blocked rate-limit snapshot, so it no longer depends on wording bb never sends.
+See `isLimitFailure`. (It read that snapshot from `threads.rateLimitRecovery()` until bb
+0.39.0 removed the method — get-bb/bb#1623 — which broke detection for two days.)
 
 **Reconciliation** — the tracked set is fed by `thread.failed`, and a store fed by one
 event can be switched off by one upstream change, silently, which is exactly what happened.
 So every watch tick also *looks*: any non-archived `error` thread the store doesn't know
-about is inspected with the same `rateLimitRecovery` call the trigger uses, and adopted if
+about is inspected with the same rate-limit read the trigger uses, and adopted if
 it is genuinely limit-failed. Adoption remembers the `updatedAt` it inspected, so a
 permanently dead thread costs exactly one inspection ever instead of looping
 adopt → exhaust attempts → drop → adopt.
@@ -54,10 +56,12 @@ adopt → exhaust attempts → drop → adopt.
 attached to whichever event fired. A thread that hit a limit is tracked; every proactive tick and every
 reactive switch then sweeps the tracked set, re-verifying each thread is still `error`
 before attempting it, so a thread already fixed elsewhere (bb's own `provider-retry`, a
-human) quietly falls out of tracking instead of being retried. When bb has no replayable
-request for a thread (`no-rate-limit-state` — the limit arrived as an agent message rather
-than a failed call), the sweep falls back to sending an ordinary follow-up message, which
-is the only thing that revives that thread. Bounded by
+human) quietly falls out of tracking instead of being retried. The resume itself is an
+ordinary follow-up message. bb's `provider-retry` owns the *replay* of the failed request
+now and schedules it for the moment the blocked window rolls over — hours away — which is
+the wait this sweep exists to skip, since accounts has just moved the machine onto an
+account with capacity. A message is also the only thing that ever revived a thread whose
+limit arrived as an agent message rather than a failed call. Bounded by
 `recoveryCooldownSec`/`recoveryMaxAttempts`/`recoveryGiveUpAfterHours` so a thread that
 keeps failing for a non-limit reason is never retried forever.
 

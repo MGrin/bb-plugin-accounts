@@ -15,11 +15,11 @@ import {
   pickBest,
   planAdoption,
   planSweep,
+  rateLimitStatusFrom,
   type RecoveryAttemptResult,
   type RecoveryPolicy,
   type StuckThreadRecord,
   type StuckThreadStore,
-  shouldNudgeAfterIneligible,
   type SwitchPolicy,
   capacityVerdict,
   type ThreadStatus,
@@ -165,9 +165,13 @@ test("a limit failure is recognised from the rate-limit snapshot when bb sends e
   assert.ok(isLimitFailure({ error: null, rateLimitStatus: "blocked" }));
 });
 
-test("a limit failure is recognised when bb itself rules the thread recoverable", () => {
-  assert.ok(isLimitFailure({ error: null, recoveryReason: "eligible" }));
-});
+// bb 0.39.0 removed threads.rateLimitRecovery() (get-bb/bb#1623), which is
+// where the second signal used to come from: `reason === "eligible"`, bb's own
+// verdict that it held a replayable failed request. Nothing outside bb's
+// provider-retry plugin can produce a `reason` now, so the signal is gone. It
+// cost no coverage: of the 245 limit failures this plugin logged between
+// 2026-08-09 and the removal, 245 carried `rate limits blocked` as well and
+// none was caught by the reason alone.
 
 test("the error string still decides on its own when bb does fill it in", () => {
   assert.ok(isLimitFailure({ error: "You've hit your session limit · resets 6pm" }));
@@ -180,43 +184,70 @@ test("an ordinary crash is not a limit failure just because it was inspected", (
   for (const signal of [
     { error: "Provider \"codex\" failed to start: spawn codex ENOENT" },
     { error: null, rateLimitStatus: "allowed" },
-    { error: null, rateLimitStatus: null, recoveryReason: "no-terminal-rate-limit-error" },
+    { error: null, rateLimitStatus: "unknown" },
     { error: null },
     {},
   ]) assert.equal(isLimitFailure(signal), false, `should not match: ${JSON.stringify(signal)}`);
 });
 
+const limitsRow = (providerId: string, status: string) => ({
+  type: "provider/rateLimits/updated",
+  data: { rateLimits: { providerId, status } },
+});
+
+// ── where the rate-limit status comes from now ───────────────────────────────
+//
+// It used to be one field on threads.rateLimitRecovery()'s answer. bb 0.39.0
+// removed that method (get-bb/bb#1623) and the call threw, swallowed, from
+// 2026-08-19T05:40Z: 196 warnings, 245 detections in the ten days before and
+// ZERO in the two days after. It is read off the thread's own
+// provider/rateLimits/updated events now, newest-first.
+
+test("the newest observation wins — an older block does not outlive it", () => {
+  // The ordering bug this guards: a thread blocked at 06:00 and allowed again
+  // at 07:00 must not still read `blocked`, or every sweep re-adopts a thread
+  // whose account has already climbed out of the window.
+  const page = [
+    limitsRow("claude-code", "allowed"),
+    limitsRow("claude-code", "blocked"),
+  ];
+  assert.equal(rateLimitStatusFrom(page, "claude-code"), "allowed");
+});
+
+test("a blocked observation is found and reported", () => {
+  assert.equal(rateLimitStatusFrom([limitsRow("claude-code", "blocked")], "claude-code"), "blocked");
+});
+
+test("another provider's observation is not this provider's answer", () => {
+  // A thread that has run on two providers interleaves their observations, so
+  // the newest event of this type need not be the one being asked about.
+  const page = [limitsRow("codex", "blocked"), limitsRow("claude-code", "allowed")];
+  assert.equal(rateLimitStatusFrom(page, "claude-code"), "allowed");
+  assert.equal(rateLimitStatusFrom([limitsRow("codex", "blocked")], "claude-code"), null);
+});
+
+test("no observation is null, never a status — no signal must not read as one", () => {
+  assert.equal(rateLimitStatusFrom([], "claude-code"), null);
+  // isLimitFailure must then decline, or a thread bb has said nothing about
+  // gets adopted on an absence of evidence.
+  assert.equal(isLimitFailure({ error: null, rateLimitStatus: rateLimitStatusFrom([], "claude-code") }), false);
+});
+
 // ── the second half of the same outage: detection is not resumption ──────────
 //
-// Even with detection fixed, thr_3waqz7vb9w could not have been resumed:
-// `bb thread retry` refused it with "no-rate-limit-state", because the limit
-// arrived as an agentMessage rather than a stored recovery candidate. The
-// sweeper would have spent all five attempts on continueAfterRateLimit and
-// then dropped the thread. What actually revived it by hand was an ordinary
-// follow-up message (`bb thread tell --mode auto`), so the sweeper needs that
-// as its fallback.
-
-test("a thread bb has no recovery candidate for is still worth a plain nudge", () => {
-  assert.ok(shouldNudgeAfterIneligible("no-rate-limit-state"));
-  assert.ok(shouldNudgeAfterIneligible("no-terminal-rate-limit-error"));
-  assert.ok(shouldNudgeAfterIneligible("input-not-accepted"));
-});
-
-test("a nudge is withheld wherever bb has already ruled on the thread", () => {
-  // Each of these is bb saying something specific that a nudge would override:
-  // it is already retrying, the thread is alive, the turn did work we would
-  // duplicate, a human asked to drive, or the environment is gone.
-  for (const reason of [
-    "provider-will-retry",
-    "thread-not-failed",
-    "output-or-side-effect-observed",
-    "manual-only",
-    "superseded",
-    "execution-unavailable",
-    "no-failed-turn",
-    "eligible",
-  ]) assert.equal(shouldNudgeAfterIneligible(reason), false, `should not nudge on: ${reason}`);
-});
+// Even with detection fixed, thr_3waqz7vb9w could not have been resumed by
+// bb's own route: `bb thread retry` refused it with "no-rate-limit-state",
+// because the limit arrived as an agentMessage rather than a stored recovery
+// candidate. What actually revived it by hand was an ordinary follow-up
+// message (`bb thread tell --mode auto`).
+//
+// bb 0.39.0 then removed the replay route entirely (get-bb/bb#1623) — it lives
+// in bb's builtin provider-retry plugin now, scheduled for the moment the
+// blocked window rolls over. So the nudge is no longer a fallback, it is the
+// whole mechanism, and shouldNudgeAfterIneligible() went with the reasons it
+// was gating on. The gates that remain are planSweep's, exercised below: a
+// candidate is only attempted while it is still `error`, while some account
+// has capacity, and once per cooldown.
 
 // ── the trips ported from the Python switcher (2026-08-10 consolidation) ──────
 // bb is the sole brain now, so the lessons the Python side had bought and bb had
