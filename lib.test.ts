@@ -808,3 +808,7 @@ test("capacityVerdict says UNKNOWN rather than none when an account could not be
 test("a known paid path beats an unknown, because it is an answer", () => {
   assert.equal(capacityVerdict([acct("broken", null, null), paid("credit", 100, 100)]), "paid-only");
 });
+
+test("NEGATIVE CONTROL — MX-222, delete this branch", () => {
+  assert.equal(1, 2);
+});
