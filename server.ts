@@ -36,8 +36,8 @@ import {
   pickBest as pickBestOf,
   planAdoption,
   type PrevSample,
+  rateLimitStatusFrom,
   type RecoveryAttemptResult,
-  shouldNudgeAfterIneligible,
   type StuckThreadRecord,
   type StuckThreadStore,
   type ThreadRecoveryPort,
@@ -491,22 +491,38 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   const threadRecovery: ThreadRecoveryPort = {
+    /**
+     * Restart a thread a rate limit stopped, now that some account can serve it.
+     *
+     * This was a two-step until 2026-08-21: ask `threads.rateLimitRecovery()`
+     * for a replayable candidate, and `threads.continueAfterRateLimit()` it if
+     * bb had one, falling back to a plain message when it did not. bb 0.39.0
+     * removed BOTH methods, their HTTP routes and `bb thread retry` outright
+     * (get-bb/bb#1623, "Move provider retry policy into the provider-retry
+     * plugin") — the server keeps no rate-limit recovery policy at all now.
+     *
+     * The replay did not move somewhere this plugin can call. It moved into
+     * bb's builtin provider-retry plugin, which schedules it for the moment
+     * the window that blocked it rolls over (`resetsAtMs` + 15s, capped at
+     * six hours). That wait is precisely what this sweep exists to skip: by
+     * the time it runs, accounts has already moved the machine onto an account
+     * with capacity, so the thread can go NOW rather than in five hours.
+     *
+     * So what is left is the fallback, and it was always the half that
+     * actually worked. thr_3waqz7vb9w sat dead for ten hours on 2026-08-11
+     * because its limit arrived as an agentMessage and bb had no replayable
+     * request to offer; an ordinary follow-up message started it again
+     * immediately.
+     *
+     * The eligibility reasons that used to gate this nudge are gone with the
+     * call that produced them. Three gates still stand, all in the sweeper:
+     * it only attempts a thread still sitting in `error` (a thread
+     * provider-retry, a human or an earlier sweep already revived is dropped
+     * untouched), only while some account has capacity, and only once per
+     * recoveryCooldownSec.
+     */
     async attemptContinue(threadId): Promise<RecoveryAttemptResult> {
       try {
-        const status = await bb.sdk.threads.rateLimitRecovery({ threadId });
-        if (status.reason === "eligible" && status.candidate) {
-          await new Promise((r) => setTimeout(r, 3000));
-          await bb.sdk.threads.continueAfterRateLimit({ threadId, failedRequestId: status.candidate.failedRequestId });
-          return { outcome: "continued" };
-        }
-        // bb has no replayable candidate. That is not the same as "unrecoverable":
-        // thr_3waqz7vb9w sat dead for ten hours on 2026-08-11 with reason
-        // "no-rate-limit-state", because its limit arrived as an agentMessage
-        // rather than a stored failed request. A plain follow-up message — what
-        // a human would send — started it again immediately.
-        if (!shouldNudgeAfterIneligible(status.reason)) {
-          return { outcome: "not-eligible", reason: status.reason };
-        }
         await new Promise((r) => setTimeout(r, 3000));
         // mode "auto", not the default "steer": bb rejects a steer into a thread
         // that is not active with HTTP 409 "Thread is not active", which is
@@ -519,11 +535,11 @@ export default async function plugin(bb: BbPluginApi) {
             mentions: [],
             text:
               "[accounts] Provider capacity is back and this thread was stopped by a rate limit. " +
-              "bb had no replayable request for it, so this is a plain restart rather than a retry of the failed call. " +
+              "This is a plain restart rather than a retry of the failed call, so the request that hit the limit was never served. " +
               "Continue from where you left off — re-check anything whose result you never saw before acting on it.",
           }],
         });
-        bb.log.info(`recovery: nudged ${threadId} back to life (bb reason: ${status.reason})`);
+        bb.log.info(`recovery: nudged ${threadId} back to life`);
         return { outcome: "continued" };
       } catch (e) {
         return { outcome: "error", message: e instanceof Error ? e.message : String(e) };
@@ -1044,19 +1060,59 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   /**
+   * The newest provider rate-limit state bb recorded on this thread, or null.
+   *
+   * `provider/rateLimits/updated` carries the same `rateLimits` object the
+   * removed `threads.rateLimitRecovery()` used to return, and reading it back
+   * off the event stream is what bb's own provider-retry plugin does now
+   * (plugins/provider-retry/src/recovery.ts, findLatestProviderRateLimitsEvent).
+   *
+   * One page, not bb's paging loop: it pages because a thread may interleave
+   * providers and the newest event of this type need not be the one it wants.
+   * Measured on this machine 2026-08-21 — all 8160 of these events are
+   * `claude-code` and no thread has ever carried two providers — and this
+   * plugin only ever asks about Claude. So a provider mismatch inside the
+   * newest page means "no signal", which is the safe direction: no signal is
+   * no adoption.
+   */
+  const RATE_LIMIT_PAGE = 100;
+  async function latestRateLimitStatus(threadId: string, providerId: string): Promise<string | null> {
+    const page = await bb.sdk.threads.events.list({
+      threadId,
+      limit: String(RATE_LIMIT_PAGE),
+      order: "desc",
+      types: ["provider/rateLimits/updated"],
+    });
+    return rateLimitStatusFrom(
+      page.flatMap((row) => (row.type === "provider/rateLimits/updated" ? [row] : [])),
+      providerId,
+    );
+  }
+
+  /**
    * Gather every signal about a dead thread. `error` alone is not enough — it
    * is null on every real limit failure (see isLimitFailure) — so unless it
-   * settles the question on its own, ask bb's recovery inspection, which
-   * carries the provider rate-limit snapshot on every answer including refusals.
+   * settles the question on its own, read the thread's own event stream.
+   *
+   * This asked `threads.rateLimitRecovery()` until 2026-08-21. bb 0.39.0
+   * removed that method (get-bb/bb#1623) and the call had been throwing since
+   * 2026-08-19T05:40Z — into the catch below, which returned a signal with no
+   * rate-limit state in it. `isLimitFailure` then said no to everything, so
+   * BOTH detection paths went quiet: 245 limit failures were caught in the ten
+   * days before, and none in the two days after. The warning was the only
+   * trace, 196 of them, and it is the reason this was findable at all.
    */
-  async function inspectFailure(threadId: string, error: string | null): Promise<LimitFailureSignal> {
+  async function inspectFailure(
+    threadId: string,
+    error: string | null,
+    providerId: string,
+  ): Promise<LimitFailureSignal> {
     if (isLimitError(error)) return { error };
     try {
-      const status = await bb.sdk.threads.rateLimitRecovery({ threadId });
-      return { error, rateLimitStatus: status.rateLimits?.status ?? null, recoveryReason: status.reason };
+      return { error, rateLimitStatus: await latestRateLimitStatus(threadId, providerId) };
     } catch (e) {
-      // Expected for a destroyed environment, which answers
-      // thread_environment_unavailable rather than a status. Nothing to adopt.
+      // Expected for a thread bb can no longer read — a deleted thread answers
+      // not-found rather than a page of events. Nothing to adopt.
       bb.log.warn(`limit inspection failed for ${threadId}: ${e instanceof Error ? e.message : e}`);
       return { error };
     }
@@ -1084,9 +1140,9 @@ export default async function plugin(bb: BbPluginApi) {
 
       for (const threadId of plan.inspect) {
         const row = rows.find((t) => t.id === threadId);
-        const signal = await inspectFailure(threadId, null);
-        if (!isLimitFailure(signal)) continue;
         const providerId = (row as unknown as { providerId?: string })?.providerId ?? "claude-code";
+        const signal = await inspectFailure(threadId, null, providerId);
+        if (!isLimitFailure(signal)) continue;
         bb.log.info(`adopted untracked stuck thread ${threadId} (${describeSignal(signal)}) — the event never reached us`);
         await sweeper.onLimitFailure(threadId, providerId);
       }
@@ -1097,11 +1153,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Which signal actually caught this failure — the line that was missing all night. */
   const describeSignal = (s: LimitFailureSignal): string =>
-    isLimitError(s.error)
-      ? `error: ${s.error}`
-      : s.rateLimitStatus === "blocked"
-      ? `rate limits blocked, bb reason ${s.recoveryReason}`
-      : `bb reason ${s.recoveryReason}`;
+    isLimitError(s.error) ? `error: ${s.error}` : `rate limits ${s.rateLimitStatus ?? "unknown"}`;
 
   // ── Placement: where should work START? ──────────────────────────────────
   //
@@ -1230,7 +1282,7 @@ export default async function plugin(bb: BbPluginApi) {
   //      the lowest-usage fresh account and auto-continue the thread there.
   bb.events.on("thread.failed", ({ thread, error }) => {
     void (async () => {
-      const signal = await inspectFailure(thread.id, error);
+      const signal = await inspectFailure(thread.id, error, thread.providerId);
       if (!isLimitFailure(signal)) return;
       bb.log.info(`thread ${thread.id} failed on a provider limit (${describeSignal(signal)}) — tracking for recovery`);
       // Track this thread as stuck regardless of what happens below — a
@@ -1281,8 +1333,8 @@ export default async function plugin(bb: BbPluginApi) {
       const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit on ${failingModel || "unknown model"} with window at ${fiveH}%`);
       if (!ok) return;
       // Sweeps thread.id itself plus every other currently-stuck thread —
-      // replaces the old single-thread rateLimitRecovery/continueAfterRateLimit
-      // dance, which never revisited threads that failed earlier.
+      // replaces the old single-thread recovery dance, which never revisited
+      // threads that failed earlier.
       const swept = await sweeper.sweep("reactive");
       if (swept.continued.length) bb.log.info(`reactive switch to ${best.slot} resumed: ${swept.continued.join(", ")}`);
     })();

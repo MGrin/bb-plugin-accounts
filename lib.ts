@@ -362,17 +362,22 @@ export function isLimitError(error: string | null | undefined): boolean {
  * Everything the plugin knows about a thread.failed, from every source it has.
  *
  * `error` is bb's own field and is null on real limit failures — see
- * isLimitFailure. The other two come from a follow-up
- * `threads.rateLimitRecovery()` call, which returns its `rateLimits` snapshot
- * on EVERY inspection, including the ones whose `reason` is a refusal.
+ * isLimitFailure. `rateLimitStatus` comes from the thread's own event stream:
+ * the newest `provider/rateLimits/updated` bb recorded for it.
+ *
+ * It used to come from a follow-up `threads.rateLimitRecovery()` call, which
+ * also carried bb's `reason` — its verdict on whether the failed request could
+ * be replayed. bb 0.39.0 removed that method outright (get-bb/bb#1623), so
+ * there is no `reason` any more and this interface no longer has one. Nothing
+ * is lost in practice: of the 245 limit failures this plugin detected before
+ * the removal, 245 were carried by `rate limits blocked` and none by `reason`
+ * alone.
  */
 export interface LimitFailureSignal {
   /** thread.failed's `error`. Null far more often than it looks. */
   error?: string | null;
-  /** ProviderRateLimitRecoveryStatus.rateLimits?.status */
+  /** provider/rateLimits/updated -> data.rateLimits.status */
   rateLimitStatus?: string | null;
-  /** ProviderRateLimitRecoveryStatus.reason */
-  recoveryReason?: string | null;
 }
 
 /**
@@ -387,45 +392,58 @@ export interface LimitFailureSignal {
  * life, the stuck-thread store had never held a single record, and every
  * overnight rate limit was recovered by hand or not at all.
  *
- * So the trigger no longer depends on that field alone. Two more signals,
- * both from bb's own recovery inspection, and either one is sufficient:
+ * So the trigger no longer depends on that field alone. The second signal is
+ * `rateLimits.status === "blocked"` — bb saw the provider block this thread's
+ * window — read from the newest `provider/rateLimits/updated` event on the
+ * thread. That event lands right before the failure, which is why it is the
+ * one that catches the real case: every one of the 245 failures this plugin
+ * detected between 2026-08-09 and 2026-08-19 carried it.
  *
- *  - `rateLimits.status === "blocked"` — bb saw the provider block this
- *    thread's window. This is the one that catches the real case, because the
- *    `provider/rateLimits/updated` event lands right before the failure.
- *  - `reason === "eligible"` — bb has a resume candidate ready, which it only
- *    ever builds for a terminal rate-limit error.
- *
- * Deliberately NOT a signal: any other `reason`. They describe why a resume is
- * refused, not what killed the thread, and treating them as limit evidence
- * would track every ENOENT on the machine.
+ * There used to be a third, `reason === "eligible"` from
+ * `threads.rateLimitRecovery()`. bb 0.39.0 removed that call (get-bb/bb#1623)
+ * and nothing outside bb's own provider-retry plugin can produce a `reason`
+ * now. It never once fired on its own — all 245 detections above also had
+ * `blocked` — so its loss costs no coverage. Deliberately NOT a signal, then
+ * as now: any OTHER reason. Those describe why a resume was refused, not what
+ * killed the thread, and treating them as limit evidence would track every
+ * ENOENT on the machine.
  */
 export function isLimitFailure(signal: LimitFailureSignal): boolean {
   if (isLimitError(signal.error)) return true;
-  if (signal.rateLimitStatus === "blocked") return true;
-  return signal.recoveryReason === "eligible";
+  return signal.rateLimitStatus === "blocked";
+}
+
+/** One `provider/rateLimits/updated` row, structurally — lib.ts imports nothing. */
+export interface RateLimitsEventRow {
+  type: string;
+  data: { rateLimits: { providerId: string; status: string } };
 }
 
 /**
- * bb won't resume this thread by its own route — is a plain follow-up message
- * still worth sending?
+ * Pick this provider's rate-limit status out of a newest-first page of
+ * `provider/rateLimits/updated` events, or null if the page holds none.
  *
- * continueAfterRateLimit replays a specific failed request, and it needs a
- * stored candidate. thr_3waqz7vb9w had none: its limit arrived as an
- * agentMessage, so `bb thread retry` refused with "no-rate-limit-state" and
- * the thread sat dead for ten hours. What actually revived it was an ordinary
- * message (`bb thread tell --mode auto`) — the same thing a human does.
+ * The page must be `order: "desc"`, because the FIRST match is the answer: a
+ * thread's rate-limit state is whatever bb observed most recently, and an
+ * older `blocked` under a newer `allowed` would resurrect a limit the account
+ * has since climbed out of.
  *
- * The three reasons below all mean "bb has no candidate, and the thread really
- * is stopped in error". Every other reason is bb ruling on the thread in a way
- * a nudge would override: it is already retrying it, the thread is alive
- * again, the failed turn did work a nudge might duplicate, a human asked to
- * drive, or the environment is gone. Those get left alone.
+ * The providerId filter is bb's own (provider-retry's
+ * findLatestProviderRateLimitsEvent) and matters for the same reason: a thread
+ * that has run on two providers interleaves their observations, so the newest
+ * event of this type is not necessarily the one being asked about. No signal
+ * is the safe answer — it means no adoption, not a wrong adoption.
  */
-export function shouldNudgeAfterIneligible(reason: string): boolean {
-  return reason === "no-rate-limit-state" ||
-    reason === "no-terminal-rate-limit-error" ||
-    reason === "input-not-accepted";
+export function rateLimitStatusFrom(
+  page: readonly RateLimitsEventRow[],
+  providerId: string,
+): string | null {
+  for (const row of page) {
+    if (row.type !== "provider/rateLimits/updated") continue;
+    if (row.data.rateLimits.providerId !== providerId) continue;
+    return row.data.rateLimits.status;
+  }
+  return null;
 }
 
 // ── Reconciliation — finding stuck threads the event stream never reported ──
@@ -438,8 +456,8 @@ export function shouldNudgeAfterIneligible(reason: string): boolean {
 // happening again.
 //
 // So the watch tick also looks for itself. Any errored thread the store does
-// not know about is a candidate, confirmed by the same rateLimitRecovery
-// inspection the trigger uses, so adoption can never be laxer than detection.
+// not know about is a candidate, confirmed by the same rate-limit inspection
+// the trigger uses, so adoption can never be laxer than detection.
 
 export interface ListedThread {
   id: string;
@@ -631,7 +649,11 @@ export type RecoveryAttemptResult =
   | { outcome: "error"; message: string };
 
 export interface ThreadRecoveryPort {
-  /** Hides the rateLimitRecovery -> continueAfterRateLimit two-step and its settle delay. */
+  /**
+   * Get this thread moving again now that an account has capacity. Hides the
+   * settle delay and whatever mechanism bb currently offers for restarting a
+   * stopped thread.
+   */
   attemptContinue(threadId: string): Promise<RecoveryAttemptResult>;
 }
 
