@@ -22,6 +22,7 @@ bb accounts switch <slot> switch the live credentials to a slot
 bb accounts auto          run one auto-switch evaluation now
 bb accounts log           the last switch decision and why
 bb accounts place         where should work on a model START? ask BEFORE spawning
+bb accounts outage        can this machine serve AT ALL? exit 0 means no
 ```
 
 **Proactive switching** — a schedule compares the active account against `switchAt` and
@@ -61,13 +62,36 @@ is the only thing that revives that thread. Bounded by
 keeps failing for a non-limit reason is never retried forever.
 
 **Capacity gating** — those bounds measure "this thread looks unrecoverable", which is not
-what an outage means. When EVERY account is walled the sweep holds: no attempts, and
+what an outage means. When the machine cannot serve at all the sweep holds: no attempts, and
 critically no drops, with the dry time banked in `stalledMs` and excluded from the give-up
 clock. Without this, the shipped defaults (5 attempts, 120s apart) dropped every stuck
 thread 10 minutes into a dry spell — while the soonest account reset was still 87 minutes
 away, so the threads were abandoned long before the capacity they were waiting for
 arrived. A stale usage cache counts as capacity available: a broken poller must not be
 able to freeze recovery.
+
+**`bb accounts outage` — the away-message question.** Answered by the 2-minute `watch`
+tick and left somewhere cheap to read, because when the machine really is dark the thing
+that would announce the outage is the thing that cannot run.
+
+An outage means the machine **cannot serve at all** — no free window anywhere *and* no
+paid credits behind the walls (mgrin's call, 2026-08-21, MX-218). It used to mean "no free
+window", which is a different statement the moment credits are on: the command led with
+`ALL ACCOUNTS EXHAUSTED` and exited 0 while the machine billed happily. The headline,
+`cannotServe` and the exit code are now emitted from one function over one verdict, so
+reading any single one of them is safe.
+
+```
+0  cannot serve at all, confirmed over N distinct non-stale polls   <- the only "stop"
+1  can serve. INCLUDES paid-only, which runs and BILLS — the headline says so
+2  cannot tell: stale poll, an unreadable account, or an outage not yet confirmed
+```
+
+"No free window anywhere" did not stop being true or useful, so it kept a field of its
+own, `allFreeWindowsSpent`, plus the `free`/`back` lines and the free-window ETA. It was
+called `allExhausted` until MX-218 and is **renamed, not redefined** — a consumer still
+reading the old key gets `undefined`, which is loud, rather than a boolean that quietly
+means something else. Same rename on `bb accounts list --json` under `outage`.
 
 **Model downgrade before account switch** — if the failing model has its own ceiling but
 the account's overall window still has room, the thread is continued on a lower-tier

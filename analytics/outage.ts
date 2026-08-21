@@ -1,4 +1,8 @@
-// Is EVERY account out, and when does the first one come back?
+// Can this machine serve AT ALL, and when does the first free window return?
+//
+// Those are two questions, and treating them as one is what MX-218 fixed. The
+// verdict is the first (`cannotServe`); the second is a fact about money and
+// waiting that keeps its own field (`allFreeWindowsSpent`) and its own ETA.
 //
 // This exists because of one asymmetry: the agent cannot announce its own
 // outage. If all accounts are walled, the thing that would post the message is
@@ -17,6 +21,7 @@
 // Pure by convention, like the rest of analytics/: server.ts does the I/O.
 
 import { DEFAULT_WEEKLY_AT, usableHeadroom, type PlacementAccount } from "./placement.ts";
+import type { CapacityVerdict } from "../lib.ts";
 
 /**
  * The 5-hour wall. Note this is NOT `switchAt` (97): that is the point at which
@@ -53,12 +58,29 @@ export interface AccountOutage {
 export type UnknownReason = "stale" | "no-reset-time" | null;
 
 export interface OutageVerdict {
-  /** Every account is at a wall, on non-stale data. */
-  allExhausted: boolean;
+  /**
+   * THE OUTAGE. No account can serve a request by ANY means — no free window
+   * anywhere and no paid credits behind the walls (MX-218; mgrin, 2026-08-21).
+   *
+   * Read straight off `capacity === "none"`, which is the same predicate the
+   * recovery sweeper already gates on (`anyAccountHasCapacity`), so the two
+   * cannot drift into disagreeing about whether this machine is working.
+   */
+  cannotServe: boolean;
+  /**
+   * Every account has spent its free window. Still true, still useful, and no
+   * longer an outage on its own: with credits on it is a fact about MONEY, not
+   * about availability. This was `allExhausted` until MX-218 — renamed rather
+   * than redefined, so a consumer that still reads the old name gets
+   * `undefined` instead of a boolean that quietly means something else.
+   */
+  allFreeWindowsSpent: boolean;
+  /** What the machine can serve, as handed in — echoed so one read answers all. */
+  capacity: CapacityVerdict;
   /** ISO-8601 of the first moment any account works again; null = UNKNOWN. */
   earliestUsableAt: string | null;
   earliestUsableSlot: string | null;
-  /** Why there is no timestamp, when allExhausted holds but the ETA does not. */
+  /** Why there is no timestamp, when every free window is spent but the ETA is not readable. */
   unknownReason: UnknownReason;
   /** One line, safe to read aloud. */
   reason: string;
@@ -132,6 +154,17 @@ export function earliestUsable(
 /**
  * The predicate, over the whole fleet.
  *
+ * WHAT AN OUTAGE MEANS (MX-218; mgrin's call, 2026-08-21): the machine cannot
+ * serve AT ALL. It used to mean "no free window is left anywhere", which is a
+ * different statement the moment credits are on — and while they are on, a
+ * machine that bills happily was reporting itself dark. The free-window fact
+ * did not stop being true or useful, so it keeps its own field
+ * (`allFreeWindowsSpent`) and its own ETA; it just stopped being the verdict.
+ *
+ * `capacity` is REQUIRED rather than defaulted, and that is the point: this
+ * question cannot be answered without knowing whether there is a paid path, so
+ * a caller must say. A default would let the old answer come back silently.
+ *
  * `stale` is a hard gate, not a caveat: the poller's cache going quiet looks
  * exactly like every account being at 100 if you only read utilisations, and
  * announcing an outage because a LaunchAgent died would be a lie about the
@@ -139,14 +172,16 @@ export function earliestUsable(
  */
 export function assessOutage(
   accounts: readonly OutageAccount[],
-  opts: { weeklyAt?: number; stale?: boolean } = {},
+  opts: { weeklyAt?: number; stale?: boolean; capacity: CapacityVerdict },
 ): OutageVerdict {
   const weeklyAt = opts.weeklyAt ?? DEFAULT_WEEKLY_AT;
   const per = accounts.map((a) => accountOutage(a, weeklyAt));
 
   if (opts.stale) {
     return {
-      allExhausted: false,
+      cannotServe: false,
+      allFreeWindowsSpent: false,
+      capacity: "unknown",
       earliestUsableAt: null,
       earliestUsableSlot: null,
       unknownReason: "stale",
@@ -156,7 +191,9 @@ export function assessOutage(
   }
   if (per.length === 0) {
     return {
-      allExhausted: false,
+      cannotServe: false,
+      allFreeWindowsSpent: false,
+      capacity: "unknown",
       earliestUsableAt: null,
       earliestUsableSlot: null,
       unknownReason: null,
@@ -167,7 +204,9 @@ export function assessOutage(
   const usable = per.filter((o) => !o.exhausted);
   if (usable.length > 0) {
     return {
-      allExhausted: false,
+      cannotServe: false,
+      allFreeWindowsSpent: false,
+      capacity: opts.capacity,
       earliestUsableAt: null,
       earliestUsableSlot: null,
       unknownReason: null,
@@ -176,17 +215,64 @@ export function assessOutage(
     };
   }
   const first = earliestUsable(accounts, weeklyAt);
+  // Two clauses, kept apart on purpose: the first is about MONEY (can anything
+  // serve, and does it bill), the second about the free window coming back.
+  // Collapsing them is how "no free window" came to read as "there is nothing".
+  const money =
+    opts.capacity === "none"
+      ? "no paid credits are open, so nothing can serve"
+      : opts.capacity === "paid-only"
+        ? "paid credits are open, so work still runs and it BILLS"
+        : "cannot tell whether paid credits are open on any of them";
+  const back =
+    first.at === null
+      ? "when the first free window returns is unknown (no reset time on a binding window)"
+      : `${first.slot}'s free window returns at ${first.at}`;
   return {
-    allExhausted: true,
+    cannotServe: opts.capacity === "none",
+    allFreeWindowsSpent: true,
+    capacity: opts.capacity,
     earliestUsableAt: first.at,
     earliestUsableSlot: first.slot,
     unknownReason: first.unknownReason,
-    reason:
-      first.at === null
-        ? `all ${per.length} account(s) exhausted; earliest usable time is unknown (no reset time on a binding window)`
-        : `all ${per.length} account(s) exhausted; ${first.slot} is back at ${first.at}`,
+    reason: `all ${per.length} account(s) have spent their free window; ${money}; ${back}`,
     accounts: per,
   };
+}
+
+/**
+ * The headline and the exit code, from ONE place.
+ *
+ * The ticket's requirement is that the headline, the boolean and the exit
+ * status give the same answer, so that reading any one of them is safe. They
+ * agree here because one function emits two of them off the verdict that
+ * carries the third — the previous shape had the exit expression written out
+ * twice and the headline a fourth time, which is a contract kept in step by
+ * hand.
+ *
+ * THE EXIT CODES, after MX-218:
+ *   0  the machine cannot serve at all, confirmed over N distinct non-stale
+ *      polls. The ONLY code that means "stop" — `if bb accounts outage; then`
+ *      still speaks on 0 alone.
+ *   1  the machine can serve. Includes PAID-ONLY, which runs and bills; the
+ *      headline says so, because exit 1 must not read as "all is well".
+ *   2  cannot tell — a stale poll, an account that could not be read, or an
+ *      outage too young to have been confirmed. Both flavours of doubt fall
+ *      here, and doubt is never 1.
+ */
+export function outageSignals(
+  v: Pick<OutageVerdict, "cannotServe" | "capacity" | "unknownReason">,
+  confirmed: boolean,
+): { headline: string; exitCode: 0 | 1 | 2 } {
+  if (v.cannotServe) {
+    return confirmed
+      ? { headline: "CANNOT SERVE — every account is walled and no credits are open", exitCode: 0 }
+      : { headline: "cannot serve, not yet confirmed", exitCode: 2 };
+  }
+  if (v.unknownReason === "stale") return { headline: "unknown (stale poll)", exitCode: 2 };
+  if (v.capacity === "unknown") return { headline: "unknown (an account could not be read)", exitCode: 2 };
+  if (v.capacity === "paid-only") return { headline: "accounts available — PAID ONLY, work BILLS", exitCode: 1 };
+  return { headline: "accounts available", exitCode: 1 };
 }
 
 /**
@@ -209,12 +295,12 @@ export const EMPTY_STREAK: OutageStreak = { consecutive: 0, sincePolledAt: null,
 
 export function advanceStreak(
   prev: OutageStreak | null,
-  verdict: Pick<OutageVerdict, "allExhausted">,
+  verdict: Pick<OutageVerdict, "cannotServe">,
   polledAt: number | null,
 ): OutageStreak {
   // A poll with no timestamp cannot be shown to be a NEW poll, so it cannot be
   // evidence of persistence. Break the run rather than count it.
-  if (!verdict.allExhausted || polledAt === null) return EMPTY_STREAK;
+  if (!verdict.cannotServe || polledAt === null) return EMPTY_STREAK;
   const last = prev ?? EMPTY_STREAK;
   if (last.lastPolledAt !== null && polledAt <= last.lastPolledAt) return last;
   return {
@@ -231,9 +317,9 @@ export function advanceStreak(
  * agreed.
  */
 export function isConfirmed(
-  verdict: Pick<OutageVerdict, "allExhausted">,
+  verdict: Pick<OutageVerdict, "cannotServe">,
   streak: OutageStreak | null,
   requiredPolls: number = DEFAULT_CONFIRM_POLLS,
 ): boolean {
-  return verdict.allExhausted && (streak?.consecutive ?? 0) >= Math.max(1, requiredPolls);
+  return verdict.cannotServe && (streak?.consecutive ?? 0) >= Math.max(1, requiredPolls);
 }
