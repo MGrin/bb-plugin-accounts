@@ -68,6 +68,7 @@ import {
 import {
   advanceStreak,
   assessOutage,
+  outageSignals,
   DEFAULT_CONFIRM_POLLS,
   earliestUsable,
   EMPTY_STREAK,
@@ -395,7 +396,11 @@ export default async function plugin(bb: BbPluginApi) {
     const { polledAt, accounts } = read ?? (await readUsage());
     const { weeklyAt, outageConfirmPolls } = await settings.get();
     const stale = await isStale(polledAt);
-    const verdict = assessOutage(toOutageAccounts(accounts), { weeklyAt: Number(weeklyAt), stale });
+    // From THIS poll, never a second read. An outage verdict and a capacity
+    // verdict taken from two different polls can disagree, and after MX-218 the
+    // first is DERIVED from the second — so they have to be one observation.
+    const capacity = await capacityOf(polledAt, accounts, Number(weeklyAt));
+    const verdict = assessOutage(toOutageAccounts(accounts), { weeklyAt: Number(weeklyAt), stale, capacity });
     const streak = (await bb.storage.kv.get<OutageStreak>("outage-streak")) ?? EMPTY_STREAK;
     const requiredPolls = Number(outageConfirmPolls) || DEFAULT_CONFIRM_POLLS;
     return { polledAt, stale, verdict, streak, requiredPolls, confirmed: isConfirmed(verdict, streak, requiredPolls) };
@@ -540,10 +545,18 @@ export default async function plugin(bb: BbPluginApi) {
    * the state a name so the two blind cases and the two sighted ones stop
    * sharing one boolean.
    */
+  async function capacityOf(
+    polledAt: number | null,
+    accounts: Account[],
+    weeklyAt: number,
+  ): Promise<CapacityVerdict> {
+    if (accounts.length === 0 || (await isStale(polledAt))) return "unknown";
+    return capacityVerdict(accounts, weeklyAt);
+  }
+
   async function machineCapacity(): Promise<CapacityVerdict> {
     const { polledAt, accounts } = await readUsage();
-    if (accounts.length === 0 || (await isStale(polledAt))) return "unknown";
-    return capacityVerdict(accounts, Number(recoverySettings.weeklyAt));
+    return capacityOf(polledAt, accounts, Number(recoverySettings.weeklyAt));
   }
 
   /**
@@ -724,6 +737,7 @@ export default async function plugin(bb: BbPluginApi) {
       const verdict = assessOutage(toOutageAccounts(accounts), {
         weeklyAt: Number(weeklyAt),
         stale: await isStale(polledAt),
+        capacity: await capacityOf(polledAt, accounts, Number(weeklyAt)),
       });
       const before = (await bb.storage.kv.get<OutageStreak>("outage-streak")) ?? EMPTY_STREAK;
       const streak = advanceStreak(before, verdict, polledAt);
@@ -1311,7 +1325,8 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "outage",
-        summary: "Is EVERY account out, and when does the first come back? (exit 0 = yes, 1 = no, 2 = cannot tell)",
+        summary:
+          "Can this machine serve AT ALL — free window or paid credits? (exit 0 = no, 1 = yes, 2 = cannot tell)",
         usage: "bb accounts outage [--json]",
       },
       { name: "forecast", summary: "When every account runs dry, and for how long", usage: "bb accounts forecast [--json]" },
@@ -1543,20 +1558,38 @@ export default async function plugin(bb: BbPluginApi) {
       }
       // The away-message question, for a SCHEDULED caller that wants a cheap,
       // unambiguous answer and no prose to parse. Exit codes are the contract:
-      //   0  every account is out, confirmed over N distinct non-stale polls
-      //   1  at least one account has headroom — nothing to announce
-      //   2  cannot tell (stale poll, or not enough polls have agreed yet)
+      //   0  the machine CANNOT SERVE AT ALL, confirmed over N distinct
+      //      non-stale polls — no free window anywhere and no credits open
+      //   1  the machine can serve. Includes PAID-ONLY, which runs and bills
+      //   2  cannot tell — stale poll, an unreadable account, or an outage too
+      //      young to have been confirmed
       // so `if bb accounts outage >/dev/null; then ...` speaks only on 0, and
       // both flavours of doubt fall to silence.
+      //
+      // MX-218 (mgrin, 2026-08-21) is what "cannot serve at all" is doing in
+      // that list. It used to be "no free window", so exit 0 fired on a machine
+      // billing happily to credits. The headline, `cannotServe` and the exit
+      // code now come from one function over one verdict — reading any single
+      // one of them is safe, which is the whole ask.
       if (cmd === "outage") {
         const o = await currentOutage();
         const v = o.verdict;
+        const { headline, exitCode } = outageSignals(v, o.confirmed);
         if (json) {
           return {
-            exitCode: v.allExhausted ? (o.confirmed ? 0 : 2) : o.stale ? 2 : 1,
+            exitCode,
             stdout: JSON.stringify({
               confirmed: o.confirmed,
-              allExhausted: v.allExhausted,
+              // THE boolean. True only when nothing can serve by any means.
+              cannotServe: v.cannotServe,
+              // The fact that used to be called `allExhausted` and used to BE
+              // the verdict. Still true, still worth knowing, no longer a
+              // reason to stop: with credits on it is a statement about money.
+              // Renamed rather than redefined so a consumer still reading the
+              // old key gets `undefined` — loud — instead of a boolean that
+              // quietly means something else.
+              allFreeWindowsSpent: v.allFreeWindowsSpent,
+              capacity: v.capacity,
               earliestUsableAt: v.earliestUsableAt,
               earliestUsableSlot: v.earliestUsableSlot,
               unknownReason: v.unknownReason,
@@ -1566,29 +1599,27 @@ export default async function plugin(bb: BbPluginApi) {
               outageSincePolledAt: o.streak.sincePolledAt,
               polledAt: o.polledAt,
               stale: o.stale,
-              // "every window is spent" and "there is nothing left" stopped
-              // being the same statement on 2026-08-20. allExhausted still
-              // means the first; `capacity` is the second, and a consumer that
-              // stops work on allExhausted alone now has the means not to.
-              capacity: await machineCapacity(),
               accounts: v.accounts,
             }),
           };
         }
         const lines = [
-          `verdict   ${o.confirmed ? "ALL ACCOUNTS EXHAUSTED" : v.allExhausted ? "all exhausted, not yet confirmed" : o.stale ? "unknown (stale)" : "accounts available"}`,
+          `verdict   ${headline}`,
           `reason    ${v.reason}`,
+          `capacity  ${v.capacity}${v.capacity === "paid-only" ? " — usable, and it BILLS" : ""}`,
+          `free      ${v.allFreeWindowsSpent ? `no free window on any of ${v.accounts.length} account(s)` : "at least one account has a free window"}`,
+          // The free window coming back, which is a different question from
+          // whether the machine is working. Named on the line so the two do not
+          // get read as one again.
+          `back      ${v.earliestUsableAt ?? (v.allFreeWindowsSpent ? "UNKNOWN — no reset time on a binding window" : "—")}${v.earliestUsableSlot ? ` (${v.earliestUsableSlot})` : ""}`,
           `polls     ${o.streak.consecutive}/${o.requiredPolls} consecutive`,
-          `back      ${v.earliestUsableAt ?? (v.allExhausted ? "UNKNOWN — no reset time on a binding window" : "—")}${v.earliestUsableSlot ? ` (${v.earliestUsableSlot})` : ""}`,
         ];
-        const capacity = await machineCapacity();
-        lines.push(`capacity  ${capacity}${capacity === "paid-only" ? " — usable, and it BILLS" : ""}`);
         for (const a of v.accounts) {
           lines.push(
             `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : "usable"}`,
           );
         }
-        return { exitCode: v.allExhausted ? (o.confirmed ? 0 : 2) : o.stale ? 2 : 1, stdout: lines.join("\n") };
+        return { exitCode, stdout: lines.join("\n") };
       }
       if (cmd === "log") {
         const last = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch");
@@ -1618,7 +1649,8 @@ export default async function plugin(bb: BbPluginApi) {
             active: accounts.find((a) => a.active)?.slot ?? null,
             outage: {
               confirmed: o.confirmed,
-              allExhausted: o.verdict.allExhausted,
+              cannotServe: o.verdict.cannotServe,
+              allFreeWindowsSpent: o.verdict.allFreeWindowsSpent,
               earliestUsableAt: o.verdict.earliestUsableAt,
               earliestUsableSlot: o.verdict.earliestUsableSlot,
               unknownReason: o.verdict.unknownReason,
@@ -1630,7 +1662,7 @@ export default async function plugin(bb: BbPluginApi) {
             // show credits is that spend nobody can see is spend nobody will
             // notice — so the verdict rides on the payload it already reads,
             // from the same poll as the accounts beside it.
-            capacity: stale ? "unknown" : capacityVerdict(accounts, Number(recoverySettings.weeklyAt)),
+            capacity: o.verdict.capacity,
             accounts: accounts.map((a) => ({
               slot: a.slot,
               email: a.email,

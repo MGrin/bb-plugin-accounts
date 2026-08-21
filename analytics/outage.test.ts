@@ -7,6 +7,7 @@ import {
   earliestUsable,
   EMPTY_STREAK,
   isConfirmed,
+  outageSignals,
   type OutageAccount,
 } from "./outage.ts";
 
@@ -136,8 +137,9 @@ test("an unparseable reset is UNKNOWN, never a guess", () => {
 // ── the predicate ────────────────────────────────────────────────────────────
 
 test("the real fleet of 2026-08-18 is NOT all-exhausted — one account had room", () => {
-  const v = assessOutage(REAL);
-  assert.equal(v.allExhausted, false);
+  const v = assessOutage(REAL, { capacity: "free" });
+  assert.equal(v.cannotServe, false);
+  assert.equal(v.allFreeWindowsSpent, false);
   assert.equal(v.earliestUsableAt, null);
 });
 
@@ -147,34 +149,37 @@ test("all-exhausted is true only when every account is walled on its binding win
       ? { ...a, fiveUtil: 100 }
       : a,
   );
-  const v = assessOutage(walled);
-  assert.equal(v.allExhausted, true);
+  const v = assessOutage(walled, { capacity: "none" });
+  assert.equal(v.cannotServe, true);
+  assert.equal(v.allFreeWindowsSpent, true);
 });
 
 test("one unreadable account suppresses the outage rather than completing it", () => {
   const walled = REAL.map((a) =>
     a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: null, sevenUtil: null } : a,
   );
-  assert.equal(assessOutage(walled).allExhausted, false);
+  const v = assessOutage(walled, { capacity: "unknown" });
+  assert.equal(v.cannotServe, false);
+  assert.equal(v.allFreeWindowsSpent, false);
 });
 
 test("stale data can never satisfy the predicate", () => {
   const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
-  const v = assessOutage(walled, { stale: true });
-  assert.equal(v.allExhausted, false);
+  const v = assessOutage(walled, { capacity: "unknown", stale: true });
+  assert.equal(v.cannotServe, false);
   assert.equal(v.earliestUsableAt, null);
   assert.equal(v.unknownReason, "stale");
 });
 
 test("an empty account list is not an outage — it is an absence of data", () => {
-  assert.equal(assessOutage([]).allExhausted, false);
+  assert.equal(assessOutage([], { capacity: "unknown" }).cannotServe, false);
 });
 
 // ── earliest usable ──────────────────────────────────────────────────────────
 
 test("earliest-usable is the MINIMUM across the exhausted accounts", () => {
   const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
-  const v = assessOutage(walled);
+  const v = assessOutage(walled, { capacity: "none" });
   // mr6r1n clears at 10:19 today; the others not until 13:29 today / 20 Aug.
   assert.equal(v.earliestUsableAt, "2026-08-18T10:19:59.728Z");
   assert.equal(v.earliestUsableSlot, "mr6r1n_gmail.com");
@@ -187,8 +192,8 @@ test("one missing reset makes the whole earliest-usable UNKNOWN, not the min of 
       ? { ...a, fiveUtil: 100, fiveResetsAt: null }
       : a,
   );
-  const v = assessOutage(walled);
-  assert.equal(v.allExhausted, true);
+  const v = assessOutage(walled, { capacity: "none" });
+  assert.equal(v.cannotServe, true);
   assert.equal(v.earliestUsableAt, null);
   assert.equal(v.unknownReason, "no-reset-time");
 });
@@ -197,8 +202,8 @@ test("one missing reset makes the whole earliest-usable UNKNOWN, not the min of 
 // still stands and is worth announcing; only the ETA is withheld.
 test("when NO account has a reset time the outage still holds and the time is UNKNOWN", () => {
   const blind = REAL.map((a) => ({ ...a, fiveUtil: 100, fiveResetsAt: null, sevenResetsAt: null }));
-  const v = assessOutage(blind);
-  assert.equal(v.allExhausted, true);
+  const v = assessOutage(blind, { capacity: "none" });
+  assert.equal(v.cannotServe, true);
   assert.equal(v.earliestUsableAt, null);
   assert.equal(v.unknownReason, "no-reset-time");
   assert.match(v.reason, /unknown/i);
@@ -223,7 +228,7 @@ test("earliestUsable answers over the walled accounts only, ignoring the roomy o
 // three ticks routinely read the SAME poll. Counting those would let one read
 // satisfy "3 consecutive polls", which is the failure the ticket forbids.
 test("the streak does not advance when the watch re-reads the same poll", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
   const s1 = advanceStreak(EMPTY_STREAK, yes, 1787045956);
   const s2 = advanceStreak(s1, yes, 1787045956);
   assert.equal(s1.consecutive, 1);
@@ -231,7 +236,7 @@ test("the streak does not advance when the watch re-reads the same poll", () => 
 });
 
 test("the streak advances once per distinct poll", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
   let s = advanceStreak(EMPTY_STREAK, yes, 100);
   s = advanceStreak(s, yes, 280);
   s = advanceStreak(s, yes, 460);
@@ -240,8 +245,8 @@ test("the streak advances once per distinct poll", () => {
 });
 
 test("one account coming back resets the streak to zero", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
-  const no = { allExhausted: false } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
+  const no = { cannotServe: false } as ReturnType<typeof assessOutage>;
   let s = advanceStreak(EMPTY_STREAK, yes, 100);
   s = advanceStreak(s, yes, 280);
   s = advanceStreak(s, no, 460);
@@ -250,14 +255,14 @@ test("one account coming back resets the streak to zero", () => {
 });
 
 test("a null polledAt resets the streak — a poll with no timestamp is not evidence", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
   let s = advanceStreak(EMPTY_STREAK, yes, 100);
   s = advanceStreak(s, yes, null);
   assert.equal(s.consecutive, 0);
 });
 
 test("confirmed only after the required number of distinct polls", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
   let s = advanceStreak(EMPTY_STREAK, yes, 100);
   s = advanceStreak(s, yes, 280);
   assert.equal(isConfirmed(yes, s, 3), false);
@@ -266,10 +271,118 @@ test("confirmed only after the required number of distinct polls", () => {
 });
 
 test("a long streak cannot confirm an outage the current poll does not show", () => {
-  const yes = { allExhausted: true } as ReturnType<typeof assessOutage>;
-  const no = { allExhausted: false } as ReturnType<typeof assessOutage>;
+  const yes = { cannotServe: true } as ReturnType<typeof assessOutage>;
+  const no = { cannotServe: false } as ReturnType<typeof assessOutage>;
   let s = advanceStreak(EMPTY_STREAK, yes, 100);
   s = advanceStreak(s, yes, 280);
   s = advanceStreak(s, yes, 460);
   assert.equal(isConfirmed(no, s, 3), false);
+});
+
+// ── MX-218: an outage is "cannot serve AT ALL", not "no free window" ─────────
+//
+// mgrin ruled on 2026-08-21 that `outage` answers the operational question.
+// Every test below distinguishes the two readings, so a regression to the old
+// one cannot pass by accident.
+
+// THE PERSUASIVE CASE, and the reason this block exists. Every free window on
+// the machine is spent and it is STILL not an outage, because credits are open
+// and work runs. This is the state a maintainer looks at and wants to soften
+// the rule for; if it is not enforced here, the decision is documentation.
+test("MX-218: all free windows spent with credits open is NOT an outage", () => {
+  const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
+  const v = assessOutage(walled, { capacity: "paid-only" });
+  assert.equal(v.cannotServe, false);
+  assert.equal(v.allFreeWindowsSpent, true);
+  assert.equal(v.capacity, "paid-only");
+  assert.match(v.reason, /bill/i);
+});
+
+test("MX-218: every account walled with no credits open IS an outage", () => {
+  const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
+  const v = assessOutage(walled, { capacity: "none" });
+  assert.equal(v.cannotServe, true);
+  assert.equal(v.allFreeWindowsSpent, true);
+});
+
+// The whole module fails towards silence, and an unread credit state is the
+// same blindness as an unread window: it must not complete an outage.
+test("MX-218: an unknown capacity is not an outage", () => {
+  const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
+  const v = assessOutage(walled, { capacity: "unknown" });
+  assert.equal(v.cannotServe, false);
+  assert.equal(v.allFreeWindowsSpent, true);
+});
+
+test("MX-218: stale stays a hard gate even when capacity says none", () => {
+  const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
+  const v = assessOutage(walled, { capacity: "none", stale: true });
+  assert.equal(v.cannotServe, false);
+  assert.equal(v.unknownReason, "stale");
+});
+
+// Requirement 2 of the ticket: "no free window exists" is still true and still
+// useful, it just is not an outage. It keeps its own field and its own ETA.
+test("MX-218: the free-window ETA survives a non-outage verdict", () => {
+  const walled = REAL.map((a) => (a.slot === "nikita_withflare.xyz" ? { ...a, fiveUtil: 100 } : a));
+  const v = assessOutage(walled, { capacity: "paid-only" });
+  assert.equal(v.earliestUsableAt, "2026-08-18T10:19:59.728Z");
+  assert.equal(v.earliestUsableSlot, "mr6r1n_gmail.com");
+});
+
+// A field that changed meaning under its old name is the hazard mgrin named
+// first. The rename makes a stale consumer read `undefined`, which is loud,
+// rather than a boolean that now means something else, which is not.
+test("MX-218: allExhausted is gone rather than silently redefined", () => {
+  const v = assessOutage(REAL, { capacity: "free" });
+  assert.equal("allExhausted" in v, false);
+});
+
+test("MX-218: the streak counts polls the machine could not serve, not spent windows", () => {
+  const paidOnly = { cannotServe: false } as ReturnType<typeof assessOutage>;
+  let s = advanceStreak(EMPTY_STREAK, paidOnly, 100);
+  s = advanceStreak(s, paidOnly, 280);
+  s = advanceStreak(s, paidOnly, 460);
+  assert.equal(s.consecutive, 0);
+  assert.equal(isConfirmed(paidOnly, s, 3), false);
+});
+
+// ── the signals: headline and exit code, from one place ─────────────────────
+//
+// The ticket's requirement is that the headline, the boolean and the exit
+// status agree. They agree because ONE function emits the first two from the
+// verdict that carries the third — not because three expressions were kept in
+// step by hand.
+
+test("MX-218: a confirmed outage is exit 0 and says so", () => {
+  const s = outageSignals({ cannotServe: true, capacity: "none", unknownReason: null }, true);
+  assert.equal(s.exitCode, 0);
+  assert.match(s.headline, /CANNOT SERVE/);
+});
+
+test("MX-218: an unconfirmed outage is exit 2 — not enough polls have agreed", () => {
+  const s = outageSignals({ cannotServe: true, capacity: "none", unknownReason: null }, false);
+  assert.equal(s.exitCode, 2);
+});
+
+test("MX-218: paid-only is exit 1 and the headline names the billing", () => {
+  const s = outageSignals({ cannotServe: false, capacity: "paid-only", unknownReason: null }, false);
+  assert.equal(s.exitCode, 1);
+  assert.match(s.headline, /BILL/);
+});
+
+test("MX-218: free capacity is exit 1", () => {
+  assert.equal(outageSignals({ cannotServe: false, capacity: "free", unknownReason: null }, false).exitCode, 1);
+});
+
+test("MX-218: a stale poll is exit 2, never 1 — doubt is not availability", () => {
+  const s = outageSignals({ cannotServe: false, capacity: "unknown", unknownReason: "stale" }, false);
+  assert.equal(s.exitCode, 2);
+  assert.match(s.headline, /stale/i);
+});
+
+test("MX-218: an unreadable account is exit 2, distinct from a stale poll", () => {
+  const s = outageSignals({ cannotServe: false, capacity: "unknown", unknownReason: null }, false);
+  assert.equal(s.exitCode, 2);
+  assert.doesNotMatch(s.headline, /stale/i);
 });
