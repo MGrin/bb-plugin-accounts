@@ -127,6 +127,17 @@ slot can hold the work, the answer is "stay" even when another slot has ten time
 headroom. Spreading load is already the proactive path's job, and two opinions racing on
 every thread creation is worse than one.
 
+**Three surfaces, one verdict.** The app panel, `bb accounts outage` and the Übersicht
+widget all read the same `capacity` field — `free` / `paid-only` / `none` / `unknown` — off
+`capacityOf()`, computed from a single poll. The panel does not re-derive it from `credits`
+and the two windows, and that is the point: three surfaces quietly disagreeing about whether
+this machine can serve leaves a reader with no way to tell which one is stale. The state
+worth having right is **`paid-only`** — every free window spent with usage credits open. It
+looks like an outage to anything that only counts windows, and it is not one: the machine
+serves, and it BILLS. The panel says so in those words. `unknown` is muted rather than
+alarming, the same rule as a null utilization and as `exit 2` on the CLI — a stale poll or an
+unreadable account asserts nothing, and must not borrow the urgency of either answer.
+
 ## Requirements
 
 This plugin is the brain and the UI; it does **not** manage credentials itself. It needs:

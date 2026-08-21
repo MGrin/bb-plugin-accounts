@@ -7,8 +7,8 @@ import { UsagePanel } from "./app/panel.tsx";
 // the big page. Two copies drift, and a meter that disagrees with the page it
 // links to is worse than no meter.
 import type { Status } from "./app/current.tsx";
-import { formatPct } from "./app/format.ts";
-import { Meter } from "./app/ui.tsx";
+import { capacityNotice, creditLabel, formatPct } from "./app/format.ts";
+import { Meter, Notice } from "./app/ui.tsx";
 
 type ForecastLine = {
   confidence: "provisional" | "fitted" | "stale";
@@ -51,6 +51,14 @@ function AccountsSection() {
                 reads as completely free and is the inverse of the truth. */}
             <span className="text-xs text-muted-foreground tabular-nums">
               5h {formatPct(a.fiveHour)} · 7d {formatPct(a.sevenDay)}
+              {/* Same three-state rule as the big page: `off` is silent,
+                  `unknown` is `credits ?`, never "off". */}
+              {(() => {
+                const label = creditLabel(a.credits, a.creditSpend);
+                return label ? (
+                  <span className={a.credits === "unknown" ? " italic" : " text-primary"}> · {label}</span>
+                ) : null;
+              })()}
             </span>
           </div>
           <div className="grid grid-cols-2 gap-2">
@@ -59,6 +67,13 @@ function AccountsSection() {
           </div>
         </div>
       ))}
+      {(() => {
+        // The same field the big page and `bb accounts outage` read. The
+        // homepage is the surface glanced at rather than opened, so the state
+        // that costs money has to be legible here too — not one click away.
+        const n = capacityNotice(st.capacity);
+        return n ? <Notice tone={n.tone}>{n.text}</Notice> : null;
+      })()}
       {st.stale && <div className="text-xs text-destructive">usage cache stale — check claude.usage-poll</div>}
       {fc?.confidence === "fitted" && fc.blackout.likely !== null && (
         <div className="text-xs text-destructive">

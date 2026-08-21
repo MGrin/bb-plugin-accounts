@@ -43,3 +43,25 @@ export function Section({ title, hint, children }: { title: string; hint?: strin
     </section>
   );
 }
+
+/**
+ * The machine-level capacity line (MX-220). One component for the homepage
+ * tiles and the big page, same reason as Meter: two banners that drift apart
+ * is worse than an import crossing a file boundary.
+ *
+ * Weight carries the meaning, and it is not decoration:
+ *  - `warn` (paid-only) is NOT an error — the machine works, the work bills.
+ *    Styling it like the outage would tell mgrin to stop when he need not.
+ *  - `bad` (none) is the outage, and looks like the other things that are wrong.
+ *  - `unknown` is muted on purpose: a stale poll asserts nothing, so it must
+ *    not borrow the urgency of either answer.
+ */
+const TONE: Record<"warn" | "bad" | "unknown", string> = {
+  warn: "border-primary/50 bg-primary/10 text-primary font-medium",
+  bad: "border-destructive/40 bg-destructive/5 text-destructive",
+  unknown: "border-border bg-muted/30 text-muted-foreground",
+};
+
+export function Notice({ tone, children }: { tone: "warn" | "bad" | "unknown"; children: ReactNode }) {
+  return <div className={`rounded-md border p-2 text-xs ${TONE[tone]}`}>{children}</div>;
+}

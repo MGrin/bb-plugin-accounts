@@ -5,7 +5,7 @@
 // exact inverse of what a null means.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clock, clockMs, formatPct, formatRelative, formatReset } from "./format.ts";
+import { capacityNotice, clock, clockMs, creditLabel, formatPct, formatRelative, formatReset } from "./format.ts";
 
 test("formatPct: an unpolled account is unknown, never 0%", () => {
   assert.equal(formatPct(null), "unknown");
@@ -78,4 +78,71 @@ test("clockMs: last-switch.at is a MILLISECOND epoch and must not go through clo
   assert.notEqual(clockMs(ms), clock(ms));
   assert.equal(clockMs(ms), clock(Math.floor(ms / 1000)));
   assert.equal(clockMs(null), "—");
+});
+
+// ── The machine-level verdict, as the panel renders it (MX-220) ────────────
+//
+// The case these exist for is the PERSUASIVE one: credits on with every free
+// window spent. It looks like an outage on every instrument that only counts
+// windows, and it is not one — the machine serves, and it bills. A panel that
+// renders that as "exhausted" tells mgrin to stop working when he can work,
+// and a panel that renders it as plain "available" spends his money without
+// saying so. Both failures are silent, which is why they are tested and not
+// merely commented.
+
+test("capacityNotice: paid-only is NOT an outage, and it says the work bills", () => {
+  const n = capacityNotice("paid-only");
+  assert.ok(n, "paid-only must produce a notice — silence here is the panel spending money quietly");
+  assert.equal(n.tone, "warn");
+  assert.match(n.text, /BILLS/);
+  // The word that would make it read as an outage must not appear.
+  assert.doesNotMatch(n.text, /walled|cannot serve/i);
+});
+
+test("capacityNotice: paid-only and none are different states, rendered differently", () => {
+  const paid = capacityNotice("paid-only");
+  const none = capacityNotice("none");
+  assert.ok(paid && none);
+  assert.notEqual(paid.tone, none.tone);
+  assert.notEqual(paid.text, none.text);
+});
+
+test("capacityNotice: free says nothing at all", () => {
+  assert.equal(capacityNotice("free"), null);
+});
+
+test("capacityNotice: unknown is CANNOT TELL — never either extreme", () => {
+  const n = capacityNotice("unknown");
+  assert.ok(n);
+  assert.equal(n.tone, "unknown");
+  assert.match(n.text, /cannot tell/i);
+  // Not the outage wording and not the billing wording: a stale or unreadable
+  // account asserts nothing about whether this machine can serve.
+  assert.doesNotMatch(n.text, /BILLS/);
+  assert.doesNotMatch(n.text, /every account is walled/i);
+});
+
+test("creditLabel: credits ON shows the amount", () => {
+  assert.equal(
+    creditLabel("on", { used: 74.62, limit: 100, util: 74.62, currency: "GBP" }),
+    "credits 74.62/100.00 GBP",
+  );
+});
+
+test("creditLabel: credits ON with no spend reading still says the path is open", () => {
+  // The paid path exists whether or not the spend endpoint answered; reporting
+  // nothing here would hide the only account that can still serve.
+  assert.equal(creditLabel("on", null), "credits on");
+  assert.equal(creditLabel("on", { used: null, limit: null, util: null, currency: null }), "credits on");
+});
+
+test("creditLabel: credits OFF shows nothing", () => {
+  assert.equal(creditLabel("off", null), null);
+});
+
+test("creditLabel: an unpolled account is `credits ?`, never `off`", () => {
+  // Same rule as formatPct: a failed poll knows nothing, and rendering that
+  // silence as "off" is the silent downgrade to exhausted.
+  assert.equal(creditLabel("unknown", null), "credits ?");
+  assert.notEqual(creditLabel("unknown", null), creditLabel("off", null));
 });
