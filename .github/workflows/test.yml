@@ -1,0 +1,41 @@
+# The unit suite as an actual gate.
+#
+# Until MX-222 this repo's only CI job was `managed-install`, which proves the
+# plugin BUILDS from a git install and says nothing about whether it works:
+# `bb plugin build` bundles without typechecking, and `npm test` ran only when
+# somebody typed it. A change that broke all 269 tests still got a green check.
+#
+# This is a SEPARATE job rather than more steps on managed-install, for two
+# reasons: that job installs `--omit=dev`, so typescript and @types/* are gone
+# by the time it ends, and a build failure and a test failure should stay
+# distinguishable at a glance.
+#
+# What a green run here covers: the pure logic — lib.ts, analytics/*,
+# app/format.ts — plus `tsc --noEmit` over everything tsconfig includes.
+# What it does NOT cover: no test imports server.ts (1678 lines), so the plugin
+# wiring, handlers and schedules are typechecked and never executed. Same shape
+# as MX-219 in bb-plugin-bus, where deleting a call left 23/23 passing. Green
+# means the logic and the types are sound, not that the plugin runs.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, main-public]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: unit tests and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # `npm ci` rather than `npm install`: it installs the lockfile exactly and
+      # fails when package.json and package-lock.json disagree, so CI tests the
+      # tree a fresh clone would get.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
