@@ -737,8 +737,44 @@ test("a free window outranks a credit account, however roomy the credit account 
   assert.equal(pickBest([paid("paid", 100, 100), free("busy", 90, 94)], "x")?.slot, "busy");
 });
 
-test("a spent credit account is a candidate at all — before MX-210 it was excluded", () => {
-  assert.equal(pickBest([paid("paid", 100, 100)], "x")?.slot, "paid");
+// ---------------------------------------------------------------------------
+// MX-262 — SELECTION NEVER SPENDS MONEY. mgrin's call, 2026-08-22, given
+// directly, and he reversed his own first answer inside the same message:
+//
+//   "The account with billing is an exception — I just needed it one time.
+//    That's not the usual case and the system must know it. Usually this will
+//    happen only when I really need some capacity when all accounts are
+//    exhausted. So in normal operation the system must not prioritize the
+//    account with money; it should operate as usual, and if all accounts
+//    exhausted all their limits it should wait for limits to be waived. So
+//    sorry, my correction, the answer is no — it should not rank this account
+//    above."
+//
+// The record does not carry the "yes". REPORTING IS UNCHANGED AND DISAGREES ON
+// PURPOSE: capacityVerdict still answers "paid-only" and `bb accounts outage`
+// still says the machine can serve, because it can. Reporting answers what is
+// POSSIBLE, selection answers what is POLICY, and reconciling one to the other
+// silently restores the behaviour he overruled.
+// ---------------------------------------------------------------------------
+
+test("a spent credit account is NOT a destination — the machine waits instead", () => {
+  // This asserted the OPPOSITE from MX-210 until 2026-08-22 ("a spent credit
+  // account is a candidate at all"), which was right for the question MX-210
+  // asked. mgrin answered the next question differently.
+  assert.equal(pickBest([paid("paid", 100, 100)], "x"), null);
+});
+
+test("can serve is not a reason to select", () => {
+  // THE PERSUASIVE CASE. A maintainer will want this account picked because
+  // "it can serve, and refusing to work when work is possible looks broken" —
+  // and it CAN serve: credits are on, so it answers rather than 429ing, and
+  // capacityVerdict says so on the very next line. Billing is an exception
+  // mgrin invokes (`bb accounts switch <slot>`, `claude-acct use <slot>`), not
+  // a tier the machine spends on his behalf. Argue with his paragraph above
+  // before deleting this.
+  const board = [free("out", 0, 100, true), paid("credit", 100, 12)];
+  assert.equal(pickBest(board, "out"), null);
+  assert.equal(capacityVerdict(board), "paid-only");
 });
 
 test("a spent account without credits stays excluded", () => {
@@ -765,22 +801,51 @@ test("a credit account whose own window is untouched is still FREE capacity", ()
   assert.equal(pickBest([paid("paid", 0, 0), free("busy", 60, 60)], "x")?.slot, "paid");
 });
 
-test("a walled machine moves onto credits instead of reporting no eligible slot", () => {
+test("a walled machine WAITS rather than moving onto credits", () => {
+  // The live state MX-210 shipped the paid fallback for (2026-08-20 13:19Z):
+  // three accounts at 7d 100% and one at 5h 100% / 7d 12% with credits on.
+  // It asserted `action === "urgent"` onto "credit" until 2026-08-22.
   const decision = decideSwitch(
     [free("out-a", 0, 100, true), free("out-b", 0, 100), paid("credit", 100, 12)],
     POLICY,
     Infinity,
   );
-  assert.equal(decision.action, "urgent");
-  assert.equal(decision.action === "urgent" && decision.to, "credit");
-  assert.match(decision.reason, /credit/i);
+  assert.equal(decision.action, "none");
+  assert.match(decision.reason, /WAITING/);
+});
+
+test("the wait names the slot it declined and how to take it deliberately", () => {
+  // Not switching is the INTENDED outcome, not a failure to find a candidate,
+  // and the two must not read alike: "no eligible alternative slot" sends the
+  // reader hunting a broken poll. This one says what it refused and what the
+  // human can do about it.
+  const decision = decideSwitch(
+    [free("out-a", 0, 100, true), paid("credit", 100, 12)],
+    POLICY,
+    Infinity,
+  );
+  assert.match(decision.reason, /credit/);
+  assert.match(decision.reason, /bb accounts switch credit/);
+});
+
+test("nothing available at all still reads as nothing available", () => {
+  // The refusal above is about DECLINING paid capacity. With no credits
+  // anywhere there is nothing to decline, and saying "WAITING: ... would BILL"
+  // would be a claim about money that is not true here.
+  const decision = decideSwitch([free("out-a", 0, 100, true), free("out-b", 0, 100)], POLICY, Infinity);
+  assert.equal(decision.action, "none");
+  assert.doesNotMatch(decision.reason, /BILL/);
 });
 
 test("it does NOT move onto credits while the active slot still has free window", () => {
-  // THE MUTATION THAT MATTERS. Active trips at 97 with no free alternative and
-  // the credit account sitting there never 429ing. Moving now strands three
-  // points of a use-it-or-lose-it window AND starts spending. Stay, wall, and
-  // let the reactive path move.
+  // Active trips at 97 with no free alternative and the credit account sitting
+  // there never 429ing. Moving now strands three points of a use-it-or-lose-it
+  // window AND starts spending. Stay and wall.
+  //
+  // Since MX-262 the SECOND half of this is also true: once the active slot is
+  // genuinely spent it still does not move — it waits. This case is now the
+  // narrower one, and it is kept because the stranding argument stands on its
+  // own and would survive a reversal of mgrin's decision.
   const decision = decideSwitch(
     [free("burning", 97, 20, true), free("out", 0, 100), paid("credit", 100, 12)],
     POLICY,
@@ -817,10 +882,17 @@ test("SPREAD never spends money — an optimization is not a reason to bill", ()
   // the config change would arrive with no test to notice. Here the gap is
   // 90 - 60 = 30, over the 25-point margin, so spread would fire onto paid
   // capacity without the guard.
+  //
+  // MX-262 moved the guard into `pickBest`, which no longer offers a paid slot
+  // to ANY caller, so the dedicated `spread declined:` branch is gone rather
+  // than duplicated. The claim this test exists for is unchanged and still
+  // checked: no switch, and the reason names the credit account rather than
+  // pretending nothing was there.
   const policy: SwitchPolicy = { ...POLICY, weeklyAt: 50 };
   const decision = decideSwitch([free("busy", 90, 10, true), paid("credit", 0, 60)], policy, Infinity);
   assert.equal(decision.action, "none", `spread billed money as an optimization: ${decision.reason}`);
-  assert.match(decision.reason, /spread declined/);
+  assert.match(decision.reason, /credit/);
+  assert.match(decision.reason, /never auto-selected/);
 });
 
 test("capacityVerdict separates an outage from a machine with only paid capacity left", () => {

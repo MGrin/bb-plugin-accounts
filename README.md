@@ -131,6 +131,35 @@ slot can hold the work, the answer is "stay" even when another slot has ten time
 headroom. Spreading load is already the proactive path's job, and two opinions racing on
 every thread creation is worse than one.
 
+**Selection never spends money, and it disagrees with reporting on purpose**
+(MX-262, mgrin's call 2026-08-22). Asked whether a credit-bearing account whose windows
+are spent should be preferred over a window-exhausted one, he answered yes and corrected
+himself inside the same message — the answer is **no**:
+
+> *"The account with billing is an exception — I just needed it one time... in normal
+> operation the system must not prioritize the account with money; it should operate as
+> usual, and if all accounts exhausted all their limits it should wait for limits to be
+> waived. So sorry, my correction, the answer is no — it should not rank this account
+> above."*
+
+`pickBest` now returns only slots with a **free window**, so no automatic path can select
+paid capacity: not `decideSwitch`, not the reactive rate-limit handler, not
+`bb accounts auto`. One gate, because guarding each caller leaves the next one unguarded.
+When nothing is free the machine **waits**, and says which slot it declined and how to
+take it deliberately.
+
+| Question | Asked by | Answer on a paid-only machine |
+|---|---|---|
+| What is POSSIBLE? | `capacityVerdict`, `bb accounts outage` | `paid-only` — it can serve, exit `1` |
+| What is POLICY? | `pickBest`, `decideSwitch` | select nothing; wait |
+
+That disagreement is correct and must not be reconciled: `outage` reporting a billing
+machine as stopped is the bug MX-218 fixed, and selection spending on its own is what
+mgrin overruled. **`bb accounts switch <slot>` never goes through `pickBest`** and is
+never refused — that is the exception he invokes. The recovery sweeper deliberately
+follows REPORTING (`anyAccountHasCapacity` holds only on `none`), because a machine he has
+deliberately put on the credit account must keep working.
+
 **Three surfaces, one verdict.** The app panel, `bb accounts outage` and the Übersicht
 widget all read the same `capacity` field — `free` / `paid-only` / `none` / `unknown` — off
 `capacityOf()`, computed from a single poll. The panel does not re-derive it from `credits`

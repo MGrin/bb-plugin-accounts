@@ -1327,7 +1327,13 @@ export default async function plugin(bb: BbPluginApi) {
 
       const best = await pickBest(active?.slot ?? "");
       if (!best) {
-        bb.log.warn(`thread ${thread.id} rate-limited but no fresh alternative slot — leaving to provider-retry`);
+        // "no fresh alternative slot" also covered a machine with paid capacity
+        // sitting right there, declined on purpose (MX-262) — and that reads as
+        // a broken poll to whoever finds it in the log.
+        bb.log.warn(
+          `thread ${thread.id} rate-limited but no alternative slot with a FREE window — leaving to provider-retry. ` +
+            `Paid capacity is never auto-selected (mgrin, 2026-08-22): bb accounts switch <slot>`,
+        );
         return;
       }
       const ok = await switchTo(best, active?.slot ?? "?", `reactive: thread ${thread.id} hit a provider rate limit on ${failingModel || "unknown model"} with window at ${fiveH}%`);

@@ -58,13 +58,15 @@ export function hasFreeWindow(a: AccountUsage, weeklyAt: number = WEEKLY_AT): bo
 }
 
 /**
- * Where a slot sits in the destination order: 0 = free capacity, 1 = paid
- * capacity (credits ON behind a spent window), null = not a destination.
+ * Where a slot sits in the capacity order: 0 = free capacity, 1 = paid capacity
+ * (credits ON behind a spent window), null = nothing there.
  *
- * Tier 1 exists so that "only paid capacity left" stops rendering as "nothing
- * left", and it ranks BELOW every tier 0 — that ordering is the whole point. A
- * ranking that let the credit account win because it never 429s would convert a
- * free machine into a paid one, and the bill would be the only thing to say so.
+ * TIER 1 IS NO LONGER A DESTINATION (MX-262, mgrin 2026-08-22). It still exists,
+ * and it is still the difference between "only paid capacity left" and "nothing
+ * left" — `capacityVerdict` and `bb accounts outage` are built on exactly that
+ * distinction and are unchanged. What changed is that `pickBest` will not
+ * SELECT one: reporting answers what is possible, selection answers what is
+ * policy. See pickBest.
  */
 export function candidateTier(a: AccountUsage, weeklyAt: number = WEEKLY_AT): 0 | 1 | null {
   const free = hasFreeWindow(a, weeklyAt);
@@ -173,17 +175,34 @@ export type SwitchDecision =
 export const worst = (a: AccountUsage): number => Math.max(a.fiveHour ?? 0, a.sevenDay ?? 0);
 
 /**
- * Best slot to move to: lowest worst() within the lowest tier, excluding the
- * current one and anything whose 5h is unknown (an unpolled account only LOOKS
- * free).
+ * Best slot to move to: lowest worst() among slots with a FREE WINDOW,
+ * excluding the current one and anything whose 5h is unknown (an unpolled
+ * account only LOOKS free). `null` when nothing is free — and that is a normal
+ * answer, not an error.
  *
- * TIER dominates the sort, so free capacity always beats paid capacity however
- * roomy the paid account looks. Within a tier, the third key breaks an exact
- * tie AWAY from a credit account: two equally roomy destinations are not
- * equally safe, because work parked on the credit one starts billing the moment
- * its window closes — up to a poll interval before anything notices. It never
- * overrides worst(), so nothing is stranded to get it; the tie used to fall to
- * alphabetical order, which is not a reason.
+ * SELECTION NEVER SPENDS MONEY (MX-262). mgrin, 2026-08-22, given directly and
+ * reversing his own first answer inside the same message: "in normal operation
+ * the system must not prioritize the account with money; it should operate as
+ * usual, and if all accounts exhausted all their limits it should wait for
+ * limits to be waived. So sorry, my correction, the answer is no — it should
+ * not rank this account above." The record does not carry the "yes".
+ *
+ * So a tier-1 slot — credits ON behind a spent window — is filtered out here
+ * rather than ranked last. Ranking it last was MX-210's answer and it was right
+ * for the question MX-210 asked; it still got selected whenever nothing better
+ * existed, which is precisely the state where the money gets spent.
+ *
+ * THIS IS THE ONE GATE, deliberately, because every automatic path runs through
+ * it: decideSwitch, the reactive rate-limit handler, `bb accounts auto`, and the
+ * simulator that models what the switcher would do. Guarding each caller would
+ * leave the next caller unguarded. `bb accounts switch <slot>` does NOT come
+ * through here — it takes an explicit slot, and that is the exception mgrin
+ * invokes, so it must keep working.
+ *
+ * The third sort key still breaks an exact tie AWAY from a credit account: two
+ * equally roomy free destinations are not equally safe, because the credit one
+ * starts billing the moment its window closes — up to a poll interval before
+ * anything notices. It never overrides worst(), so nothing is stranded for it.
  */
 export function pickBest(
   accounts: AccountUsage[],
@@ -192,7 +211,7 @@ export function pickBest(
 ): AccountUsage | null {
   const billable = (a: AccountUsage) => (a.credits === "on" ? 1 : 0);
   const candidates = accounts
-    .filter((a) => a.slot !== exceptSlot && candidateTier(a, weeklyAt) !== null)
+    .filter((a) => a.slot !== exceptSlot && hasFreeWindow(a, weeklyAt) === true)
     .sort(
       (a, b) =>
         candidateTier(a, weeklyAt)! - candidateTier(b, weeklyAt)! ||
@@ -258,7 +277,6 @@ export function decideSwitch(
   const horizon = policy.pollIntervalSec ?? POLL_INTERVAL_S;
 
   const best = pickBest(accounts, active.slot, weeklyAt);
-  if (!best) return { action: "none", reason: "no eligible alternative slot" };
 
   const activeFive = active.fiveHour ?? 0;
   const activeSeven = active.sevenDay ?? 0;
@@ -274,34 +292,45 @@ export function decideSwitch(
     why = `velocity: 5h ${activeFive}% projected ~${projected.toFixed(0)}% >= ${policy.switchAt}% by next poll`;
   }
 
-  // PAID CAPACITY IS THE LAST RESORT, AND ONLY ONCE THE ACTIVE SLOT IS SPENT
-  // (MX-210). A tier-1 destination has Usage credits, i.e. capacity that costs
-  // money. Moving onto it while the active slot still has free window strands a
-  // use-it-or-lose-it 5-hour window AND starts spending — the worst of both. A
-  // blind active slot counts as NOT spent: a failed poll must never be the
-  // thing that authorises a bill.
-  const bestIsPaid = candidateTier(best, weeklyAt) === 1;
-
-  if (why !== null) {
-    if (bestIsPaid) {
-      const activeFree = hasFreeWindow(active, weeklyAt);
-      if (activeFree !== false) {
-        const held = activeFree ? "still has free window" : "cannot be read, so it is not known to be spent";
-        return {
-          action: "none",
-          reason:
-            `only paid capacity elsewhere (${best.slot} has usage credits); ` +
-            `${active.slot} ${held} (5h ${active.fiveHour ?? "unknown"}%, 7d ${active.sevenDay ?? "unknown"}%)`,
-        };
-      }
+  // NOTHING FREE TO MOVE TO — AND THE MACHINE WAITS RATHER THAN SPENDING
+  // (MX-262, mgrin 2026-08-22). `pickBest` filters paid capacity out entirely
+  // now, so this is where a tier-1 slot lands. It used to be an `urgent` switch
+  // onto credits once the active slot was genuinely spent; that is the sentence
+  // he overruled.
+  //
+  // THE REASON HAS TO SAY WHICH OF THE TWO STATES THIS IS. "no eligible
+  // alternative slot" sends the reader hunting a broken poll, and it is what
+  // this returned for a machine that had paid capacity sitting right there and
+  // declined it on purpose. Three states, and the trip is what separates them:
+  // no move was wanted, a move was wanted and declined, or there is genuinely
+  // nothing anywhere.
+  //
+  // Reporting is untouched and disagrees on purpose: `capacityVerdict` still
+  // answers "paid-only" here and `bb accounts outage` still says the machine
+  // can serve, because it can. Reporting answers what is POSSIBLE; selection
+  // answers what is POLICY. The recovery sweeper deliberately follows REPORTING
+  // rather than this — `anyAccountHasCapacity` holds only on "none" — because a
+  // machine mgrin has deliberately put ON the credit account must keep working.
+  if (!best) {
+    const paidAlt = accounts.find((a) => a.slot !== active.slot && candidateTier(a, weeklyAt) === 1);
+    if (!paidAlt) return { action: "none", reason: "no eligible alternative slot" };
+    const where = `(${active.slot} at 5h ${active.fiveHour ?? "unknown"}%, 7d ${active.sevenDay ?? "unknown"}%)`;
+    if (why === null) {
       return {
-        action: "urgent",
-        to: best.slot,
-        reason:
-          `proactive: ${why} — NO free window anywhere, falling back to PAID capacity ` +
-          `on ${best.slot} (usage credits${spendSuffix(best)})`,
+        action: "none",
+        reason: `only paid capacity elsewhere (${paidAlt.slot} has usage credits, never auto-selected); nothing tripped ${where}`,
       };
     }
+    return {
+      action: "none",
+      reason:
+        `WAITING: ${why}, but no other account has a free window — ${paidAlt.slot} would serve, ` +
+        `and BILL, against usage credits${spendSuffix(paidAlt)}. Paid capacity is not auto-selected ` +
+        `(mgrin, 2026-08-22) ${where}; to spend deliberately: bb accounts switch ${paidAlt.slot}`,
+    };
+  }
+
+  if (why !== null) {
     // Only move if the destination is actually better on its worst window —
     // otherwise this is a switch into the same wall, one slot over.
     if (worst(best) >= worst(active)) {
@@ -314,12 +343,12 @@ export function decideSwitch(
     };
   }
 
-  // SPREAD NEVER SPENDS MONEY. Spread is an optimization — it moves off a slot
-  // that is merely worse, not walled — and an optimization is not a reason to
-  // start billing. The urgent path above is the only one allowed onto credits.
-  if (bestIsPaid) {
-    return { action: "none", reason: `spread declined: ${best.slot} is paid capacity, and spread does not bill` };
-  }
+  // SPREAD NEVER SPENDS MONEY — and since MX-262 neither does anything else, so
+  // the guard that used to stand here is gone rather than duplicated: `pickBest`
+  // cannot hand back a paid slot at all, and the `!best` branch above is where
+  // that case now lands. Deleting it is safe only BECAUSE the gate moved into
+  // pickBest; re-introducing a caller that ranks its own candidates would need
+  // it back.
 
   if (!(policy.spreadMargin > 0)) return { action: "none", reason: "spread disabled" };
   const gap = worst(active) - worst(best);
