@@ -20,6 +20,9 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
+import { createCodexSnapshotReader } from "./telemetry-source.ts";
+import { telemetryShape, normalizeClaude, normalizeCodexEvents, isClaudeProvider, isFresh,
+  formatTelemetry, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
 import {
@@ -205,6 +208,7 @@ const forecastShape = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  telemetry: { input: z.null(), output: telemetryShape },
   forecast: { input: z.null(), output: forecastShape.nullable() },
   analytics: {
     input: z.object({ days: z.number() }),
@@ -302,7 +306,7 @@ function creditSpendOf(a: RawAccount): CreditSpend | null {
   };
 }
 
-async function readUsage(): Promise<{ polledAt: number | null; accounts: Account[] }> {
+async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Account[] }> {
   try {
     const raw = JSON.parse(await readFile(USAGE, "utf8")) as RawUsage;
     return {
@@ -324,7 +328,53 @@ async function readUsage(): Promise<{ polledAt: number | null; accounts: Account
   }
 }
 
-export default async function plugin(bb: BbPluginApi) {
+export default async function plugin(bb: BbPluginApi, dependencies: {
+  readClaudeUsage?: typeof readUsageCache;
+  readCodexSnapshot?: () => Promise<ProviderAccount>;
+} = {}) {
+  const readUsage = dependencies.readClaudeUsage ?? readUsageCache;
+  const readCodexSnapshot = dependencies.readCodexSnapshot ?? createCodexSnapshotReader(`${os.homedir()}/.local/bin/mx`);
+  const observedThreads = new Map<string, { account: ProviderAccount | null; tokens: TokenObservation | null }>();
+  const inspectingThreads = new Set<string>();
+  const invalidatedReads = new Set<string>();
+  const inspectedAt = new Map<string, number>();
+  async function observeCodexThread(threadId: string) {
+    if (inspectingThreads.has(threadId) || inspectingThreads.size >= 4 || Date.now() - (inspectedAt.get(threadId) ?? 0) < 30_000) return;
+    inspectingThreads.add(threadId);
+    inspectedAt.delete(threadId);
+    inspectedAt.set(threadId, Date.now());
+    if (inspectedAt.size > 64) inspectedAt.delete(inspectedAt.keys().next().value!);
+    try {
+      const rows = await bb.sdk.threads.events.list({ threadId, order: "desc", limit: "100",
+        types: ["provider/rateLimits/updated", "thread/tokenUsage/updated"] });
+      if (invalidatedReads.has(threadId)) return;
+      observedThreads.delete(threadId);
+      observedThreads.set(threadId, normalizeCodexEvents(threadId, rows, Date.now() / 1000));
+      if (observedThreads.size > 64) observedThreads.delete(observedThreads.keys().next().value!);
+    } catch {
+      observedThreads.delete(threadId); // do not refresh old evidence or expose raw provider errors
+    } finally { inspectingThreads.delete(threadId); invalidatedReads.delete(threadId); }
+  }
+  function forgetThread(threadId: string) {
+    observedThreads.delete(threadId);
+    inspectedAt.delete(threadId);
+    if (inspectingThreads.has(threadId)) invalidatedReads.add(threadId);
+  }
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    if (thread.providerId === "codex") return observeCodexThread(thread.id);
+    forgetThread(thread.id);
+  });
+  for (const event of ["thread.archived", "thread.deleted"] as const) bb.events.on(event, ({ thread }) => {
+    forgetThread(thread.id);
+  });
+  async function currentTelemetry(): Promise<Telemetry> {
+    const [claude, codex] = await Promise.all([readUsage(), readCodexSnapshot()]);
+    const now = Date.now() / 1000;
+    return { version: 1,
+      accounts: [...normalizeClaude(claude.accounts, claude.polledAt, now), codex,
+        ...[...observedThreads.values()].flatMap(v => v.account ? [{ ...v.account, fresh: isFresh(v.account.observedAt, now) }] : [])],
+      tokens: [...observedThreads.values()].flatMap(v => v.tokens ? [{ ...v.tokens, fresh: isFresh(v.tokens.observedAt, now) }] : []) };
+  }
   const settings = bb.settings.define({
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
     switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "97" },
@@ -483,7 +533,7 @@ export default async function plugin(bb: BbPluginApi) {
     async getStatus(threadId): Promise<ThreadStatus> {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
-        return thread.status;
+        return isClaudeProvider(thread.providerId) ? thread.status : "not-found";
       } catch {
         return "not-found";
       }
@@ -524,6 +574,8 @@ export default async function plugin(bb: BbPluginApi) {
     async attemptContinue(threadId): Promise<RecoveryAttemptResult> {
       try {
         await new Promise((r) => setTimeout(r, 3000));
+        const current = await bb.sdk.threads.get({ threadId });
+        if (!isClaudeProvider(current.providerId) || current.status !== "error") return { outcome: "not-eligible", reason: "Thread is no longer an error on the Claude provider" };
         // mode "auto", not the default "steer": bb rejects a steer into a thread
         // that is not active with HTTP 409 "Thread is not active", which is
         // exactly the state every stuck thread is in.
@@ -1140,7 +1192,8 @@ export default async function plugin(bb: BbPluginApi) {
 
       for (const threadId of plan.inspect) {
         const row = rows.find((t) => t.id === threadId);
-        const providerId = (row as unknown as { providerId?: string })?.providerId ?? "claude-code";
+        const providerId = (row as unknown as { providerId?: string })?.providerId;
+        if (!isClaudeProvider(providerId)) continue;
         const signal = await inspectFailure(threadId, null, providerId);
         if (!isLimitFailure(signal)) continue;
         bb.log.info(`adopted untracked stuck thread ${threadId} (${describeSignal(signal)}) — the event never reached us`);
@@ -1228,7 +1281,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!autoSwitch || !placeOnSpawn) return;
       // Only Claude threads bill these accounts; a codex thread is none of our
       // business and must not be allowed to move the machine.
-      if (!/claude/i.test(thread.providerId)) return;
+      if (!isClaudeProvider(thread.providerId)) return;
 
       const model = await modelOf(thread.id);
       const { plan, accounts, active, polledAt } = await planFor(model);
@@ -1281,7 +1334,9 @@ export default async function plugin(bb: BbPluginApi) {
   //   2. Otherwise the whole window (or a non-Fable limit) is gone → switch to
   //      the lowest-usage fresh account and auto-continue the thread there.
   bb.events.on("thread.failed", ({ thread, error }) => {
-    void (async () => {
+    // Before inspecting error text, reading Claude usage, tracking, downgrading or switching.
+    if (!isClaudeProvider(thread.providerId)) return;
+    return (async () => {
       const signal = await inspectFailure(thread.id, error, thread.providerId);
       if (!isLimitFailure(signal)) return;
       bb.log.info(`thread ${thread.id} failed on a provider limit (${describeSignal(signal)}) — tracking for recovery`);
@@ -1347,6 +1402,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    telemetry: currentTelemetry,
     async forecast() {
       return (await currentForecast()) ?? null;
     },
@@ -1387,8 +1443,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register({
     name: "accounts",
-    summary: "Claude Max account usage and switching (auto-switch on limits)",
+    summary: "Claude switching and provider-scoped subscription telemetry",
     commands: [
+      { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
@@ -1416,6 +1473,10 @@ export default async function plugin(bb: BbPluginApi) {
     ],
     async run(argv) {
       const cmd = argv[0] ?? "list";
+      if (cmd === "telemetry") {
+        const telemetry = await currentTelemetry();
+        return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(telemetry) : formatTelemetry(telemetry) };
+      }
       const json = argv.includes("--json");
 
       // Deliberately answered BEFORE anything else touches the db or the usage cache:

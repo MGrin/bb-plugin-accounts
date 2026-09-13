@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { ProviderTelemetry } from "./app/providers.tsx";
 import { UsagePanel } from "./app/panel.tsx";
 // One Meter and one set of thresholds for both surfaces — the tiles here and
 // the big page. Two copies drift, and a meter that disagrees with the page it
@@ -91,10 +92,11 @@ function AccountsSection() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.homepageSection({ id: "codex-subscription", title: "Codex subscription", component: () => <ProviderTelemetry compact /> });
   app.slots.homepageSection({ id: "claude-accounts", title: "Claude accounts", component: AccountsSection });
   app.slots.navPanel({
     id: "usage",
-    title: "Claude usage",
+    title: "Subscription usage",
     icon: "ChartBar",
     path: "usage",
     component: UsagePanel,

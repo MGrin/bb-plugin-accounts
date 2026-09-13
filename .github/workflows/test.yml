@@ -12,10 +12,9 @@
 #
 # What a green run here covers: the pure logic — lib.ts, analytics/*,
 # app/format.ts — plus `tsc --noEmit` over everything tsconfig includes.
-# What it does NOT cover: no test imports server.ts (1678 lines), so the plugin
-# wiring, handlers and schedules are typechecked and never executed. Same shape
-# as MX-219 in bb-plugin-bus, where deleting a call left 23/23 passing. Green
-# means the logic and the types are sound, not that the plugin runs.
+# server.test.ts also exercises the registered handlers, RPC and CLI with the public
+# SDK fake host; quota card render tests cover presentation. No live install or auth
+# routing is exercised by CI.
 name: Test
 
 on:

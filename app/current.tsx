@@ -141,7 +141,7 @@ export function CurrentUsage() {
 
   if (!loaded && !st) {
     return (
-      <Section title="Current usage">
+      <Section title="Claude current usage">
         <div className="text-xs text-muted-foreground">loading…</div>
       </Section>
     );
@@ -149,7 +149,7 @@ export function CurrentUsage() {
 
   if (!st || st.accounts.length === 0) {
     return (
-      <Section title="Current usage" hint={hint}>
+      <Section title="Claude current usage" hint={hint}>
         <div className="text-xs text-muted-foreground">
           {failed
             ? "could not read the usage cache — the plugin's status call failed"
@@ -160,7 +160,7 @@ export function CurrentUsage() {
   }
 
   return (
-    <Section title="Current usage" hint={hint}>
+    <Section title="Claude current usage" hint={hint}>
       {(st.stale || failed) && (
         <div className="mb-3 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
           {failed

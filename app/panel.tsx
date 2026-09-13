@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import { useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
 import { BarList, Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
+import { ProviderTelemetry } from "./providers.tsx";
 import { CurrentUsage } from "./current.tsx";
 import { clock } from "./format.ts";
 import { Section } from "./ui.tsx";
@@ -42,7 +43,7 @@ const RANGES = [7, 14, 30] as const;
 const RANGE_KEY = "accounts.analytics.days";
 
 function ForecastSection({ fc }: { fc: Forecast | null }) {
-  if (!fc) return <Section title="Forecast">
+  if (!fc) return <Section title="Claude forecast">
     <div className="text-xs text-muted-foreground">no accounts in the usage cache</div>
   </Section>;
 
@@ -51,7 +52,7 @@ function ForecastSection({ fc }: { fc: Forecast | null }) {
     const pct = Math.min(100, Math.round((distinctPolls / neededPolls) * 100));
     return (
       <Section
-        title="Forecast"
+        title="Claude forecast"
         hint={fc.confidence === "stale" ? "The usage cache is behind." : "Not enough recorded history yet."}
       >
         <div className="rounded-md border border-border bg-muted/40 p-3">
@@ -78,7 +79,7 @@ function ForecastSection({ fc }: { fc: Forecast | null }) {
   }
 
   return (
-    <Section title="Forecast" hint={`Next ${Math.round(fc.horizonSec / 86400)} days, at median demand.`}>
+    <Section title="Claude forecast" hint={`Next ${Math.round(fc.horizonSec / 86400)} days, at median demand.`}>
       <div className="mb-3">
         {fc.blackout.likely === null ? (
           <div className="text-sm text-foreground">No point in the horizon where every account is walled.</div>
@@ -147,7 +148,7 @@ export function UsagePanel() {
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h1 className="text-base font-medium text-foreground">Claude usage</h1>
+          <h1 className="text-base font-medium text-foreground">Subscription usage</h1>
           <p className="text-xs text-muted-foreground">
             {data ? `${data.coverage.messages.toLocaleString()} messages indexed` : "loading…"}
             {data?.coverage.firstTs
@@ -175,6 +176,7 @@ export function UsagePanel() {
 
       {/* Current usage FIRST: it is the daily question ('can I start this now'),
           the forecast is the occasional one. */}
+      <ProviderTelemetry />
       <CurrentUsage />
 
       <ForecastSection fc={fc} />

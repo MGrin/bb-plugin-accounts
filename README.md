@@ -1,6 +1,6 @@
 # bb-plugin-accounts
 
-Claude Max account usage and auto-switching for [bb](https://getbb.app).
+Claude Max account switching and Claude/Codex subscription telemetry for [bb](https://getbb.app).
 
 Shows what each of your Claude subscriptions has left, and — when a thread actually
 hits a rate limit — switches to an account with headroom and continues the interrupted
@@ -12,12 +12,13 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-accounts.git@main
 
 ## What it does
 
-**Homepage tiles** — 5-hour and 7-day utilization per account, with the active one marked.
+**Homepage tiles and dashboard** — Claude account windows plus a separate Codex subscription card, with Spark and paid credits identified separately.
 
 **`bb accounts`**
 
 ```
-bb accounts [list]        per-account 5h/7d utilization
+bb accounts telemetry     provider-scoped subscription windows (--json supported)
+bb accounts [list]        Claude per-account 5h/7d utilization
 bb accounts switch <slot> switch the live credentials to a slot
 bb accounts auto          run one auto-switch evaluation now
 bb accounts log           the last switch decision and why
@@ -29,8 +30,8 @@ bb accounts outage        can this machine serve AT ALL? exit 0 means no
 moves to the candidate with the lowest `max(5h, 7d)` among accounts whose usage data is
 fresh, subject to a cooldown.
 
-**Reactive switching** — this is the useful part. bb emits `thread.failed`; when the
-failure is a rate limit the plugin switches accounts and then sweeps every currently-stuck
+**Reactive switching (Claude only)** — this is the useful part. bb emits `thread.failed`; when the
+failure is a Claude rate limit the plugin switches accounts and then sweeps every currently-stuck
 thread through bb's rate-limit recovery, so long-running work survives a limit instead of
 dying at it. It complements bb's builtin `provider-retry` plugin, which *waits* for the
 window to reset on the single account bb knows about; this one *moves*.
@@ -74,7 +75,7 @@ away, so the threads were abandoned long before the capacity they were waiting f
 arrived. A stale usage cache counts as capacity available: a broken poller must not be
 able to freeze recovery.
 
-**`bb accounts outage` — the away-message question.** Answered by the 2-minute `watch`
+**`bb accounts outage` — the Claude away-message question.** Answered by the 2-minute `watch`
 tick and left somewhere cheap to read, because when the machine really is dark the thing
 that would announce the outage is the thing that cannot run.
 
@@ -170,6 +171,54 @@ looks like an outage to anything that only counts windows, and it is not one: th
 serves, and it BILLS. The panel says so in those words. `unknown` is muted rather than
 alarming, the same rule as a null utilization and as `exit 2` on the CLI — a stale poll or an
 unreadable account asserts nothing, and must not borrow the urgency of either answer.
+
+## Provider-scoped telemetry (MX-1038)
+
+`bb accounts telemetry --json` and the `telemetry` RPC return version 1 with normalized
+`accounts[]` and separate `tokens[]`. Each observation names its provider, scope, source,
+observation time, freshness, account ID (or null), windows and subscription capacity.
+`available` / `exhausted` / `unavailable` / `unknown` describes subscription capacity;
+paid credits never turn an exhausted subscription into an available one. The legacy
+`list`, `outage`, `place`, switching and analytics commands remain **Claude-only** with
+their existing meanings and JSON shapes. A telemetry command exits 0 on a successful
+report, including UNKNOWN; it is not an admission gate.
+
+Codex snapshots come from the custom dotfiles command `mx spawn availability`, which
+initializes Codex app-server and calls `account/rateLimits/read` without inference. This
+plugin invokes it on demand, at most once per minute across callers, with a 10-second
+and 256-KiB bound. It accepts v1 stdout JSON on exit 0 or 2 (Claude can be unknown while
+Codex has usable telemetry). An older or absent `mx`, timeout, malformed output, missing
+main bucket, partial windows, stale/future timestamp or elapsed reset produces UNKNOWN.
+The observation expires after 180 seconds; reset passage cannot prove that quota returned.
+
+The v1 contract reads `codex_usage.rateLimitsByLimitId.codex`, falling back to
+`codex_usage.rateLimits` only when its own `limitId` is `codex`. Primary/secondary windows
+carry `usedPercent`, `resetsAt` in Unix seconds and optional `windowDurationMins`. An
+explicit null window is allowed, but at least one valid window is required. Spark never
+substitutes for the main bucket. `planType` and `credits` describe the main bucket separately.
+`codex_observed_at` is the Codex observation time, with the older conservative
+`observed_at` as a compatibility fallback. `codex_account_id` is an optional opaque ID;
+without it the card explicitly says the local session's account identity is unavailable.
+
+BB's `experimental_thread.events` notifications trigger bounded reads of the newest
+`provider/rateLimits/updated` and `thread/tokenUsage/updated` SDK events (100 events,
+30-second minimum per thread, four concurrent reads, 64 retained threads). SDK quota
+observations lack account identity and complete numerical main-bucket windows, so they
+remain thread-scoped UNKNOWN capacity. They show the provider's reported window status
+without inventing percentages. Token totals require a matching provider session with
+explicit Codex attribution in the same page; they are never converted to quota or merged
+into Claude analytics. Reads do not refresh an event's observation time.
+
+All failure detection, reconciliation, placement and recovery paths require exactly
+`claude-code` before acting on Claude accounts. Old misclassified Codex recovery records
+are removed by the sweeper, and provider identity is checked again before a resume.
+There is no Codex switcher, auth routing change or Pooler integration. This preserves the
+custom Claude primary and the separate Python deadman.
+
+The SDK event notification requires bb 0.43 or newer. Verification includes the actual
+plugin failure handler, reconciliation, event listener, RPC and CLI under the public SDK
+fake host, fake `mx` process tests, and rendering the quota cards. Live install/reload is a
+separate coordinated deployment step.
 
 ## Requirements
 

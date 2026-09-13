@@ -1,3 +1,4 @@
+import { isClaudeProvider } from "./telemetry.ts";
 // The switch decision, as a pure function.
 //
 // It used to live inside the 2-minute cron callback, tangled with kv reads and
@@ -660,7 +661,7 @@ export function planSweep(
   return { attempt: eligible, drop, waiting, stallCreditMs: 0 };
 }
 
-export type ThreadStatus = "error" | "active" | "starting" | "idle" | "stopping" | "not-found";
+export type ThreadStatus = "error" | "active" | "starting" | "idle" | "stopping" | "pending" | "not-found";
 
 export interface StuckThreadStore {
   list(): Promise<StuckThreadRecord[]>;
@@ -741,6 +742,7 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
   let lastSweepAt: number | null = null;
 
   async function onLimitFailure(threadId: string, providerId: string, at: number = now()): Promise<void> {
+    if (!isClaudeProvider(providerId)) return;
     const existing = (await deps.store.list()).find((r) => r.threadId === threadId);
     await deps.store.upsert({
       threadId,
@@ -757,7 +759,12 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
     if (sweeping) return result;
     sweeping = true;
     try {
-      const candidates = await deps.store.list();
+      const stored = await deps.store.list();
+      // Purge records captured by the pre-isolation handler, even during a Claude outage.
+      for (const record of stored) {
+        if (!isClaudeProvider(record.providerId)) await deps.store.remove(record.threadId);
+      }
+      const candidates = stored.filter(record => isClaudeProvider(record.providerId));
       const available = deps.hasCapacity ? await deps.hasCapacity() : true;
       const sinceLastSweepMs = lastSweepAt === null ? 0 : at - lastSweepAt;
       lastSweepAt = at;
