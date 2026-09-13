@@ -197,8 +197,16 @@ carry `usedPercent`, `resetsAt` in Unix seconds and optional `windowDurationMins
 explicit null window is allowed, but at least one valid window is required. Spark never
 substitutes for the main bucket. `planType` and `credits` describe the main bucket separately.
 `codex_observed_at` is the Codex observation time, with the older conservative
-`observed_at` as a compatibility fallback. `codex_account_id` is an optional opaque ID;
-without it the card explicitly says the local session's account identity is unavailable.
+`observed_at` as a compatibility fallback. `codex_account_id` is an optional opaque internal ID. The additive `codex_account_email`
+comes from read-only `account/read` with `refreshToken: false` in the same app-server
+session; identity lookup failure does not invalidate quota. The normalized `email` and
+`label` fields provide a human-readable feed for BB and desktop consumers. Without a
+valid email the label says "Codex account (email unavailable)"; a UUID is never a display
+label. SDK thread observations never inherit this machine account's email.
+
+The homepage and dashboard show only email, main subscription usage and reset time by
+default. A closed **Details** section contains secondary buckets, credits, plan/source
+metadata, and (on the dashboard) thread quotas and token counts.
 
 BB's `experimental_thread.events` notifications trigger bounded reads of the newest
 `provider/rateLimits/updated` and `thread/tokenUsage/updated` SDK events (100 events,

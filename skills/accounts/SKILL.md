@@ -13,6 +13,9 @@ this is a reporting command, not an admission gate.
 - `capacity` is subscription headroom only: available, exhausted, unavailable or unknown.
   Credits and token counts never make a subscription available.
 - Codex's main `codex` bucket controls ordinary capacity. Spark is shown separately.
+- Use `email` or `label` for display, never `accountId`. `codex_account_email` comes from
+  read-only `account/read` (`refreshToken: false`); missing email stays unavailable and
+  does not invalidate quota. The UI defaults to usage/reset, with diagnostics collapsed.
 - A Codex local-session observation without `accountId` cannot identify an account. SDK
   quota observations stay thread-scoped and cannot replace the current local snapshot.
 - Missing, malformed, stale, future-dated or incomplete main quota is UNKNOWN. A reset

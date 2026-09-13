@@ -29,3 +29,14 @@ not install/reload a live plugin, enable Account Pooler, change auth routing, ch
 custom Claude primary/Python deadman, or modify shared fallback environments. The legacy
 Übersicht widget remains Claude-only. It can adopt the new `accounts telemetry --json`
 feed separately; legacy `accounts list --json` and `outage` contracts are unchanged.
+
+## UI simplification follow-up
+
+- `npm test`: 338 passed (334 backend/logic, 4 quota-card rendering).
+- Default card renders the email, main subscription usage and reset only. Secondary
+  buckets, paid credits, metadata and thread quotas/tokens remain inside closed native
+  details, available by mouse or keyboard.
+- Missing/invalid identity retains quota and uses an email-unavailable label. A UUID
+  stays in `accountId` only, including when an old server's label contains it.
+- Optional `codex_account_email` comes from the upstream read-only `account/read` contract;
+  SDK thread observations never acquire machine account identity.
