@@ -6,6 +6,7 @@ export const providerAccountShape = z.object({
   providerId: z.enum(["claude-code", "codex"]),
   scope: z.enum(["account", "local-session", "thread"]),
   accountId: z.string().nullable(),
+  email: z.string().nullable(),
   threadId: z.string().nullable(),
   label: z.string(),
   source: z.enum(["claude-usage-cache", "mx-spawn-availability", "bb-sdk-event"]),
@@ -38,14 +39,18 @@ const percent = (v: unknown): number | null => number(v) !== null && (v as numbe
 const positive = (v: unknown): number | null => number(v) !== null && (v as number) > 0 ? v as number : null;
 const epochSeconds = (v: unknown): number | null => positive(v) !== null && Number.isSafeInteger(v) && (v as number) <= 253402300799 ? v as number : null;
 const word = (v: unknown): string | null => typeof v === "string" && v.length <= 100 && /^[\w .:+-]+$/.test(v) ? v : null;
+const emailAddress = (v: unknown): string | null => {
+  const parsed = z.string().trim().max(254).email().safeParse(v);
+  return parsed.success ? parsed.data : null;
+};
 const bool = (v: unknown): boolean | null => typeof v === "boolean" ? v : null;
 export const isFresh = (at: unknown, now: number, maxAge = MAX_AGE_SEC): boolean =>
   positive(at) !== null && Number.isFinite(now) && now >= (at as number) && now - (at as number) <= maxAge;
 export const isClaudeProvider = (id: unknown): id is "claude-code" => id === "claude-code";
 
 export function unknownCodex(reason = "No fresh Codex subscription observation"): ProviderAccount {
-  return { providerId: "codex", scope: "local-session", accountId: null, threadId: null,
-    label: "Codex local session (account identity unavailable)", source: "mx-spawn-availability", observedAt: null,
+  return { providerId: "codex", scope: "local-session", accountId: null, email: null, threadId: null,
+    label: "Codex account (email unavailable)", source: "mx-spawn-availability", observedAt: null,
     fresh: false, capacity: "unknown", reason, planType: null,
     credits: { hasCredits: null, unlimited: null, balance: null }, windows: [] };
 }
@@ -56,7 +61,9 @@ export function normalizeCodex(value: unknown, now: number): ProviderAccount {
   if (v.version !== 1) return out;
   const accountId = word(v.codex_account_id);
   out.accountId = accountId;
-  if (accountId) { out.scope = "account"; out.label = `Codex account ${accountId}`; }
+  if (accountId) out.scope = "account";
+  out.email = emailAddress(v.codex_account_email);
+  out.label = out.email ?? "Codex account (email unavailable)";
   out.observedAt = epochSeconds(Object.hasOwn(v, "codex_observed_at") ? v.codex_observed_at : v.observed_at);
   out.fresh = isFresh(out.observedAt, now);
   const usage = object(v.codex_usage);
@@ -116,7 +123,7 @@ export function normalizeClaude(accounts: readonly { slot: string; email: string
       resetsAt: reset && Number.isFinite(Date.parse(reset)) ? Date.parse(reset) / 1000 : null, durationMinutes, reportedStatus: null }));
     const valid = accountId !== null && fresh && normalized.every(w => w.usedPercent !== null && w.resetsAt !== null && w.resetsAt > now);
     const capacity = !valid ? "unknown" : normalized.some(w => w.usedPercent === 100) ? "exhausted" : "available";
-    return { providerId: "claude-code", scope: "account", accountId, threadId: null, label,
+    return { providerId: "claude-code", scope: "account", accountId, email: emailAddress(a.email), threadId: null, label,
       source: "claude-usage-cache", observedAt, fresh, capacity, reason: valid ? "Claude subscription windows" : "Claude windows missing, invalid or stale",
       planType: null, windows: normalized, credits: { hasCredits: a.credits === "on" ? true : a.credits === "off" ? false : null, unlimited: null, balance: null } };
   });

@@ -104,3 +104,24 @@ test("only the exact Claude provider can use Claude switching", () => {
   for (const id of [undefined, null, "", "codex", "claude", "fake-claude", "provider-claude-code"]) assert.equal(isClaudeProvider(id), false);
   assert.equal(isClaudeProvider("claude-code"), true);
 });
+
+test("email from the read-only identity feed labels Codex; UUID remains internal", () => {
+  const v = { ...snapshot(), codex_account_id: "opaque-uuid", codex_account_email: "reader@example.com" };
+  const a = normalizeCodex(v, now);
+  assert.equal(a.email, "reader@example.com"); assert.equal(a.label, "reader@example.com");
+  assert.equal(a.accountId, "opaque-uuid"); assert.equal(a.capacity, "available");
+  assert.ok(!formatTelemetry({ version: 1, accounts: [a], tokens: [] }).includes("opaque-uuid"));
+});
+
+test("missing, API-key or malformed email never borrows an identity or breaks quota", () => {
+  for (const codex_account_email of [undefined, null, "", "opaque-uuid", "wrong\n@example.com", {}, "<script>@example.com"]) {
+    const a = normalizeCodex({ ...snapshot(), codex_account_id: "opaque-uuid", codex_account_email }, now);
+    assert.equal(a.email, null); assert.equal(a.label, "Codex account (email unavailable)");
+    assert.equal(a.capacity, "available");
+  }
+});
+
+test("a subsequent identity-less snapshot never retains the previous email", () => {
+  assert.equal(normalizeCodex({ ...snapshot(), codex_account_email: "first@example.com" }, now).email, "first@example.com");
+  assert.equal(normalizeCodex(snapshot(), now).email, null);
+});
