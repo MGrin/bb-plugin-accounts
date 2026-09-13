@@ -33,6 +33,11 @@
     "lib.test.ts",
     "app.tsx",
     "app",
-    "types"
+    "types",
+    "telemetry.ts",
+    "telemetry-source.ts",
+    "telemetry.test.ts",
+    "telemetry-source.test.ts",
+    "server.test.ts"
   ]
 }

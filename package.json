@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "type": "module",
   "engines": {
-    "bb": ">=0.36",
+    "bb": ">=0.43.0",
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
-    "name": "Claude accounts",
-    "description": "Claude Max account usage + auto-switching: proactive at 85% and reactive on real rate-limit failures, with thread auto-continue.",
+    "name": "Subscription accounts",
+    "description": "Claude account switching and provider-scoped Claude/Codex subscription telemetry.",
     "branding": {
       "icon": "Users"
     },
@@ -25,13 +25,18 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "@radix-ui/react-dialog": "^1.1.19",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.3.0",
     "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.10.1",
     "hono": "^4.11.9",
+    "react-dom": "^19.3.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.0",
-    "@radix-ui/react-dialog": "^1.1.19",
     "vaul": "^1.1.2"
   },
   "license": "MIT",
@@ -40,7 +45,7 @@
     "url": "git+https://github.com/MGrin/bb-plugin-accounts.git"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types lib.test.ts analytics/*.test.ts app/*.test.ts",
+    "test": "node --test --experimental-strip-types lib.test.ts telemetry*.test.ts server.test.ts analytics/*.test.ts app/*.test.ts && node --import tsx --test app/*.test.tsx",
     "typecheck": "tsc --noEmit"
   }
 }

@@ -911,3 +911,14 @@ test("capacityVerdict says UNKNOWN rather than none when an account could not be
 test("a known paid path beats an unknown, because it is an answer", () => {
   assert.equal(capacityVerdict([acct("broken", null, null), paid("credit", 100, 100)]), "paid-only");
 });
+
+test("Claude sweeper ignores Codex and purges old misclassified records even without Claude capacity", async () => {
+  const store = inMemoryStore([{ ...stuck("old-codex", T), providerId: "codex" }, stuck("claude", T)]);
+  const recovery = fakeRecovery({});
+  const sweeper = createRecoverySweeper({ store, status: fakeStatus({}), recovery, policy: RPOLICY, hasCapacity: async () => false });
+  await sweeper.onLimitFailure("new-codex", "codex", T);
+  assert.equal((await store.list()).length, 2);
+  await sweeper.sweep("periodic", T);
+  assert.deepEqual((await store.list()).map(r => r.threadId), ["claude"]);
+  assert.deepEqual(recovery.calls, []);
+});
