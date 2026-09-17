@@ -622,8 +622,10 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
           env: { ...process.env, BB_PROJECT_ID: thread.projectId, BB_THREAD_ID: threadId },
         });
         return { kind: "child", runId, status: workflowStatusFrom(stdout) };
-      } catch {
-        return { kind: "child", runId, status: null };
+      } catch (e) {
+        const detail = e as { message?: string; stdout?: string; stderr?: string };
+        const readError = (detail.stderr || detail.stdout || detail.message || String(e)).trim().split("\n")[0].slice(0, 200);
+        return { kind: "child", runId, status: null, readError };
       }
     },
   };

@@ -703,7 +703,7 @@ export interface ThreadRecoveryPort {
  */
 export type WorkflowLink =
   | { kind: "none" }
-  | { kind: "child"; runId: string | null; status: string | null };
+  | { kind: "child"; runId: string | null; status: string | null; readError?: string };
 
 export interface WorkflowRunPort {
   linkOf(threadId: string): Promise<WorkflowLink>;
@@ -732,7 +732,7 @@ export function workflowGate(threadId: string, link: WorkflowLink): WorkflowGate
   return {
     restart: false,
     terminal: false,
-    reason: `recovery: left ${threadId} idle — workflow child of ${run}, run state UNKNOWN (${link.status ?? "unreadable"}); not restarting blind`,
+    reason: `recovery: left ${threadId} idle — workflow child of ${run}, run state UNKNOWN (${link.status ?? `unreadable${link.readError ? `: ${link.readError}` : ""}`}); not restarting blind`,
   };
 }
 
@@ -864,8 +864,8 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
             let link: WorkflowLink;
             try {
               link = await deps.workflow.linkOf(candidate.threadId);
-            } catch {
-              link = { kind: "child", runId: null, status: null };
+            } catch (e) {
+              link = { kind: "child", runId: null, status: null, readError: e instanceof Error ? e.message : String(e) };
             }
             const gate = workflowGate(candidate.threadId, link);
             if (!gate.restart) {
