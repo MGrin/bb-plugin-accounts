@@ -46,6 +46,11 @@ import {
   type ThreadRecoveryPort,
   type ThreadStatus,
   type ThreadStatusPort,
+  type WorkflowLink,
+  type WorkflowRunPort,
+  workflowGate,
+  workflowRunIdFrom,
+  workflowStatusFrom,
   worst,
 } from "./lib.ts";
 import { buildObservations, fitModelWeights, SEED_PRIORS } from "./analytics/calibrate.ts";
@@ -599,6 +604,30 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     },
   };
 
+  /**
+   * MX-983: is a stuck thread a `bb workflows` child, and is its run still live?
+   * See WorkflowLink in lib.ts for what bb exposes and how it was measured.
+   * `bb workflows status` refuses a run outside the caller's project, so the
+   * call is scoped to the CHILD's project, which is the run's.
+   */
+  const workflowRuns: WorkflowRunPort = {
+    async linkOf(threadId): Promise<WorkflowLink> {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.originPluginId !== "workflows") return { kind: "none" };
+      const runId = workflowRunIdFrom(thread.titleFallback);
+      if (runId === null) return { kind: "child", runId: null, status: null };
+      try {
+        const { stdout } = await run(process.env.BB_CLI || "bb", ["workflows", "status", runId], {
+          timeout: 20_000,
+          env: { ...process.env, BB_PROJECT_ID: thread.projectId, BB_THREAD_ID: threadId },
+        });
+        return { kind: "child", runId, status: workflowStatusFrom(stdout) };
+      } catch {
+        return { kind: "child", runId, status: null };
+      }
+    },
+  };
+
   // Snapshotted at load, like the rest of this plugin's config surface
   // requires `bb plugin reload accounts` to pick up a settings change.
   const recoverySettings = await settings.get();
@@ -650,6 +679,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     store: stuckThreadsStore,
     status: threadStatus,
     recovery: threadRecovery,
+    workflow: workflowRuns,
     hasCapacity: anyAccountHasCapacity,
     policy: {
       attemptCooldownSec: Number(recoverySettings.recoveryCooldownSec),
@@ -1470,6 +1500,11 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         summary: "Which commit this RUNNING process was loaded from (not the checkout)",
         usage: "bb accounts build [--json]",
       },
+      {
+        name: "workflow-link",
+        summary: "Would recovery restart this thread? Reads its workflow run, restarts nothing",
+        usage: "bb accounts workflow-link <threadId>",
+      },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "list";
@@ -1490,6 +1525,17 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
           exitCode: 0,
           stdout: `loaded ${rev}${dirty} from ${BUILD_STAMP.sourceDir} at ${BUILD_STAMP.loadedAt}${why}`,
         };
+      }
+      if (cmd === "workflow-link") {
+        const threadId = argv[1];
+        if (!threadId) return { exitCode: 2, stderr: "usage: bb accounts workflow-link <threadId>" };
+        let link: WorkflowLink;
+        try {
+          link = await workflowRuns.linkOf(threadId);
+        } catch (e) {
+          return { exitCode: 2, stderr: `cannot read ${threadId}: ${e instanceof Error ? e.message : e}` };
+        }
+        return { exitCode: 0, stdout: JSON.stringify({ threadId, link, gate: workflowGate(threadId, link) }) };
       }
       const flag = (name: string, fallback: number): number => {
         const i = argv.indexOf(`--${name}`);

@@ -687,6 +687,68 @@ export interface ThreadRecoveryPort {
   attemptContinue(threadId: string): Promise<RecoveryAttemptResult>;
 }
 
+/**
+ * Is this thread a child of a `bb workflows` run, and what is that run doing?
+ *
+ * MX-983. A child restarted after its run has ended does its whole job again
+ * for a reader that no longer exists: on 2026-09-11 the sweep restarted all 11
+ * slices of a dream run that had finished 1h40m earlier. Measured 2026-09-17,
+ * bb exposes the link only this way — `parentThreadId` is null on a child,
+ * `originPluginId` is "workflows", and the run id is in the header bb puts on
+ * the child's first prompt (so in `titleFallback`). The run's status comes
+ * from `bb workflows status <run>`, which answers only inside the run's project.
+ *
+ * `status: null` means the instrument could not see: no run id, a pruned run
+ * (runs are deleted after `retentionDays`), or a failed read.
+ */
+export type WorkflowLink =
+  | { kind: "none" }
+  | { kind: "child"; runId: string | null; status: string | null };
+
+export interface WorkflowRunPort {
+  linkOf(threadId: string): Promise<WorkflowLink>;
+}
+
+/** bb workflows' own sets: `status IN ('queued', 'running')` vs the three it prunes. */
+const WORKFLOW_LIVE = new Set(["queued", "running"]);
+const WORKFLOW_TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
+
+export type WorkflowGate =
+  | { restart: true }
+  | { restart: false; terminal: boolean; reason: string };
+
+/** Pure. Restart only an ordinary thread or a child whose run is SEEN to be live. */
+export function workflowGate(threadId: string, link: WorkflowLink): WorkflowGate {
+  if (link.kind === "none") return { restart: true };
+  const run = link.runId ?? "an unidentified run";
+  if (link.status !== null && WORKFLOW_LIVE.has(link.status)) return { restart: true };
+  if (link.status !== null && WORKFLOW_TERMINAL.has(link.status)) {
+    return {
+      restart: false,
+      terminal: true,
+      reason: `recovery: left ${threadId} idle — workflow child of ${run}, which is ${link.status}; nothing is waiting on its output`,
+    };
+  }
+  return {
+    restart: false,
+    terminal: false,
+    reason: `recovery: left ${threadId} idle — workflow child of ${run}, run state UNKNOWN (${link.status ?? "unreadable"}); not restarting blind`,
+  };
+}
+
+export function workflowRunIdFrom(text: string | null | undefined): string | null {
+  return text?.match(/^\[BB workflow .*? · run (wfr_[0-9a-f-]+)\]/)?.[1] ?? null;
+}
+
+export function workflowStatusFrom(stdout: string): string | null {
+  try {
+    const status = (JSON.parse(stdout) as { status?: unknown }).status;
+    return typeof status === "string" ? status : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Tag for logging/observability only — must never change planSweep's judgement. */
 export type SweepTrigger = "reactive" | "proactive-switch" | "placement" | "periodic";
 
@@ -724,6 +786,8 @@ export interface RecoverySweeperDeps {
   store: StuckThreadStore;
   status: ThreadStatusPort;
   recovery: ThreadRecoveryPort;
+  /** Omitted = every thread is ordinary, which is the pre-MX-983 behaviour. */
+  workflow?: WorkflowRunPort;
   policy: RecoveryPolicy;
   /**
    * Can ANY account serve a request right now? When this says no, the sweep
@@ -795,6 +859,21 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
             // not an attempt, not a drop, just quietly no longer tracked.
             await deps.store.remove(candidate.threadId);
             continue;
+          }
+          if (deps.workflow) {
+            let link: WorkflowLink;
+            try {
+              link = await deps.workflow.linkOf(candidate.threadId);
+            } catch {
+              link = { kind: "child", runId: null, status: null };
+            }
+            const gate = workflowGate(candidate.threadId, link);
+            if (!gate.restart) {
+              log(gate.reason);
+              if (gate.terminal) await deps.store.remove(candidate.threadId);
+              else await deps.store.upsert({ ...candidate, lastAttemptAt: at, attempts: candidate.attempts + 1 });
+              continue;
+            }
           }
           result.attempted.push(candidate.threadId);
           const outcome = await deps.recovery.attemptContinue(candidate.threadId);
