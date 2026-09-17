@@ -15,7 +15,7 @@
 //    immediately and auto-continue the failed thread via the SDK's
 //    rate-limit-recovery path. Utilization thresholds can lie; the 429 doesn't.
 import { execFile, execFileSync } from "node:child_process";
-import { dirname } from "node:path";
+import { realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import { promisify } from "node:util";
@@ -611,6 +611,19 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
    * `bb workflows status` refuses a run outside the caller's project, so the
    * call is scoped to the CHILD's project, which is the run's.
    */
+  function bbCliScript(): string | null {
+    if (process.env.BB_CLI) return process.env.BB_CLI;
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      const candidate = `${dir}/bb`;
+      try {
+        if (dir && statSync(candidate).isFile()) return realpathSync(candidate);
+      } catch {
+        // not here
+      }
+    }
+    return null;
+  }
+
   const workflowRuns: WorkflowRunPort = {
     async linkOf(threadId): Promise<WorkflowLink> {
       const thread = await bb.sdk.threads.get({ threadId });
@@ -618,23 +631,23 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       const runId = workflowRunIdFrom(thread.titleFallback);
       if (runId === null) return { kind: "child", runId: null, status: null };
       try {
-        const { stdout } = await run(process.env.BB_CLI || "bb", ["workflows", "status", runId], {
+        // `bb` is a `#!/usr/bin/env node` script, and this process has no
+        // `node` on PATH nor beside its own executable (measured live after
+        // #29 and #30: "env: node: No such file or directory"). So run the
+        // script on this process's own runtime; ELECTRON_RUN_AS_NODE makes
+        // that work when the runtime is bb.app's Electron, and is ignored by
+        // plain node.
+        const script = bbCliScript();
+        if (script === null) return { kind: "child", runId, status: null, readError: "no bb CLI on BB_CLI or PATH" };
+        const { stdout } = await run(process.execPath, [script, "workflows", "status", runId], {
           timeout: 20_000,
-          // `bb` is a `#!/usr/bin/env node` script and this process's PATH has
-          // no node (measured live: "env: node: No such file or directory"),
-          // so hand it the runtime this plugin is itself running on.
-          env: {
-            ...process.env,
-            PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}`,
-            BB_PROJECT_ID: thread.projectId,
-            BB_THREAD_ID: threadId,
-          },
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", BB_PROJECT_ID: thread.projectId, BB_THREAD_ID: threadId },
         });
         return { kind: "child", runId, status: workflowStatusFrom(stdout) };
       } catch (e) {
         const detail = e as { message?: string; stdout?: string; stderr?: string };
-        const readError = (detail.stderr || detail.stdout || detail.message || String(e)).trim().split("\n")[0].slice(0, 200);
-        return { kind: "child", runId, status: null, readError };
+        const why = (detail.stderr || detail.stdout || detail.message || String(e)).trim().split("\n")[0].slice(0, 200);
+        return { kind: "child", runId, status: null, readError: `${why} [runtime ${process.execPath}]` };
       }
     },
   };
