@@ -24,6 +24,10 @@ import {
   capacityVerdict,
   type ThreadStatus,
   type ThreadStatusPort,
+  type WorkflowLink,
+  type WorkflowRunPort,
+  workflowRunIdFrom,
+  workflowStatusFrom,
   worst,
 } from "./lib.ts";
 
@@ -921,4 +925,100 @@ test("Claude sweeper ignores Codex and purges old misclassified records even wit
   await sweeper.sweep("periodic", T);
   assert.deepEqual((await store.list()).map(r => r.threadId), ["claude"]);
   assert.deepEqual(recovery.calls, []);
+});
+
+// ── MX-983: a workflow child whose run has ENDED is never restarted ─────────
+//
+// 2026-09-11: dream run wfr_625767af finished at 13:30:16Z with every slice
+// rate-limited; at the 15:10Z reset the sweep restarted all 11 slice threads,
+// burning the only account with headroom for output no run could read.
+
+function fakeWorkflow(links: Record<string, WorkflowLink | Error>): WorkflowRunPort {
+  return {
+    async linkOf(id) {
+      const link = links[id];
+      if (link instanceof Error) throw link;
+      return link ?? { kind: "none" };
+    },
+  };
+}
+
+async function sweepOne(link: WorkflowLink | Error) {
+  const store = inMemoryStore([stuck("a", T, null, 0)]);
+  const recovery = fakeRecovery({ a: { outcome: "continued" } });
+  const logs: string[] = [];
+  const sweeper = createRecoverySweeper({
+    store,
+    status: fakeStatus({ a: "error" }),
+    recovery,
+    workflow: fakeWorkflow({ a: link }),
+    policy: RPOLICY,
+    now: () => T,
+    log: (m) => logs.push(m),
+  });
+  const result = await sweeper.sweep("periodic");
+  return { result, calls: recovery.calls, logs, rows: await store.list() };
+}
+
+test("MX-983: a child of a TERMINAL workflow run is not restarted, and stops being tracked", async () => {
+  for (const status of ["succeeded", "failed", "cancelled"]) {
+    const { calls, logs, rows, result } = await sweepOne({ kind: "child", runId: "wfr_625767af", status });
+    assert.deepEqual(calls, [], status);
+    assert.deepEqual(result.continued, [], status);
+    assert.deepEqual(rows, [], status);
+    assert.equal(logs.length, 1, status);
+    assert.match(logs[0], /wfr_625767af/);
+    assert.match(logs[0], new RegExp(status));
+  }
+});
+
+test("MX-983: a child of a still-RUNNING workflow run is restarted", async () => {
+  for (const status of ["queued", "running"]) {
+    const { calls, result } = await sweepOne({ kind: "child", runId: "wfr_1", status });
+    assert.deepEqual(calls, ["a"], status);
+    assert.deepEqual(result.continued, ["a"], status);
+  }
+});
+
+test("MX-983: an ordinary thread is restarted", async () => {
+  const { calls, result, logs } = await sweepOne({ kind: "none" });
+  assert.deepEqual(calls, ["a"]);
+  assert.deepEqual(result.continued, ["a"]);
+  assert.deepEqual(logs, []);
+});
+
+test("MX-983: an UNREADABLE run state is not restarted, says UNKNOWN, and spends an attempt", async () => {
+  const cases: (WorkflowLink | Error)[] = [
+    { kind: "child", runId: "wfr_1", status: null },
+    { kind: "child", runId: null, status: null },
+    { kind: "child", runId: "wfr_1", status: "some-new-status" },
+    new Error("bb did not respond"),
+  ];
+  for (const link of cases) {
+    const { calls, logs, rows } = await sweepOne(link);
+    assert.deepEqual(calls, [], String(JSON.stringify(link) ?? link));
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /UNKNOWN/);
+    // Still tracked, so a transient read failure is not a permanent loss —
+    // but it costs an attempt, so maxAttempts eventually lets it go.
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].attempts, 1);
+    assert.equal(rows[0].lastAttemptAt, T);
+  }
+});
+
+test("MX-983: the run id is read from the header bb workflows puts on every child's prompt", () => {
+  // Measured 2026-09-17 on thr_3pub2sz9qp (curate:slice-9): originPluginId
+  // "workflows", parentThreadId null, and this titleFallback.
+  const measured = "[BB workflow dream-curate · run wfr_625767af-92a2-42a5-8661-b17dee0218da] You...";
+  assert.equal(workflowRunIdFrom(measured), "wfr_625767af-92a2-42a5-8661-b17dee0218da");
+  assert.equal(workflowRunIdFrom("fix the thing"), null);
+  assert.equal(workflowRunIdFrom(null), null);
+});
+
+test("MX-983: the run status is read from `bb workflows status` JSON, and anything else is null", () => {
+  assert.equal(workflowStatusFrom('{"id":"wfr_1","status":"succeeded","calls":{}}'), "succeeded");
+  assert.equal(workflowStatusFrom("Unknown workflow run wfr_1"), null);
+  assert.equal(workflowStatusFrom('{"id":"wfr_1"}'), null);
+  assert.equal(workflowStatusFrom(""), null);
 });
