@@ -15,6 +15,7 @@
 //    immediately and auto-continue the failed thread via the SDK's
 //    rate-limit-recovery path. Utilization thresholds can lie; the 429 doesn't.
 import { execFile, execFileSync } from "node:child_process";
+import { dirname } from "node:path";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import { promisify } from "node:util";
@@ -619,7 +620,15 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       try {
         const { stdout } = await run(process.env.BB_CLI || "bb", ["workflows", "status", runId], {
           timeout: 20_000,
-          env: { ...process.env, BB_PROJECT_ID: thread.projectId, BB_THREAD_ID: threadId },
+          // `bb` is a `#!/usr/bin/env node` script and this process's PATH has
+          // no node (measured live: "env: node: No such file or directory"),
+          // so hand it the runtime this plugin is itself running on.
+          env: {
+            ...process.env,
+            PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}`,
+            BB_PROJECT_ID: thread.projectId,
+            BB_THREAD_ID: threadId,
+          },
         });
         return { kind: "child", runId, status: workflowStatusFrom(stdout) };
       } catch (e) {
