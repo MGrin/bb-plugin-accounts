@@ -999,6 +999,7 @@ test("MX-983: an UNREADABLE run state is not restarted, says UNKNOWN, and spends
     assert.deepEqual(calls, [], String(JSON.stringify(link) ?? link));
     assert.equal(logs.length, 1);
     assert.match(logs[0], /UNKNOWN/);
+    if (link instanceof Error) assert.match(logs[0], /bb did not respond/);
     // Still tracked, so a transient read failure is not a permanent loss —
     // but it costs an attempt, so maxAttempts eventually lets it go.
     assert.equal(rows.length, 1);
