@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  isFactorySecretary,
   type AccountUsage,
   createRecoverySweeper,
   decideSwitch,
@@ -1022,4 +1023,12 @@ test("MX-983: the run status is read from `bb workflows status` JSON, and anythi
   assert.equal(workflowStatusFrom("Unknown workflow run wfr_1"), null);
   assert.equal(workflowStatusFrom('{"id":"wfr_1"}'), null);
   assert.equal(workflowStatusFrom(""), null);
+});
+
+test("MX-1149: a factory Secretary is never nudged; near-miss titles still are", () => {
+  assert.equal(isFactorySecretary("scani \u00b7 Secretary"), true);
+  assert.equal(isFactorySecretary("scani \u00b7 Operator"), false);
+  assert.equal(isFactorySecretary("scani - Secretary"), false);
+  assert.equal(isFactorySecretary("Secretary notes"), false);
+  assert.equal(isFactorySecretary(undefined), false);
 });

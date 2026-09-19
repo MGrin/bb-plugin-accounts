@@ -49,6 +49,7 @@ import {
   type ThreadStatusPort,
   type WorkflowLink,
   type WorkflowRunPort,
+  isFactorySecretary,
   workflowGate,
   workflowRunIdFrom,
   workflowStatusFrom,
@@ -582,6 +583,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         await new Promise((r) => setTimeout(r, 3000));
         const current = await bb.sdk.threads.get({ threadId });
         if (!isClaudeProvider(current.providerId) || current.status !== "error") return { outcome: "not-eligible", reason: "Thread is no longer an error on the Claude provider" };
+        if (isFactorySecretary(current.title)) return { outcome: "not-eligible", reason: "Factory Secretaries are offline (MX-1149)" };
         // mode "auto", not the default "steer": bb rejects a steer into a thread
         // that is not active with HTTP 409 "Thread is not active", which is
         // exactly the state every stuck thread is in.
@@ -1409,7 +1411,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       } catch { /* model unknown — fall through to account switch */ }
 
       const fiveH = active?.fiveHour ?? 100;
-      if (/fable/i.test(failingModel) && fiveH < Number(switchAt)) {
+      if (/fable/i.test(failingModel) && fiveH < Number(switchAt) && !isFactorySecretary(thread.title)) {
         const ceilings = (await bb.storage.kv.get<object[]>("fable-ceilings")) ?? [];
         await bb.storage.kv.set("fable-ceilings", [
           ...ceilings.slice(-49),
