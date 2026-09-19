@@ -896,3 +896,12 @@ export function createRecoverySweeper(deps: RecoverySweeperDeps): RecoverySweepe
 
   return { onLimitFailure, sweep };
 }
+
+/**
+ * MX-1149 (mgrin 2026-09-19): every factory Secretary is OFFLINE — "do not react to anything,
+ * do not spend any tokens". A thread titled `<factory> · Secretary` (U+00B7, one space each
+ * side, as bb-plugin-intake spells it) is never nudged or continued by this plugin.
+ */
+export function isFactorySecretary(title: string | null | undefined): boolean {
+  return typeof title === "string" && title.endsWith(" \u00b7 Secretary");
+}
