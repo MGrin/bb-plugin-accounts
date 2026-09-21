@@ -21,9 +21,9 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import { createCodexSnapshotReader } from "./telemetry-source.ts";
+import { createCodexSnapshotReader, createJevUsageReader } from "./telemetry-source.ts";
 import { telemetryShape, normalizeClaude, normalizeCodexEvents, isClaudeProvider, isFresh,
-  formatTelemetry, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
+  formatTelemetry, jevSpendShape, formatJev, type JevSpend, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
 import {
@@ -216,6 +216,8 @@ const forecastShape = z.object({
 
 export const rpcContract = defineRpcContract({
   telemetry: { input: z.null(), output: telemetryShape },
+  // Its own method, not a key on `telemetry`: the dotfiles widget feed pins that shape to version 1.
+  jev: { input: z.null(), output: jevSpendShape },
   forecast: { input: z.null(), output: forecastShape.nullable() },
   analytics: {
     input: z.object({ days: z.number() }),
@@ -338,9 +340,11 @@ async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Ac
 export default async function plugin(bb: BbPluginApi, dependencies: {
   readClaudeUsage?: typeof readUsageCache;
   readCodexSnapshot?: () => Promise<ProviderAccount>;
+  readJevUsage?: () => Promise<JevSpend>;
 } = {}) {
   const readUsage = dependencies.readClaudeUsage ?? readUsageCache;
   const readCodexSnapshot = dependencies.readCodexSnapshot ?? createCodexSnapshotReader(`${os.homedir()}/.local/bin/mx`);
+  const readJevUsage = dependencies.readJevUsage ?? createJevUsageReader(`${os.homedir()}/.local/bin/mx`);
   const observedThreads = new Map<string, { account: ProviderAccount | null; tokens: TokenObservation | null }>();
   const inspectingThreads = new Set<string>();
   const invalidatedReads = new Set<string>();
@@ -1459,6 +1463,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
 
   bb.rpc.register(rpcContract, {
     telemetry: currentTelemetry,
+    jev: () => readJevUsage(),
     async forecast() {
       return (await currentForecast()) ?? null;
     },
@@ -1502,6 +1507,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     summary: "Claude switching and provider-scoped subscription telemetry",
     commands: [
       { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
+      { name: "jev", summary: "Jev spend from mx jev usage: an ESTIMATE, mx jev calls only", usage: "bb accounts jev [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
@@ -1537,6 +1543,10 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       if (cmd === "telemetry") {
         const telemetry = await currentTelemetry();
         return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(telemetry) : formatTelemetry(telemetry) };
+      }
+      if (cmd === "jev") {
+        const jev = await readJevUsage();
+        return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(jev) : formatJev(jev, Date.now() / 1000) };
       }
       const json = argv.includes("--json");
 
