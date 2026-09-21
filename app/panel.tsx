@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 import { useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
 import { BarList, Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
-import { ProviderTelemetry } from "./providers.tsx";
+import { JevSpendSection, ProviderTelemetry } from "./providers.tsx";
 import { CurrentUsage } from "./current.tsx";
 import { clock } from "./format.ts";
 import { Section } from "./ui.tsx";
@@ -178,6 +178,7 @@ export function UsagePanel() {
           the forecast is the occasional one. */}
       <ProviderTelemetry />
       <CurrentUsage />
+      <JevSpendSection />
 
       <ForecastSection fc={fc} />
 

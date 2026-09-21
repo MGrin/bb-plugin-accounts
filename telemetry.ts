@@ -180,3 +180,72 @@ export function formatTelemetry(t: Telemetry): string {
   for (const tkn of t.tokens) lines.push(`codex thread ${tkn.threadId}: ${tkn.totalTokens} tokens (not quota), observed=${tkn.observedAt} fresh=${tkn.fresh}`);
   return lines.join("\n\n");
 }
+
+/**
+ * Jev spend, read from `mx jev usage --json` (MX-1172) and never recomputed here: mx and the
+ * Übersicht widget read the same log through the same code, so a second reader would be a
+ * second number. Three states and no fourth. `no-data` (no log, or no decision in it) is NOT
+ * zero spend, and `unknown` is anything we could not trust; neither carries a figure.
+ */
+export const JEV_COVERS = "calls made through `mx jev` only. The fast-jev-compaction plugin and any script that posts to TypeSafe directly are NOT in these numbers";
+const jevCountsShape = z.object({ calls: z.number(), inputTokens: z.number(), usd: z.number() });
+export const jevSpendShape = z.object({
+  state: z.enum(["ok", "no-data", "unknown"]),
+  reason: z.string(),
+  generatedAt: z.number().nullable(), // when mx took the reading, epoch seconds
+  lastDecisionAt: z.number().nullable(),
+  usdPerMtok: z.number().nullable(),
+  covers: z.string(),
+  windows: z.array(jevCountsShape.extend({ name: z.string(), since: z.number(), bySet: z.array(jevCountsShape.extend({ set: z.string() })) })),
+});
+export type JevSpend = z.infer<typeof jevSpendShape>;
+export const JEV_WINDOWS = ["24h", "7d", "30d"] as const;
+
+export function unknownJev(reason: string): JevSpend {
+  return { state: "unknown", reason, generatedAt: null, lastDecisionAt: null, usdPerMtok: null, covers: JEV_COVERS, windows: [] };
+}
+
+const nonNegative = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const jevCounts = (v: Record<string, unknown>) =>
+  nonNegative(v.calls) && nonNegative(v.input_tokens) && nonNegative(v.usd) ? { calls: v.calls, inputTokens: v.input_tokens, usd: v.usd } : null;
+
+export function normalizeJev(value: unknown, _now: number): JevSpend {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return unknownJev("mx jev usage printed something that is not a JSON object");
+  const v = value as Record<string, unknown>;
+  if (v.version !== 1) return unknownJev(`mx jev usage reported version ${JSON.stringify(v.version) ?? "none"}, this page reads version 1`);
+  if (v.estimate !== true) return unknownJev("mx jev usage did not mark its figures as an estimate");
+  if (typeof v.log_present !== "boolean") return unknownJev("mx jev usage gave no boolean log_present");
+  const out: JevSpend = { ...unknownJev(""), generatedAt: epochSeconds(v.generated_at), usdPerMtok: nonNegative(v.usd_per_mtok) ? v.usd_per_mtok : null,
+    covers: typeof v.covers === "string" && v.covers.length > 0 && v.covers.length <= 600 ? v.covers : JEV_COVERS };
+  if (!v.log_present) return { ...out, state: "no-data", reason: "the Jev decision log does not exist" };
+  if (v.last_decision_ts === null) return { ...out, state: "no-data", reason: "the Jev decision log holds no readable decision" };
+  const lastDecisionAt = epochSeconds(v.last_decision_ts);
+  if (lastDecisionAt === null) return { ...out, reason: "mx jev usage gave an unreadable last_decision_ts" };
+  const rows = Array.isArray(v.windows) ? v.windows.map(object) : [];
+  const windows: JevSpend["windows"] = [];
+  for (const [i, name] of JEV_WINDOWS.entries()) {
+    const row = rows[i], counts = row && jevCounts(row), since = row && epochSeconds(row.since);
+    if (rows.length !== JEV_WINDOWS.length || !row || row.name !== name || !counts || since === null)
+      return { ...out, reason: `mx jev usage window ${name} is missing or not non-negative finite numbers` };
+    const bySet = (Array.isArray(row.by_set) ? row.by_set : []).slice(0, 32).map(object).flatMap(s => {
+      const c = jevCounts(s), set = word(s.set);
+      return c && set ? [{ set, ...c }] : [];
+    });
+    windows.push({ name, since: since as number, ...counts, bySet });
+  }
+  return { ...out, state: "ok", reason: "estimate from mx jev usage", lastDecisionAt, windows };
+}
+
+/** "3m", "5h", "2d" — the same buckets mx prints, so the page and the CLI read alike. */
+export function jevAge(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  return s < 120 ? `${s}s` : s < 7200 ? `${Math.floor(s / 60)}m` : s < 172_800 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86_400)}d`;
+}
+
+export function formatJev(j: JevSpend, now: number): string {
+  const head = j.state === "unknown" ? `Jev spend UNKNOWN · ${j.reason}` : j.state === "no-data" ? `Jev spend NO DATA · ${j.reason}` :
+    `Jev spend (an ESTIMATE: input tokens × $${j.usdPerMtok ?? "?"}/MTok, not a bill) · newest decision ${jevAge(now - (j.lastDecisionAt ?? now))} ago` +
+    ` · reading ${j.generatedAt === null ? "age unknown" : `${jevAge(now - j.generatedAt)} old`}`;
+  const rows = j.state !== "ok" ? [] : j.windows.map(w => `  ${w.name.padEnd(4)} ${w.calls.toLocaleString("en-US")} calls · ${w.inputTokens.toLocaleString("en-US")} input tokens · $${w.usd}`);
+  return [head, ...rows, `  covers: ${j.covers}`].join("\n");
+}
