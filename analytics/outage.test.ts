@@ -386,3 +386,14 @@ test("MX-218: an unreadable account is exit 2, distinct from a stale poll", () =
   assert.equal(s.exitCode, 2);
   assert.doesNotMatch(s.headline, /stale/i);
 });
+
+test('unknown accounts are not advertised as headroom', () => {
+  const accounts = [acct({slot:'good',fiveUtil:20,sevenUtil:97}),acct({slot:'unreadable',fiveUtil:null,sevenUtil:null})];
+  const v=assessOutage(accounts,{capacity:'free'});
+  assert.match(v.reason,/1 of 2 account\(s\).*headroom \(good\)/);
+  assert.match(v.reason,/1.*unknown/);
+  const unknown=assessOutage(accounts.slice(1),{capacity:'unknown'});
+  assert.doesNotMatch(unknown.reason,/have headroom/);
+  assert.match(unknown.reason,/unknown/);
+  assert.equal(unknown.cannotServe,false);
+});

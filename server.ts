@@ -1831,6 +1831,8 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
             accounts: accounts.map((a) => ({
               slot: a.slot,
               email: a.email,
+              error: a.error,
+              authState: a.authState,
               active: a.active,
               fiveHour: { util: a.fiveHour, resetsAt: a.fiveHourResetsAt },
               sevenDay: { util: a.sevenDay, resetsAt: a.sevenDayResetsAt },
