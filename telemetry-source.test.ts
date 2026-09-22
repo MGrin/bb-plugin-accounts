@@ -37,9 +37,9 @@ test("missing CLI, malformed stdout, oversized response and timeout all yield UN
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-const jevReading = (now: number) => ({ version: 1, generated_at: now, source: "s", log_present: true, last_decision_ts: now - 60,
-  estimate: true, usd_per_mtok: 0.042, covers: "mx jev only", windows: ["24h", "7d", "30d"].map(name =>
-    ({ name, since: now - 86_400, calls: 3, input_tokens: 1000, usd: 0.000042, by_set: [] })) });
+const jevReading = (now: number) => ({ version: 2, generated_at: now, source: "s", log_present: true, last_decision_ts: now - 60,
+  billing: null, billing_error: null, covers: "mx jev only", windows: ["24h", "7d", "30d"].map(name =>
+    ({ name, since: now - 86_400, calls: 3, input_tokens: 1000, by_set: [] })) });
 
 test("Jev reader: exact read-only argv, deduplication, 60 s throttle, and a failure never keeps the old figure", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "accounts-jev-"));

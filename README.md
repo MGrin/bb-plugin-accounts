@@ -18,7 +18,7 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-accounts.git@main
 
 ```
 bb accounts telemetry     provider-scoped subscription windows (--json supported)
-bb accounts jev           Jev spend from mx jev usage: an estimate (--json supported)
+bb accounts jev           Jev usage from mx jev usage: counts, plus the console bill if read (--json supported)
 bb accounts [list]        Claude per-account 5h/7d utilization
 bb accounts switch <slot> switch the live credentials to a slot
 bb accounts auto          run one auto-switch evaluation now
@@ -231,11 +231,12 @@ separate coordinated deployment step.
 
 ### Jev spend (MX-1172)
 
-`bb accounts jev [--json]` and the `jev` RPC render `mx jev usage --json` (v1), bounded the
+`bb accounts jev [--json]` and the `jev` RPC render `mx jev usage --json` (v2), bounded the
 same way as the Codex read and never recomputed here: the Übersicht widget reads the same
 command, so two readers cannot become two numbers. It is its own RPC rather than a key on
 `telemetry`, whose version-1 shape the dotfiles widget feed pins. Three states and no
-fourth: `ok` (24h / 7d / 30d calls, input tokens, dollars), `no-data` (no log, or no
+fourth: `ok` (24h / 7d / 30d calls and input tokens; dollars ONLY from `billing`, a recorded
+reading of TypeSafe's console across every key, MX-1200), `no-data` (no log, or no
 decision in it, which is **not** zero spend) and `unknown` with its reason (mx missing,
 slow, non-zero exit, not JSON, `version` not 1, `estimate` not true, or a window that is
 not non-negative finite numbers). Only `ok` carries a figure. Every surface prints the two
