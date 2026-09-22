@@ -97,8 +97,9 @@ test("an in-flight SDK read cannot restore a thread after provider change", asyn
 
 test("Jev spend rides its own rpc and CLI verb; telemetry keeps version 1 and gains no key", async () => {
   const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
-  const ok = { ...unknownJev(""), state: "ok" as const, reason: "estimate", generatedAt: 1_800_000_000, lastDecisionAt: 1_799_999_000,
-    usdPerMtok: 0.042, windows: JEV_WINDOWS.map(name => ({ name, since: 1_799_000_000, calls: 3, inputTokens: 1000, usd: 0.000042, bySet: [] })) };
+  const ok = { ...unknownJev(""), state: "ok" as const, reason: "counts", generatedAt: 1_800_000_000, lastDecisionAt: 1_799_999_000,
+    billing: { amountUsd: 12.5, recordedAt: 1_799_990_000, period: "Sep 2026", source: "https://console.typesafe.ai/usage", asOf: null },
+    windows: JEV_WINDOWS.map(name => ({ name, since: 1_799_000_000, calls: 3, inputTokens: 1000, bySet: [] })) };
   let reading: ReturnType<typeof unknownJev> = ok;
   try {
     await plugin(bb as unknown as Parameters<typeof plugin>[0], { readClaudeUsage: async () => ({ polledAt: null, accounts: [] }),
@@ -108,7 +109,7 @@ test("Jev spend rides its own rpc and CLI verb; telemetry keeps version 1 and ga
     assert.deepEqual(await harness.behavior.callRpc("jev", null), ok);
     const cli = await harness.behavior.runCli(["jev", "--json"]);
     assert.equal(cli.exitCode, 0); assert.deepEqual(JSON.parse(cli.stdout!), ok);
-    assert.match((await harness.behavior.runCli(["jev"])).stdout!, /\$0\.000042/);
+    assert.match((await harness.behavior.runCli(["jev"])).stdout!, /\$12\.50 for Sep 2026/);
     reading = unknownJev("mx not found");
     const blind = await harness.behavior.runCli(["jev"]);
     assert.equal(blind.exitCode, 0, "a report, not a gate: README, Provider-scoped telemetry"); assert.match(blind.stdout!, /UNKNOWN · mx not found/); assert.doesNotMatch(blind.stdout!, /\$/);

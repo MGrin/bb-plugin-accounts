@@ -1507,7 +1507,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     summary: "Claude switching and provider-scoped subscription telemetry",
     commands: [
       { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
-      { name: "jev", summary: "Jev spend from mx jev usage: an ESTIMATE, mx jev calls only", usage: "bb accounts jev [--json]" },
+      { name: "jev", summary: "Jev usage from mx jev usage: this key's counts, and the TypeSafe console bill when one was read", usage: "bb accounts jev [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
