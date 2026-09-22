@@ -45,7 +45,7 @@
     "url": "git+https://github.com/MGrin/bb-plugin-accounts.git"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types lib.test.ts telemetry*.test.ts server.test.ts analytics/*.test.ts app/*.test.ts && node --import tsx --test app/*.test.tsx",
+    "test": "node --test --experimental-strip-types lib.test.ts telemetry*.test.ts server.test.ts recovery.test.ts analytics/*.test.ts app/*.test.ts && node --import tsx --test app/*.test.tsx",
     "typecheck": "tsc --noEmit"
   }
 }

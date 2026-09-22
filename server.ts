@@ -34,6 +34,7 @@ import {
   type CreditState,
   decideSwitch,
   isLimitError,
+  isAuthenticationError,
   isLimitFailure,
   type LimitFailureSignal,
   type ListedThread,
@@ -174,6 +175,8 @@ const creditSpendShape = z.object({
 });
 
 const accountShape = z.object({
+  error: z.string().optional(),
+  authState: z.enum(["ok", "unknown", "reauth-required"]).optional(),
   slot: z.string(),
   email: z.string(),
   active: z.boolean(),
@@ -277,6 +280,7 @@ interface RawUsage {
       spend_limit_reached?: boolean | null;
     } | null;
     error?: string;
+    authState?: "ok" | "unknown" | "reauth-required";
   }[];
 }
 
@@ -321,6 +325,8 @@ async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Ac
     return {
       polledAt: raw.polledAt ?? null,
       accounts: (raw.accounts ?? []).map((a) => ({
+        error: a.error,
+        authState: a.authState,
         slot: a.slot,
         email: a.email,
         active: a.active,
@@ -338,11 +344,14 @@ async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Ac
 }
 
 export default async function plugin(bb: BbPluginApi, dependencies: {
+  runClaudeAccount?: (args: string[]) => Promise<string>;
   readClaudeUsage?: typeof readUsageCache;
   readCodexSnapshot?: () => Promise<ProviderAccount>;
   readJevUsage?: () => Promise<JevSpend>;
 } = {}) {
   const readUsage = dependencies.readClaudeUsage ?? readUsageCache;
+  const runClaudeAccount = dependencies.runClaudeAccount ?? (async (args: string[]) =>
+    (await run(CLAUDE_ACCT, args, { timeout: 30_000 })).stdout);
   const readCodexSnapshot = dependencies.readCodexSnapshot ?? createCodexSnapshotReader(`${os.homedir()}/.local/bin/mx`);
   const readJevUsage = dependencies.readJevUsage ?? createJevUsageReader(`${os.homedir()}/.local/bin/mx`);
   const observedThreads = new Map<string, { account: ProviderAccount | null; tokens: TokenObservation | null }>();
@@ -488,14 +497,13 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   // behind, so skip this tick rather than reason about a stale world.
   async function activeSlotIsTrustworthy(cacheActive: string): Promise<boolean> {
     try {
-      const { stdout } = await run(CLAUDE_ACCT, ["current"], { timeout: 10_000 });
-      const live = stdout.trim();
-      if (live && live !== cacheActive) {
+      const live = (await runClaudeAccount(["current"])).trim();
+      if (!live || live !== cacheActive) {
         bb.log.info(`skipping watch: live slot ${live} != cached active ${cacheActive} (usage cache is behind)`);
         return false;
       }
     } catch {
-      return true; // claude-acct unavailable: fall back to the cache rather than freeze
+      return false; // An unreadable identity cannot authorize a switch or recovery.
     }
     return true;
   }
@@ -507,13 +515,16 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     return !!last && Date.now() - last.at < window * 1000;
   }
 
+  let switching = false;
   async function switchTo(to: Account, from: string, reason: string): Promise<boolean> {
+    if (switching) return false;
+    switching = true;
     try {
-      await run(CLAUDE_ACCT, ["use", to.slot], { timeout: 30_000 });
+      await runClaudeAccount(["use", to.slot, "--expected-current", from]);
     } catch (e) {
       bb.log.error(`switch to ${to.slot} FAILED: ${e instanceof Error ? e.message : e}`);
       return false;
-    }
+    } finally { switching = false; }
     await bb.storage.kv.set("last-switch", { at: Date.now(), from, to: to.slot, reason });
     bb.log.info(`switched ${from} -> ${to.slot} (${reason})`);
     bb.realtime.publish("accounts.switched", { from, to: to.slot, reason });
@@ -526,18 +537,22 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   // rather than queried from bb. Pure judgement (planSweep) and the port
   // shapes below live in lib.ts, under the same `node --test` coverage as
   // decideSwitch/isLimitError.
+  let storeWrite: Promise<void> = Promise.resolve();
+  const mutateStuck = (change: (rows: StuckThreadRecord[]) => StuckThreadRecord[]) => {
+    const next = storeWrite.then(async () => {
+      const rows = (await bb.storage.kv.get<StuckThreadRecord[]>("stuck-threads")) ?? [];
+      await bb.storage.kv.set("stuck-threads", change(rows));
+    });
+    storeWrite = next.catch(() => {});
+    return next;
+  };
   const stuckThreadsStore: StuckThreadStore = {
     async list() {
+      await storeWrite;
       return (await bb.storage.kv.get<StuckThreadRecord[]>("stuck-threads")) ?? [];
     },
-    async upsert(record) {
-      const all = await stuckThreadsStore.list();
-      await bb.storage.kv.set("stuck-threads", [...all.filter((r) => r.threadId !== record.threadId), record]);
-    },
-    async remove(threadId) {
-      const all = await stuckThreadsStore.list();
-      await bb.storage.kv.set("stuck-threads", all.filter((r) => r.threadId !== threadId));
-    },
+    upsert: record => mutateStuck(rows => [...rows.filter(r => r.threadId !== record.threadId), record]),
+    remove: threadId => mutateStuck(rows => rows.filter(r => r.threadId !== threadId)),
   };
 
   const threadStatus: ThreadStatusPort = {
@@ -552,58 +567,25 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   };
 
   const threadRecovery: ThreadRecoveryPort = {
-    /**
-     * Restart a thread a rate limit stopped, now that some account can serve it.
-     *
-     * This was a two-step until 2026-08-21: ask `threads.rateLimitRecovery()`
-     * for a replayable candidate, and `threads.continueAfterRateLimit()` it if
-     * bb had one, falling back to a plain message when it did not. bb 0.39.0
-     * removed BOTH methods, their HTTP routes and `bb thread retry` outright
-     * (get-bb/bb#1623, "Move provider retry policy into the provider-retry
-     * plugin") — the server keeps no rate-limit recovery policy at all now.
-     *
-     * The replay did not move somewhere this plugin can call. It moved into
-     * bb's builtin provider-retry plugin, which schedules it for the moment
-     * the window that blocked it rolls over (`resetsAtMs` + 15s, capped at
-     * six hours). That wait is precisely what this sweep exists to skip: by
-     * the time it runs, accounts has already moved the machine onto an account
-     * with capacity, so the thread can go NOW rather than in five hours.
-     *
-     * So what is left is the fallback, and it was always the half that
-     * actually worked. thr_3waqz7vb9w sat dead for ten hours on 2026-08-11
-     * because its limit arrived as an agentMessage and bb had no replayable
-     * request to offer; an ordinary follow-up message started it again
-     * immediately.
-     *
-     * The eligibility reasons that used to gate this nudge are gone with the
-     * call that produced them. Three gates still stand, all in the sweeper:
-     * it only attempts a thread still sitting in `error` (a thread
-     * provider-retry, a human or an earlier sweep already revived is dropped
-     * untouched), only while some account has capacity, and only once per
-     * recoveryCooldownSec.
-     */
+    // Reuse the failed turn; never fabricate a second user request.
     async attemptContinue(threadId): Promise<RecoveryAttemptResult> {
       try {
         await new Promise((r) => setTimeout(r, 3000));
         const current = await bb.sdk.threads.get({ threadId });
         if (!isClaudeProvider(current.providerId) || current.status !== "error") return { outcome: "not-eligible", reason: "Thread is no longer an error on the Claude provider" };
         if (isFactorySecretary(current.title)) return { outcome: "not-eligible", reason: "Factory Secretaries are offline (MX-1149)" };
-        // mode "auto", not the default "steer": bb rejects a steer into a thread
-        // that is not active with HTTP 409 "Thread is not active", which is
-        // exactly the state every stuck thread is in.
-        await bb.sdk.threads.send({
-          threadId,
-          mode: "auto",
-          input: [{
-            type: "text",
-            mentions: [],
-            text:
-              "[accounts] Provider capacity is back and this thread was stopped by a rate limit. " +
-              "This is a plain restart rather than a retry of the failed call, so the request that hit the limit was never served. " +
-              "Continue from where you left off — re-check anything whose result you never saw before acting on it.",
-          }],
-        });
-        bb.log.info(`recovery: nudged ${threadId} back to life`);
+        if (!(await anyAccountHasCapacity())) return { outcome: "not-eligible", reason: "Active account capacity is no longer verified" };
+        const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+        const requests = await bb.sdk.threads.events.list({ threadId, order: "desc", limit: "1", types: ["client/turn/requested"] });
+        const failed = requests[0]?.data as { requestId?: string; retryOfRequestId?: string } | undefined;
+        const original = failed?.retryOfRequestId ?? failed?.requestId;
+        const retry = queued.filter(q => q.payload.kind === "retry" && original !== undefined && q.payload.retryOfTurnRequestId === original)
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        const result = retry
+          ? await bb.sdk.threads.queuedMessages.send({ threadId, queuedMessageId: retry.id, mode: "auto" })
+          : await bb.sdk.threads.retry({ threadId, ...(failed?.requestId ? { turnRequestId: failed.requestId } : {}), reason: "accounts: active account capacity verified" });
+        if (result.delivery !== "sent") return { outcome: "not-eligible", reason: "Retry is queued by BB admission controls" };
+        bb.log.info(`recovery: retried failed request for ${threadId}`);
         return { outcome: "continued" };
       } catch (e) {
         return { outcome: "error", message: e instanceof Error ? e.message : String(e) };
@@ -662,22 +644,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   // requires `bb plugin reload accounts` to pick up a settings change.
   const recoverySettings = await settings.get();
 
-  /**
-   * Could ANY account serve a request right now?
-   *
-   * A stale cache answers YES. A broken poller must not be able to freeze
-   * recovery — an attempt that turns out to be doomed only costs one retry,
-   * while refusing to attempt for hours costs the whole night.
-   */
-  /**
-   * free / paid-only / none / unknown — see capacityVerdict.
-   *
-   * A stale cache is UNKNOWN for the same reason a failed poll is: the
-   * instrument cannot see, so it asserts nothing. That was already this
-   * function's behaviour (it returned "available" when stale); MX-210 only gave
-   * the state a name so the two blind cases and the two sighted ones stop
-   * sharing one boolean.
-   */
+  // Capacity reporting retains its explicit unknown state.
   async function capacityOf(
     polledAt: number | null,
     accounts: Account[],
@@ -692,17 +659,15 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     return capacityOf(polledAt, accounts, Number(recoverySettings.weeklyAt));
   }
 
-  /**
-   * Can the sweeper get a thread served AT ALL right now?
-   *
-   * "only paid capacity left" is not an outage and must not hold the sweep —
-   * that verdict is exactly what MX-210 was filed for: a machine reporting
-   * itself walled while a paid path was open stalls work for no reason. It is
-   * still not a licence to PREFER credits; the destination order in pickBest is
-   * what keeps them last, and this answers a different question.
-   */
   async function anyAccountHasCapacity(): Promise<boolean> {
-    return (await machineCapacity()) !== "none";
+    const { polledAt, accounts } = await readUsage();
+    const active = accounts.find(a => a.active);
+    if (!active || active.fiveHour === null || active.sevenDay === null || active.error || active.authState === "reauth-required" || !(await activeSlotIsTrustworthy(active.slot))) return false;
+    // A successful poll from before the failure cannot prove OAuth recovered.
+    const tracked = await stuckThreadsStore.list();
+    if (polledAt === null || tracked.some(row => row.lastFailedAt >= polledAt * 1000)) return false;
+    const capacity = await capacityOf(polledAt, [active], Number(recoverySettings.weeklyAt));
+    return capacity === "free" || capacity === "paid-only";
   }
 
   const sweeper = createRecoverySweeper({
@@ -1187,41 +1152,22 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
    * newest page means "no signal", which is the safe direction: no signal is
    * no adoption.
    */
-  const RATE_LIMIT_PAGE = 100;
-  async function latestRateLimitStatus(threadId: string, providerId: string): Promise<string | null> {
-    const page = await bb.sdk.threads.events.list({
-      threadId,
-      limit: String(RATE_LIMIT_PAGE),
-      order: "desc",
-      types: ["provider/rateLimits/updated"],
-    });
-    return rateLimitStatusFrom(
-      page.flatMap((row) => (row.type === "provider/rateLimits/updated" ? [row] : [])),
-      providerId,
-    );
-  }
-
-  /**
-   * Gather every signal about a dead thread. `error` alone is not enough — it
-   * is null on every real limit failure (see isLimitFailure) — so unless it
-   * settles the question on its own, read the thread's own event stream.
-   *
-   * This asked `threads.rateLimitRecovery()` until 2026-08-21. bb 0.39.0
-   * removed that method (get-bb/bb#1623) and the call had been throwing since
-   * 2026-08-19T05:40Z — into the catch below, which returned a signal with no
-   * rate-limit state in it. `isLimitFailure` then said no to everything, so
-   * BOTH detection paths went quiet: 245 limit failures were caught in the ten
-   * days before, and none in the two days after. The warning was the only
-   * trace, 196 of them, and it is the reason this was findable at all.
-   */
+  // Read the newest provider/system failure before rate-limit state. A previous
+  // blocked window is not evidence that a later OAuth failure needs a downgrade.
   async function inspectFailure(
     threadId: string,
     error: string | null,
     providerId: string,
   ): Promise<LimitFailureSignal> {
-    if (isLimitError(error)) return { error };
     try {
-      return { error, rateLimitStatus: await latestRateLimitStatus(threadId, providerId) };
+      const rows = await bb.sdk.threads.events.list({ threadId, limit: "100", order: "desc", types: ["provider/error", "system/error", "provider/rateLimits/updated", "turn/started"] });
+      const boundary = rows.findIndex(row => row.type === "turn/started");
+      const current = boundary < 0 ? rows : rows.slice(0, boundary);
+      const recent = current.find(row => row.type === "provider/error" || row.type === "system/error");
+      const data = recent?.data as { message?: string; error?: string } | undefined;
+      const message = data?.message ?? data?.error ?? error;
+      if (typeof message === "string" && (isAuthenticationError(message) || isLimitError(message))) return { error: message };
+      return { error: typeof message === "string" ? message : error, rateLimitStatus: rateLimitStatusFrom(current.flatMap(row => row.type === "provider/rateLimits/updated" ? [row] : []), providerId) };
     } catch (e) {
       // Expected for a thread bb can no longer read — a deleted thread answers
       // not-found rather than a page of events. Nothing to adopt.
@@ -1244,18 +1190,18 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       const res = (await bb.sdk.threads.list({ archived: false })) as unknown;
       const rows = (Array.isArray(res) ? res : ((res as { threads?: unknown[] })?.threads ?? [])) as ListedThread[];
       const tracked = await stuckThreadsStore.list();
-      const inspected = (await bb.storage.kv.get<Record<string, number>>("adoption-inspected")) ?? {};
+      const inspected = (await bb.storage.kv.get<Record<string, number>>("adoption-inspected-v2")) ?? {};
       const plan = planAdoption(rows, tracked.map((r) => r.threadId), inspected, Date.now(), giveUpAfterSec);
       // Persist BEFORE inspecting: a crash mid-loop must not leave a thread
       // eligible for re-inspection on every tick forever.
-      await bb.storage.kv.set("adoption-inspected", plan.retain);
+      await bb.storage.kv.set("adoption-inspected-v2", plan.retain);
 
       for (const threadId of plan.inspect) {
         const row = rows.find((t) => t.id === threadId);
         const providerId = (row as unknown as { providerId?: string })?.providerId;
         if (!isClaudeProvider(providerId)) continue;
         const signal = await inspectFailure(threadId, null, providerId);
-        if (!isLimitFailure(signal)) continue;
+        if (!isLimitFailure(signal) && !isAuthenticationError(signal.error)) continue;
         bb.log.info(`adopted untracked stuck thread ${threadId} (${describeSignal(signal)}) — the event never reached us`);
         await sweeper.onLimitFailure(threadId, providerId);
       }
@@ -1266,7 +1212,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
 
   /** Which signal actually caught this failure — the line that was missing all night. */
   const describeSignal = (s: LimitFailureSignal): string =>
-    isLimitError(s.error) ? `error: ${s.error}` : `rate limits ${s.rateLimitStatus ?? "unknown"}`;
+    (isLimitError(s.error) || isAuthenticationError(s.error)) ? `error: ${s.error}` : `rate limits ${s.rateLimitStatus ?? "unknown"}`;
 
   // ── Placement: where should work START? ──────────────────────────────────
   //
@@ -1398,11 +1344,12 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     if (!isClaudeProvider(thread.providerId)) return;
     return (async () => {
       const signal = await inspectFailure(thread.id, error, thread.providerId);
-      if (!isLimitFailure(signal)) return;
-      bb.log.info(`thread ${thread.id} failed on a provider limit (${describeSignal(signal)}) — tracking for recovery`);
+      if (!isLimitFailure(signal) && !isAuthenticationError(signal.error)) return;
+      bb.log.info(`thread ${thread.id} failed on a recoverable provider error (${describeSignal(signal)}) — tracking for recovery`);
       // Track this thread as stuck regardless of what happens below — a
       // fable-downgrade or a switch that itself fails must not lose it.
       await sweeper.onLimitFailure(thread.id, thread.providerId);
+      if (isAuthenticationError(signal.error)) return; // Recover on a fresh, verified watch tick; never downgrade OAuth failures.
       const { autoSwitch, switchAt, downgradeModel } = await settings.get();
       if (!autoSwitch || (await underCooldown())) return;
       const { accounts } = await readUsage();
@@ -1894,6 +1841,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         };
       }
       const bar = (v: number | null) => {
+        if (v === null) return "????????????";
         const f = Math.min(1, (v ?? 0) / 100);
         const n = Math.round(f * 12);
         return "█".repeat(n) + "░".repeat(12 - n);
@@ -1912,7 +1860,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       };
       const lines = accounts.map(
         (a) =>
-          `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${String(a.fiveHour ?? 0).padStart(3)}%  7d ${bar(a.sevenDay)} ${String(a.sevenDay ?? 0).padStart(3)}%${creditCell(a)}`,
+          `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${a.fiveHour === null ? "UNKNOWN" : `${a.fiveHour}%`}  7d ${bar(a.sevenDay)} ${a.sevenDay === null ? "UNKNOWN" : `${a.sevenDay}%`}${creditCell(a)}${a.error ? `  ${a.error}` : ""}`,
       );
       if (!stale && accounts.length > 0) {
         const v = capacityVerdict(accounts, Number(recoverySettings.weeklyAt));
