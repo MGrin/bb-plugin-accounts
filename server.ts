@@ -479,7 +479,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     const verdict = assessOutage(toOutageAccounts(accounts), { weeklyAt: Number(weeklyAt), stale, capacity });
     const streak = (await bb.storage.kv.get<OutageStreak>("outage-streak")) ?? EMPTY_STREAK;
     const requiredPolls = Number(outageConfirmPolls) || DEFAULT_CONFIRM_POLLS;
-    return { polledAt, stale, verdict, streak, requiredPolls, confirmed: isConfirmed(verdict, streak, requiredPolls) };
+    return { polledAt, stale, accounts, verdict, streak, requiredPolls, confirmed: isConfirmed(verdict, streak, requiredPolls) };
   }
 
   async function pickBest(exceptSlot: string): Promise<Account | null> {
@@ -1772,7 +1772,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
           `verdict   ${headline}`,
           `reason    ${v.reason}`,
           `capacity  ${v.capacity}${v.capacity === "paid-only" ? " — usable, and it BILLS" : ""}`,
-          `free      ${v.allFreeWindowsSpent ? `no free window on any of ${v.accounts.length} account(s)` : "at least one account has a free window"}`,
+          `free      ${v.allFreeWindowsSpent ? `no free window on any of ${v.accounts.length} account(s)` : v.capacity === "free" ? "at least one account has a free window" : "UNKNOWN"}`,
           // The free window coming back, which is a different question from
           // whether the machine is working. Named on the line so the two do not
           // get read as one again.
@@ -1780,8 +1780,10 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
           `polls     ${o.streak.consecutive}/${o.requiredPolls} consecutive`,
         ];
         for (const a of v.accounts) {
+          const source = o.accounts.find(row => row.slot === a.slot);
+          const known = !o.stale && source?.fiveHour != null && source?.sevenDay != null;
           lines.push(
-            `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : "usable"}`,
+            `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : known ? "usable" : "UNKNOWN"}`,
           );
         }
         return { exitCode, stdout: lines.join("\n") };

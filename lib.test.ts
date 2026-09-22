@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   isFactorySecretary,
+  hasFreeWindow,
   type AccountUsage,
   createRecoverySweeper,
   decideSwitch,
@@ -1031,4 +1032,11 @@ test("MX-1149: a factory Secretary is never nudged; near-miss titles still are",
   assert.equal(isFactorySecretary("scani - Secretary"), false);
   assert.equal(isFactorySecretary("Secretary notes"), false);
   assert.equal(isFactorySecretary(undefined), false);
+});
+
+test('a missing weekly quota is unknown and cannot be selected as free capacity',()=>{
+  const partial=acct('partial',20,null);
+  assert.equal(hasFreeWindow(partial),null);
+  assert.equal(capacityVerdict([partial]),'unknown');
+  assert.equal(pickBest([partial],'out'),null);
 });
