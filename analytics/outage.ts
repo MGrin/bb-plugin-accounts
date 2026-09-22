@@ -202,6 +202,11 @@ export function assessOutage(
     };
   }
   const usable = per.filter((o) => !o.exhausted);
+  const readable = usable.filter(o => {
+    const a = accounts.find(a => a.slot === o.slot)!;
+    return a.fiveUtil !== null && a.sevenUtil !== null;
+  });
+  const unknown = usable.length - readable.length;
   if (usable.length > 0) {
     return {
       cannotServe: false,
@@ -210,7 +215,9 @@ export function assessOutage(
       earliestUsableAt: null,
       earliestUsableSlot: null,
       unknownReason: null,
-      reason: `${usable.length} of ${per.length} account(s) still have headroom (${usable.map((o) => o.slot).join(", ")})`,
+      reason: readable.length > 0
+        ? `${readable.length} of ${per.length} account(s) still have headroom (${readable.map(o => o.slot).join(", ")})${unknown ? `; ${unknown} unknown` : ""}`
+        : `${unknown} account(s) have unknown capacity — no readable free window` ,
       accounts: per,
     };
   }

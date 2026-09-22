@@ -95,3 +95,13 @@ test('the current provider OAuth failure outranks an older system limit error',a
     assert.equal(reads,0);
   } finally {await harness.lifecycle.dispose();}
 });
+
+test('outage CLI never announces free capacity when every quota is unreadable',async()=>{
+  const {bb,harness}=createFakePluginHost({pluginId:'accounts'});
+  try {
+    await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:Date.now()/1000,accounts:[{...account,fiveHour:null,sevenDay:null,error:'reauthentication required'}]}),readCodexSnapshot:async()=>unknownCodex()});
+    const result=await harness.behavior.runCli(['outage']);
+    assert.match(result.stdout!,/UNKNOWN|unknown/);
+    assert.doesNotMatch(result.stdout!,/at least one account has a free window|live\s+usable/);
+  } finally {await harness.lifecycle.dispose();}
+});

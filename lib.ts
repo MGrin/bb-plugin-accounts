@@ -55,7 +55,7 @@ const FIVE_WALL = 100;
 export function hasFreeWindow(a: AccountUsage, weeklyAt: number = WEEKLY_AT): boolean | null {
   if (a.fiveHour === null) return null;
   if (a.fiveHour >= FIVE_WALL) return false;
-  return (a.sevenDay ?? 0) < weeklyAt;
+  return a.sevenDay === null ? null : a.sevenDay < weeklyAt;
 }
 
 /**
