@@ -438,6 +438,10 @@ export interface LimitFailureSignal {
  * killed the thread, and treating them as limit evidence would track every
  * ENOENT on the machine.
  */
+export function isAuthenticationError(error: string | null | undefined): boolean {
+  return typeof error === "string" && /OAuth (?:session expired|token (?:has expired|is no longer valid))|(?:refresh token|token refresh).*(?:expired|revoked|invalid)|Failed to authenticate/i.test(error);
+}
+
 export function isLimitFailure(signal: LimitFailureSignal): boolean {
   if (isLimitError(signal.error)) return true;
   return signal.rateLimitStatus === "blocked";
