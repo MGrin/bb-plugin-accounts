@@ -115,3 +115,35 @@ test("Jev spend rides its own rpc and CLI verb; telemetry keeps version 1 and ga
     assert.equal(blind.exitCode, 0, "a report, not a gate: README, Provider-scoped telemetry"); assert.match(blind.stdout!, /UNKNOWN · mx not found/); assert.doesNotMatch(blind.stdout!, /\$/);
   } finally { await harness.lifecycle.dispose(); }
 });
+
+// MX-1226: `bb plugin list` read `accounts running (rpc status failed: rpc result at
+// $result.accounts[0].error is not a JSON value (undefined))`. `error` and `authState` are
+// optional in the contract, and zod accepts undefined — but the RPC wire does not: a key
+// PRESENT with an undefined value is not JSON, and the real usage cache always set both
+// keys. Claude's whole panel was dead.
+test("status serialises accounts as JSON even when the optional fields are absent", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as unknown as Parameters<typeof plugin>[0], {
+      // Exactly the shape readUsageCache builds for an account with no error: the keys
+      // exist and hold undefined.
+      readClaudeUsage: async () => ({
+        polledAt: 1_700_000_000,
+        accounts: [{
+          error: undefined, authState: undefined,
+          slot: "one", email: "a@example.com", active: true,
+          fiveHour: 12, sevenDay: 34, fiveHourResetsAt: null, sevenDayResetsAt: null,
+          credits: "on" as const, creditSpend: null,
+        }],
+      }),
+      readCodexSnapshot: async () => unknownCodex(),
+    });
+    const status = await harness.behavior.callRpc("status", null) as any;
+    assert.equal(status.accounts.length, 1);
+    // The daemon's own test: every value must survive a JSON round trip. A key holding
+    // undefined vanishes, so this reds on exactly the payload that broke the panel.
+    assert.deepStrictEqual(status, JSON.parse(JSON.stringify(status)));
+    // Positive control: a real error still reaches the reader.
+    assert.equal(status.accounts[0].email, "a@example.com");
+  } finally { await harness.lifecycle.dispose(); }
+});
