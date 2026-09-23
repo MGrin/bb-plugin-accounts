@@ -319,14 +319,28 @@ function creditSpendOf(a: RawAccount): CreditSpend | null {
   };
 }
 
+/**
+ * An optional field is OMITTED when it has nothing to say, never present holding
+ * `undefined` (MX-1226).
+ *
+ * zod's `.optional()` accepts `undefined`, so the contract validated and every test
+ * passed — but the RPC wire refuses it: `rpc result at $result.accounts[0].error is not a
+ * JSON value (undefined)` is what `bb plugin list` printed for a Claude account with no
+ * error, which is most of them. Claude's entire panel was dead while Codex's rendered,
+ * because Codex's path never set the key at all.
+ */
+function optional<T>(value: T | undefined, key: string): Record<string, T> {
+  return value === undefined ? {} : { [key]: value };
+}
+
 async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Account[] }> {
   try {
     const raw = JSON.parse(await readFile(USAGE, "utf8")) as RawUsage;
     return {
       polledAt: raw.polledAt ?? null,
       accounts: (raw.accounts ?? []).map((a) => ({
-        error: a.error,
-        authState: a.authState,
+        ...optional(a.error, "error"),
+        ...optional(a.authState, "authState"),
         slot: a.slot,
         email: a.email,
         active: a.active,
@@ -1436,13 +1450,22 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       // where a second readUsage() let the verdict and the account list come
       // from different polls and disagree on screen.
       const { polledAt, accounts } = await readUsage();
+      // The wire, not the schema, is the boundary that broke (MX-1226). `readUsage` is
+      // injectable, so fixing only the cache reader leaves the same trap for the next
+      // source; an optional field with nothing to say is dropped here for every one of
+      // them.
+      const wireSafe = accounts.map(({ error, authState, ...rest }) => ({
+        ...rest,
+        ...optional(error, "error"),
+        ...optional(authState, "authState"),
+      }));
       const { weeklyAt } = await settings.get();
       const lastSwitch =
         (await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch")) ?? null;
       return {
         polledAt,
         stale: await isStale(polledAt),
-        accounts,
+        accounts: wireSafe,
         capacity: await capacityOf(polledAt, accounts, Number(weeklyAt)),
         lastSwitch,
       };
