@@ -21,7 +21,13 @@ export function JevCard({ spend, failed, now }: { spend: JevSpend | null; failed
   const status = failed ? "UNKNOWN — Jev usage could not be refreshed" : !spend ? "Loading Jev usage…" :
     spend.state === "unknown" ? `UNKNOWN — ${spend.reason}` : spend.state === "no-data" ? `No data — ${spend.reason}` : null;
   const s = !failed && spend?.state === "ok" ? spend : null;
-  if (!s) return <div className="space-y-2"><p className="text-xs text-muted-foreground">{status}</p></div>;
+  // The caveat stays on screen in EVERY state, including the ones with no numbers: a
+  // reader who arrives during an outage must still learn that these counts are one key's,
+  // not the bill. Two lines, so the collapsed card is still within its budget.
+  if (!s) return <div className="space-y-1">
+    <p className="text-xs text-muted-foreground">{status}</p>
+    <p className="text-xs text-muted-foreground">Covers {spend?.covers ?? JEV_COVERS}.</p>
+  </div>;
   return <div className="space-y-1">
     {/* 1. the bill — the only dollar figure, and it says where it came from. */}
     <div className="text-sm tabular-nums text-foreground">

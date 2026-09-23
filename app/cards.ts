@@ -32,16 +32,23 @@ export function claudeCards(status: Status | null, nowMs: number): CardAccount[]
       { label: "5h", usedPercent: a.fiveHour, resetsAt: null, resetText: resetTextFromIso(a.fiveHourResetsAt, nowMs) },
       { label: "7d", usedPercent: a.sevenDay, resetsAt: null, resetText: resetTextFromIso(a.sevenDayResetsAt, nowMs) },
     ];
-    const unreadable = status.stale || windows.every((w) => w.usedPercent === null);
+    // A login that expired is its own answer: not spent, not merely stale. It was read by
+    // the server and shown nowhere before MX-1226.
+    const needsLogin = a.authState === "reauth-required";
+    const unreadable = needsLogin || Boolean(a.error) || status.stale || windows.every((w) => w.usedPercent === null);
     return {
       provider: "Claude" as const,
       label: a.email || "Claude account (identity unavailable)",
       active: a.active,
       state: unreadable ? "unreadable" : windows.some(spent) ? "walled" : "ok",
       stateNote: unreadable
-        ? status.stale
-          ? "poll is stale"
-          : "no window was read"
+        ? needsLogin
+          ? "needs re-login"
+          : a.error
+            ? a.error.slice(0, 60)
+            : status.stale
+              ? "poll is stale"
+              : "no window was read"
         : windows.some(spent)
           ? `${windows.filter(spent).map((w) => w.label).join(" and ")} spent`
           : null,

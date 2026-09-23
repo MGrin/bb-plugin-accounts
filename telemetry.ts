@@ -199,12 +199,22 @@ export const jevSpendShape = z.object({
   billing: jevBillingShape.nullable(),
   covers: z.string(),
   windows: z.array(jevCountsShape.extend({ name: z.string(), since: z.number(), bySet: z.array(jevCountsShape.extend({ set: z.string() })) })),
+  /**
+   * Compaction spend, from the fast-jev-compaction plugin's own log (MX-1226).
+   *
+   * `mx jev usage` has always returned this and the server dropped it, so the page showed
+   * 2.08M input tokens for a 24h window in which compaction alone spent 4.93M. The caveat
+   * under the windows even said it "is reported apart, under `compaction`" — and then the
+   * page reported it nowhere. Null when the plugin's log is absent or unreadable: that is
+   * NOT zero compaction.
+   */
+  compaction: z.array(jevCountsShape.extend({ name: z.string(), compactions: z.number(), jevRequests: z.number() })).nullable(),
 });
 export type JevSpend = z.infer<typeof jevSpendShape>;
 export const JEV_WINDOWS = ["24h", "7d", "30d"] as const;
 
 export function unknownJev(reason: string): JevSpend {
-  return { state: "unknown", reason, generatedAt: null, lastDecisionAt: null, billing: null, covers: JEV_COVERS, windows: [] };
+  return { state: "unknown", reason, generatedAt: null, lastDecisionAt: null, billing: null, covers: JEV_COVERS, windows: [], compaction: null };
 }
 
 const nonNegative = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
@@ -217,6 +227,23 @@ const jevBilling = (value: unknown): JevSpend["billing"] => {
   if (!nonNegative(b.amount_usd) || recordedAt === null || typeof b.period !== "string" || typeof b.source !== "string") return null;
   return { amountUsd: b.amount_usd, recordedAt, period: b.period.slice(0, 80), source: b.source.slice(0, 200),
     asOf: typeof b.as_of === "string" ? b.as_of.slice(0, 80) : null };
+};
+
+/**
+ * Compaction windows, or null. Null means "the plugin's log could not be read", which must
+ * not render as zero spend — the same three-state rule the rest of this file obeys.
+ */
+const jevCompaction = (value: unknown): JevSpend["compaction"] => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const c = value as Record<string, unknown>;
+  if (c.readable !== true || !Array.isArray(c.windows)) return null;
+  const out = c.windows.slice(0, 8).map(object).flatMap(w => {
+    const counts = nonNegative(w.input_tokens) ? { calls: 0, inputTokens: w.input_tokens } : null;
+    const name = word(w.name);
+    if (!counts || !name || !nonNegative(w.compactions) || !nonNegative(w.jev_requests)) return [];
+    return [{ name, ...counts, compactions: w.compactions, jevRequests: w.jev_requests }];
+  });
+  return out.length ? out : null;
 };
 
 export function normalizeJev(value: unknown, _now: number): JevSpend {
@@ -242,7 +269,7 @@ export function normalizeJev(value: unknown, _now: number): JevSpend {
     });
     windows.push({ name, since: since as number, ...counts, bySet });
   }
-  return { ...out, state: "ok", reason: "calls and tokens from mx jev usage", lastDecisionAt, windows };
+  return { ...out, state: "ok", reason: "calls and tokens from mx jev usage", lastDecisionAt, windows, compaction: jevCompaction(v.compaction) };
 }
 
 /** "3m", "5h", "2d" — the same buckets mx prints, so the page and the CLI read alike. */
