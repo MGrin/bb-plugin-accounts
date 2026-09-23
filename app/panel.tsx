@@ -14,8 +14,7 @@ import { useEffect, useState } from "react";
 import { useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
 import { BarList, Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
-import { JevSpendSection, ProviderTelemetry } from "./providers.tsx";
-import { CurrentUsage } from "./current.tsx";
+import { SubscriptionsSection } from "./subscriptions.tsx";
 import { clock } from "./format.ts";
 import { Section } from "./ui.tsx";
 
@@ -176,9 +175,9 @@ export function UsagePanel() {
 
       {/* Current usage FIRST: it is the daily question ('can I start this now'),
           the forecast is the occasional one. */}
-      <ProviderTelemetry />
-      <CurrentUsage />
-      <JevSpendSection />
+      <Section title="Subscriptions" hint="Every provider, same card: Claude and Codex windows, then the Jev bill.">
+        <SubscriptionsSection />
+      </Section>
 
       <ForecastSection fc={fc} />
 

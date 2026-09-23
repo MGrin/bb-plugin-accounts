@@ -34,6 +34,10 @@ export type Status = {
   accounts: {
     slot: string;
     email: string;
+    /** Present only when the poll failed for THIS account (MX-1226: never shown before). */
+    error?: string;
+    /** `reauth-required` means the account needs a login, not that it is spent (MX-1226). */
+    authState?: "ok" | "unknown" | "reauth-required";
     active: boolean;
     fiveHour: number | null;
     sevenDay: number | null;
