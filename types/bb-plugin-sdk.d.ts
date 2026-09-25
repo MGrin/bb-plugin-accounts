@@ -9,6 +9,7 @@ import * as react from 'react';
 import { ComponentType, ComponentPropsWithoutRef, CSSProperties, ReactNode } from 'react';
 import * as z from 'zod';
 import { z as z$1 } from 'zod';
+import * as zod_v4_core from 'zod/v4/core';
 import { StandardSchemaV1 as StandardSchemaV1$1, StandardSchemaV1InferOutput as StandardSchemaV1InferOutput$1, PluginMachineValidateDecision as PluginMachineValidateDecision$1, JsonValue as JsonValue$2, PluginEnvironmentProviderRequirements as PluginEnvironmentProviderRequirements$1, PluginEnvironmentValidateDecision as PluginEnvironmentValidateDecision$1 } from '@get-bb/plugin-sdk';
 import Database from 'better-sqlite3';
 import { Context } from 'hono';
@@ -82,7 +83,7 @@ declare const appSettingsUpdateSchema: z$1.ZodUnion<readonly [z$1.ZodObject<{
 }, z$1.core.$strict>]>;
 type AppSettingsUpdate = z$1.infer<typeof appSettingsUpdateSchema>;
 
-declare const UI_PREFERENCE_KEYS: readonly ["sidebar.organizationMode", "sidebar.chronologicalSort", "sidebar.sortDirection", "sidebar.sectionOrder", "sidebar.manualSectionOrder", "sidebar.machineSectionOrder", "sidebar.collapsedSections", "sidebar.collapsedProjects", "sidebar.collapsedThreads", "sidebar.collapsedEnvironments", "sidebar.collapsedThreadSections", "sidebar.collapsedMachines", "sidebar.pluginPanelOrder", "sidebar.visiblePluginPanels", "sidebar.navigationProvider", "sidebar.threadListProvider"];
+declare const UI_PREFERENCE_KEYS: readonly ["sidebar.organizationMode", "sidebar.chronologicalSort", "sidebar.sortDirection", "sidebar.sectionOrder", "sidebar.manualSectionOrder", "sidebar.machineSectionOrder", "sidebar.collapsedSections", "sidebar.collapsedProjects", "sidebar.collapsedThreads", "sidebar.collapsedEnvironments", "sidebar.collapsedThreadSections", "sidebar.collapsedMachines", "sidebar.footerOrder", "sidebar.hiddenFooterItems", "sidebar.pluginPanelOrder", "sidebar.visiblePluginPanels", "sidebar.navigationProvider", "sidebar.threadListProvider"];
 type UiPreferenceKey = (typeof UI_PREFERENCE_KEYS)[number];
 interface UiPreferenceDefinition<Schema extends z$1.ZodTypeAny = z$1.ZodTypeAny> {
     schema: Schema;
@@ -118,6 +119,8 @@ declare const uiPreferenceDefinitions: {
     readonly "sidebar.collapsedEnvironments": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
     readonly "sidebar.collapsedThreadSections": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
     readonly "sidebar.collapsedMachines": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
+    readonly "sidebar.footerOrder": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
+    readonly "sidebar.hiddenFooterItems": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
     readonly "sidebar.pluginPanelOrder": UiPreferenceDefinition<z$1.ZodArray<z$1.ZodString>>;
     readonly "sidebar.visiblePluginPanels": UiPreferenceDefinition<z$1.ZodNullable<z$1.ZodArray<z$1.ZodString>>>;
     readonly "sidebar.navigationProvider": UiPreferenceDefinition<z$1.ZodString>;
@@ -2565,6 +2568,32 @@ declare const threadEventSchema: z$1.ZodPipe<z$1.ZodUnknown, z$1.ZodUnion<readon
     contextWindowUsage: z$1.ZodObject<{
         estimated: z$1.ZodBoolean;
         modelContextWindow: z$1.ZodNullable<z$1.ZodNumber>;
+        snapshot: z$1.ZodOptional<z$1.ZodObject<{
+            autoCompactAtTokens: z$1.ZodNullable<z$1.ZodNumber>;
+            capturedAt: z$1.ZodISODateTime;
+            categories: z$1.ZodArray<z$1.ZodObject<{
+                entries: z$1.ZodArray<z$1.ZodObject<{
+                    id: z$1.ZodString;
+                    label: z$1.ZodString;
+                    tokens: z$1.ZodNumber;
+                }, z$1.core.$strip>>;
+                id: z$1.ZodString;
+                kind: z$1.ZodEnum<{
+                    deferred: "deferred";
+                    free: "free";
+                    reserved: "reserved";
+                    used: "used";
+                }>;
+                label: z$1.ZodString;
+                tokens: z$1.ZodNumber;
+            }, z$1.core.$strip>>;
+            contextWindowTokens: z$1.ZodNumber;
+            estimated: z$1.ZodBoolean;
+            model: z$1.ZodString;
+            providerSessionId: z$1.ZodString;
+            providerTurnId: z$1.ZodNullable<z$1.ZodString>;
+            usedTokens: z$1.ZodNumber;
+        }, z$1.core.$strip>>;
         usedTokens: z$1.ZodNullable<z$1.ZodNumber>;
     }, z$1.core.$strip>;
     providerThreadId: z$1.ZodString;
@@ -3702,6 +3731,8 @@ declare const pluginPendingInteractionSchema: z$1.ZodObject<{
 type PluginPendingInteraction = z$1.infer<typeof pluginPendingInteractionSchema>;
 type PendingInteraction = ProviderPendingInteraction | PluginPendingInteraction;
 
+declare const pluginMetadataSchema: z.ZodType<JsonObject, unknown, zod_v4_core.$ZodTypeInternals<JsonObject, unknown>>;
+
 declare const projectSchema: z$1.ZodObject<{
     createdAt: z$1.ZodNumber;
     gitRemoteUrl: z$1.ZodNullable<z$1.ZodString>;
@@ -4188,6 +4219,41 @@ declare const threadQueuedMessageSchema: z$1.ZodObject<{
     }, z$1.core.$strip>], "kind">>;
 }, z$1.core.$strip>;
 type ThreadQueuedMessage = z$1.infer<typeof threadQueuedMessageSchema>;
+
+declare const threadContextResponseSchema: z$1.ZodObject<{
+    usage: z$1.ZodNullable<z$1.ZodObject<{
+        estimated: z$1.ZodBoolean;
+        modelContextWindow: z$1.ZodNumber;
+        snapshot: z$1.ZodOptional<z$1.ZodObject<{
+            autoCompactAtTokens: z$1.ZodNullable<z$1.ZodNumber>;
+            capturedAt: z$1.ZodISODateTime;
+            categories: z$1.ZodArray<z$1.ZodObject<{
+                entries: z$1.ZodArray<z$1.ZodObject<{
+                    id: z$1.ZodString;
+                    label: z$1.ZodString;
+                    tokens: z$1.ZodNumber;
+                }, z$1.core.$strip>>;
+                id: z$1.ZodString;
+                kind: z$1.ZodEnum<{
+                    deferred: "deferred";
+                    free: "free";
+                    reserved: "reserved";
+                    used: "used";
+                }>;
+                label: z$1.ZodString;
+                tokens: z$1.ZodNumber;
+            }, z$1.core.$strip>>;
+            contextWindowTokens: z$1.ZodNumber;
+            estimated: z$1.ZodBoolean;
+            model: z$1.ZodString;
+            providerSessionId: z$1.ZodString;
+            providerTurnId: z$1.ZodNullable<z$1.ZodString>;
+            usedTokens: z$1.ZodNumber;
+        }, z$1.core.$strip>>;
+        usedTokens: z$1.ZodNumber;
+    }, z$1.core.$strip>>;
+}, z$1.core.$strip>;
+type ThreadContextResponse = z$1.infer<typeof threadContextResponseSchema>;
 
 declare const createThreadEnvironmentArgsSchema: z$1.ZodDiscriminatedUnion<[z$1.ZodObject<{
     environmentId: z$1.ZodString;
@@ -6938,6 +7004,21 @@ declare const hostDaemonCommandRegistry: {
         type: z$1.ZodLiteral<"interactive.resolve">;
     }, z$1.core.$strict>, z$1.ZodObject<{}, z$1.core.$strip>, "settled", false>;
     "environment.attach": HostDaemonCommandDescriptor<"environment.attach", z$1.ZodObject<{
+        contributedEnv: z$1.ZodArray<z$1.ZodObject<{
+            name: z$1.ZodString;
+            reason: z$1.ZodString;
+            source: z$1.ZodUnion<readonly [z$1.ZodObject<{
+                plugin: z$1.ZodString;
+            }, z$1.core.$strict>, z$1.ZodObject<{
+                core: z$1.ZodEnum<{
+                    "machine-environment": "machine-environment";
+                    "machine-git": "machine-git";
+                }>;
+            }, z$1.core.$strict>]>;
+            value: z$1.ZodUnion<readonly [z$1.ZodString, z$1.ZodObject<{
+                serverPath: z$1.ZodString;
+            }, z$1.core.$strict>]>;
+        }, z$1.core.$strict>>;
         environmentId: z$1.ZodString;
         initiator: z$1.ZodNullable<z$1.ZodObject<{
             provisioningId: z$1.ZodString;
@@ -11409,6 +11490,7 @@ declare const createThreadRequestSchema: z$1.ZodObject<{
         auto: "auto";
         full: "full";
     }>, z$1.ZodLiteral<"workspace-write">]>, z$1.ZodTransform<"accept-edits" | "auto" | "full", "accept-edits" | "auto" | "full" | "workspace-write">>>;
+    pluginMetadata: z$1.ZodOptional<z$1.ZodType<JsonObject, unknown, z$1.core.$ZodTypeInternals<JsonObject, unknown>>>;
     projectId: z$1.ZodString;
     providerId: z$1.ZodOptional<z$1.ZodString>;
     reasoningLevel: z$1.ZodOptional<z$1.ZodEnum<{
@@ -11662,6 +11744,7 @@ declare const forkThreadRequestSchema: z$1.ZodObject<{
         auto: "auto";
         full: "full";
     }>, z$1.ZodLiteral<"workspace-write">]>, z$1.ZodTransform<"accept-edits" | "auto" | "full", "accept-edits" | "auto" | "full" | "workspace-write">>>;
+    pluginMetadata: z$1.ZodOptional<z$1.ZodType<JsonObject, unknown, z$1.core.$ZodTypeInternals<JsonObject, unknown>>>;
     sourceSeqEnd: z$1.ZodOptional<z$1.ZodNumber>;
     sourceThreadId: z$1.ZodString;
     title: z$1.ZodOptional<z$1.ZodString>;
@@ -12834,6 +12917,7 @@ declare const threadGetQuerySchema: z$1.ZodObject<{
     include: z$1.ZodOptional<z$1.ZodString>;
 }, z$1.core.$strip>;
 type ThreadGetQuery = z$1.infer<typeof threadGetQuerySchema>;
+type ThreadPluginMetadataResponse = z$1.infer<typeof pluginMetadataSchema>;
 declare const threadWithIncludesResponseSchema: z$1.ZodObject<{
     activeBackgroundAgentCount: z$1.ZodNumber;
     archivedAt: z$1.ZodNullable<z$1.ZodNumber>;
@@ -13792,6 +13876,32 @@ declare const threadTimelineResponseSchema: z$1.ZodObject<{
     contextWindowUsage: z$1.ZodOptional<z$1.ZodObject<{
         estimated: z$1.ZodBoolean;
         modelContextWindow: z$1.ZodNumber;
+        snapshot: z$1.ZodOptional<z$1.ZodObject<{
+            autoCompactAtTokens: z$1.ZodNullable<z$1.ZodNumber>;
+            capturedAt: z$1.ZodISODateTime;
+            categories: z$1.ZodArray<z$1.ZodObject<{
+                entries: z$1.ZodArray<z$1.ZodObject<{
+                    id: z$1.ZodString;
+                    label: z$1.ZodString;
+                    tokens: z$1.ZodNumber;
+                }, z$1.core.$strip>>;
+                id: z$1.ZodString;
+                kind: z$1.ZodEnum<{
+                    deferred: "deferred";
+                    free: "free";
+                    reserved: "reserved";
+                    used: "used";
+                }>;
+                label: z$1.ZodString;
+                tokens: z$1.ZodNumber;
+            }, z$1.core.$strip>>;
+            contextWindowTokens: z$1.ZodNumber;
+            estimated: z$1.ZodBoolean;
+            model: z$1.ZodString;
+            providerSessionId: z$1.ZodString;
+            providerTurnId: z$1.ZodNullable<z$1.ZodString>;
+            usedTokens: z$1.ZodNumber;
+        }, z$1.core.$strip>>;
         usedTokens: z$1.ZodNumber;
     }, z$1.core.$strip>>;
     delta: z$1.ZodOptional<z$1.ZodObject<{
@@ -14311,6 +14421,14 @@ type MachineEnvironmentList = z$1.infer<typeof machineEnvironmentListSchema>;
  */
 type JsonValue = string | number | boolean | null | JsonValue[] | {
     [key: string]: JsonValue;
+};
+/**
+ * A `JsonValue` that is read-only at every depth. BB uses it for JSON
+ * snapshots it deep-freezes before handing them to a plugin, where any write
+ * throws at runtime.
+ */
+type ReadonlyJsonValue = string | number | boolean | null | readonly ReadonlyJsonValue[] | {
+    readonly [key: string]: ReadonlyJsonValue;
 };
 
 /** A JSON-safe path segment reported by a Standard Schema validation issue. */
@@ -18046,6 +18164,7 @@ interface ThreadOutputResponse {
     output: string | null;
 }
 type ThreadMutationResult = ThreadResponse;
+type ThreadPluginMetadataResult = ThreadPluginMetadataResponse;
 type ThreadSpawnResult = ThreadResponse;
 type ThreadForkResult = ThreadResponse;
 type ThreadInteractionGetResult = PendingInteraction;
@@ -18055,6 +18174,7 @@ type ThreadInteractionRespondResult = PendingInteraction;
 type ThreadInteractionCancelResult = PendingInteraction;
 type ThreadEventsListResult = ThreadEventRow[];
 type ThreadEventWaitResult = ThreadEventRow | null;
+type ThreadContextResult = ThreadContextResponse;
 type ThreadTimelineResult = ThreadTimelineResponse;
 type ThreadArchiveResult = ThreadArchiveAllResponse;
 type ThreadOpenResult = ThreadOpenResponse;
@@ -18119,6 +18239,18 @@ interface ThreadForkArgs extends Omit<ForkThreadRequest, "origin" | "visibility"
 interface ThreadUpdateArgs extends UpdateThreadRequest {
     threadId: string;
 }
+interface ThreadPluginMetadataArgs {
+    pluginId: string;
+    signal?: AbortSignal;
+    threadId: string;
+}
+interface ThreadPluginMetadataUpdateArgs {
+    threadId: string;
+    pluginId: string;
+    set?: JsonObject;
+    remove?: string[];
+    signal?: AbortSignal;
+}
 interface ThreadDeleteArgs extends DeleteThreadRequest {
     threadId: string;
 }
@@ -18145,6 +18277,7 @@ interface ThreadRetryArgs {
     reason?: string;
 }
 interface ThreadActionArgs {
+    signal?: AbortSignal;
     threadId: string;
 }
 interface ThreadStatusArgs extends ThreadActionArgs {
@@ -18335,6 +18468,8 @@ interface ThreadsArea {
     events: ThreadEventsArea;
     fork(args: ThreadForkArgs): Promise<ThreadForkResult>;
     get(args: ThreadGetArgs): Promise<ThreadGetResult>;
+    getPluginMetadata(args: ThreadPluginMetadataArgs): Promise<ThreadPluginMetadataResult>;
+    updatePluginMetadata(args: ThreadPluginMetadataUpdateArgs): Promise<ThreadPluginMetadataResult>;
     queue: ThreadQueueArea;
     interactions: ThreadInteractionsArea;
     list(args?: ThreadListArgs): Promise<ThreadListResult>;
@@ -18362,6 +18497,7 @@ interface ThreadsArea {
     spawn(args: ThreadSpawnArgs): Promise<ThreadSpawnResult>;
     stop(args: ThreadActionArgs): Promise<ThreadStopResult>;
     tabs: ThreadTabsArea;
+    context(args: ThreadStatusArgs): Promise<ThreadContextResult>;
     timeline(args: ThreadTimelineArgs): Promise<ThreadTimelineResult>;
     timelineTurnSummaryDetails(args: ThreadTimelineTurnSummaryDetailsArgs): Promise<ThreadTimelineTurnSummaryDetailsResult>;
     storageFiles(args: ThreadStorageFilesArgs): Promise<ThreadStorageFilesResult>;
@@ -19388,6 +19524,15 @@ interface PluginAgentToolRegistrationBase {
 }
 /** Stable, plain-data context resolved by the server for one agent session. */
 interface PluginAgentConfigurationContext {
+    /**
+     * The thread's metadata stored under this plugin's id, or `{}` when absent,
+     * as a deep-frozen snapshot for this configure call. Any API client, another
+     * plugin, or the thread's own agent can write it; treat values as untrusted,
+     * and quote or escape any value you put into returned instructions.
+     */
+    readonly pluginMetadata: {
+        readonly [key: string]: ReadonlyJsonValue;
+    };
     thread: {
         id: string;
         title: string | null;
@@ -20074,6 +20219,25 @@ interface PluginStatusApi {
     needsConfiguration(message: string): void;
 }
 /**
+ * The BB SDK bound to one plugin (`bb.sdk`). `threads.getPluginMetadata` and
+ * `threads.updatePluginMetadata` default `pluginId` to that plugin's id. An
+ * explicit `pluginId` must be a plugin id (lowercase letters, digits, and
+ * dashes) or the request fails with HTTP 400. A `pluginMetadata` seed or a
+ * `set` that is over 256 KiB on its own rejects before any request is sent. A
+ * patch whose merged namespace would exceed 256 KiB fails with HTTP 413 and
+ * leaves the namespace unchanged.
+ */
+type PluginBbSdk = Omit<BbSdk, "threads"> & {
+    threads: Omit<BbSdk["threads"], "getPluginMetadata" | "updatePluginMetadata"> & {
+        getPluginMetadata(args: Omit<ThreadPluginMetadataArgs, "pluginId"> & {
+            pluginId?: string;
+        }): Promise<ThreadPluginMetadataResult>;
+        updatePluginMetadata(args: Omit<ThreadPluginMetadataUpdateArgs, "pluginId"> & {
+            pluginId?: string;
+        }): Promise<ThreadPluginMetadataResult>;
+    };
+};
+/**
  * The API object handed to a plugin's factory (design §4). Implemented by
  * the BB server; this contract is what plugin `server.ts` files compile
  * against.
@@ -20141,10 +20305,12 @@ interface BbPluginApi {
      * server binds it before loading plugins, so it is available from the
      * moment factories run there — but isolated harnesses may not, so prefer
      * using it from handlers, services, and timers for portability.
-     * `threads.spawn` defaults `origin` to "plugin" and `originPluginId` to
-     * this plugin's id so spawned threads are attributed automatically.
+     * `threads.spawn` and `threads.fork` default `origin` to "plugin" and, for
+     * that origin, `originPluginId` to this plugin's id unless you set them.
+     * Seeding `pluginMetadata` always attributes the new thread to this plugin,
+     * overriding an explicit `origin` or `originPluginId`.
      */
-    readonly sdk: BbSdk;
+    readonly sdk: PluginBbSdk;
     /**
      * Register cleanup to run on reload/disable/shutdown. Hooks run LIFO.
      * The sanctioned place to clear timers and close connections.
@@ -20153,4 +20319,4 @@ interface BbPluginApi {
 }
 
 export { PLUGIN_CLI_OUTPUT_MAX_BYTES, defineRpcContract, experimental_defineHostEntry };
-export type { BbContext, BbNavigate, BbPluginApi, BranchPickerProps, BranchesState, CheckoutState, CodeOverflowMode, ComposerCustomization, ComposerPlusMenuItem, ComposerRichTextSpec, ComposerStructuredDraft, ComposerView, DiffProps, DiffViewMode, ExperimentalAppIcons, ExperimentalAppOverlayProps, ExperimentalAppOverlayRegistration, ExperimentalAppPanel, ExperimentalAppPanelSurface, ExperimentalComposerSubmitOptions, ExperimentalDesktopBrowserAcquireInput, ExperimentalDesktopBrowserCreateInput, ExperimentalDesktopBrowserLease, ExperimentalDesktopBrowserScope, ExperimentalDesktopBrowsersArea, ExperimentalDiffFileContent, ExperimentalDiffFullFileContents, ExperimentalFileLinkProps, ExperimentalFileLocation, ExperimentalFileOpenOptions, ExperimentalFixedTabTargetContract, ExperimentalFixedTabTargetState, ExperimentalHostCallOptions, ExperimentalHostClient, ExperimentalHostEntry, ExperimentalHostPaths, ExperimentalHostRpcContext, ExperimentalHostRpcHandlers, ExperimentalHostSignalContract, ExperimentalHostSignalEvent, ExperimentalHostSignals, ExperimentalHostWatchChange, ExperimentalHostWatchChangeType, ExperimentalHostWatchEvent, ExperimentalHostWatchListener, ExperimentalHostWatchOptions, ExperimentalHostWatchSubscription, ExperimentalHostWorkerLease, ExperimentalIconProps, ExperimentalIconRegistration, ExperimentalLiveFileTarget, ExperimentalOpenFixedTabOptions, ExperimentalPermissionModePickerProps, ExperimentalPluginFixedTabReference, ExperimentalPluginProviderEnvContext, ExperimentalPluginProviderEnvEntry, ExperimentalPluginProviderEnvHealth, ExperimentalPluginProviderEnvHealthContext, ExperimentalPluginWebSocket, ExperimentalPluginWebSocketContext, ExperimentalPluginWebSocketHandler, ExperimentalPluginWebSocketHandlers, ExperimentalProviderIconProps, ExperimentalProviderModelPickerProps, ExperimentalProviderModelPickerRouting, ExperimentalProviderModelPickerValue, ExperimentalSidebarFooter, ExperimentalSidebarFooterActionContext, ExperimentalSidebarFooterActionRegistration, ExperimentalSidebarFooterDisclosureController, ExperimentalSidebarFooterDisclosureProps, ExperimentalSidebarFooterDisclosureRegistration, ExperimentalSidebarFooterItemBase, ExperimentalSidebarFooterItemRegistration, ExperimentalSidebarNavigationAction, ExperimentalSidebarNavigationActivationOptions, ExperimentalSidebarNavigationIcon, ExperimentalSidebarNavigationItem, ExperimentalSidebarNavigationProps, ExperimentalSidebarNavigationRegistration, ExperimentalSidebarNavigationShortcut, JsonValue, MachineBootstrapApi, MachineBootstrapRequest, MachineExecutor, MachineExecutorRequest, MarkdownProps, MessageDispatchHookContext, MessageDispatchHookDecision, NewThreadComposerProps, NewThreadRequest, PluginAgentConfiguration, PluginAgentConfigurationContext, PluginAgentToolContentPart, PluginAgentToolContext, PluginAgentToolLabels, PluginAgentToolPresentation, PluginAgentToolRegistrationBase, PluginAgentToolResult, PluginAgentToolSelection, PluginAgents, PluginAiServiceDeclaration, PluginAiServiceKind, PluginAiServices, PluginAppBuilder, PluginAppComposer, PluginAppContentScripts, PluginAppDefinition, PluginAppSetup, PluginAppSlots, PluginBackground, PluginCli, PluginCliCommandInfo, PluginCliContext, PluginCliExecutionResult, PluginCliOutputLimitError, PluginCliRegistration, PluginCliResult, PluginCodeThemeData, PluginCodeThemeState, PluginCodeThemeTokenRule, PluginCommandPaletteActionContext, PluginCommandPaletteActionRegistration, PluginComposerApi, PluginComposerMention, PluginComposerScope, PluginComposerTextEffect, PluginComposerThreadRowStatus, PluginContentScriptContext, PluginContentScriptDisposer, PluginContentScriptRegistration, PluginDiffRendererProps, PluginDiffRendererRegistration, PluginDispatchAttemptKind, PluginDispatchEnvironmentIntent, PluginDispatchExecution, PluginDispatchExecutionSources, PluginDispatchInput, PluginEnvironmentProviderDeclaration, PluginEnvironmentProviderInputsChange, PluginEnvironmentProviderInputsProps, PluginEnvironmentProviderInputsRegistration, PluginEnvironmentProviderRequirements, PluginEnvironmentValidateDecision, PluginEnvironments, PluginEvents, PluginFileOpenerProps, PluginFileOpenerRegistration, PluginFileOpenerSource, PluginFixedTabDeclaration, PluginFixedTabRegistration, PluginHomepageSectionProps, PluginHomepageSectionRegistration, PluginHookHandler, PluginHookName, PluginHookSignatures, PluginHooks, PluginHosts, PluginHttp, PluginHttpAuthMode, PluginHttpHandler, PluginInteractionCancelReason, PluginInteractionRequest, PluginInteractionResult, PluginKvStorage, PluginLogger, PluginMachineProviderDeclaration, PluginMachineProviderInputsChange, PluginMachineProviderInputsProps, PluginMachineProviderInputsRegistration, PluginMachineValidateDecision, PluginMachines, PluginMentionItem, PluginMentionProviderRegistration, PluginMentionSearchContext, PluginMentionTrigger, PluginMessageActionContext, PluginMessageActionRegistration, PluginMessageDirectiveMessage, PluginMessageDirectiveOpenWorkspaceFile, PluginMessageDirectiveProps, PluginMessageDirectiveRegistration, PluginNavPanelProps, PluginNavPanelRegistration, PluginNewThreadPanelActionContext, PluginNewThreadPanelActionRegistration, PluginNewThreadPanelProps, PluginPanelActionOpenOptions, PluginPendingInteractionProps, PluginPendingInteractionRegistration, PluginPendingInteractionView, PluginProviderCapabilities, PluginProviderComposerAction, PluginProviderDeclaration, PluginProviderExtensionKindDeclaration, PluginProviderFallbackModel, PluginProviderIconRegistration, PluginProviderMaintenance, PluginProviderModelCatalogScope, PluginProviderNativeRootEntry, PluginProviderNativeRoots, PluginProviderOptionDescriptor, PluginProviderOptionsContext, PluginProviderPermissionMode, PluginProviderReasoningLevel, PluginProviderStrings, PluginProviders, PluginProvidersState, PluginRealtime, PluginRealtimeConnectionState, PluginRpc, PluginRpcCallArgs, PluginRpcClient, PluginRpcContract, PluginRpcError, PluginRpcErrorCode, PluginRpcHandlers, PluginRpcIssuePathSegment, PluginRpcMethodContract, PluginRpcResult, PluginRpcValidationIssue, PluginSdkApp, PluginServerAccess, PluginServerApi, PluginSettingDescriptor, PluginSettingDescriptors, PluginSettingValue, PluginSettings, PluginSettingsHandle, PluginSettingsSectionProps, PluginSettingsSectionRegistration, PluginSettingsState, PluginSettingsValues, PluginSharedPortTunnelIdentity, PluginSidebarFooterActionContext, PluginSidebarFooterActionProps, PluginSidebarFooterActionRegistration, PluginSidebarProject, PluginSidebarPullRequest, PluginSidebarSplitPane, PluginSidebarThread, PluginSidebarThreadActions, PluginSidebarThreadActivity, PluginSidebarThreadIndicator, PluginSidebarThreadPullRequestState, PluginSidebarThreadSplit, PluginSidebarThreadsState, PluginSourceCodeRendererProps, PluginSourceCodeRendererRegistration, PluginStatusApi, PluginStorage, PluginTargetedPanelActionOpenOptions, PluginThreadEventHandler, PluginThreadEventName, PluginThreadEventPayloads, PluginThreadHeaderActionProps, PluginThreadHeaderActionRegistration, PluginThreadListProps, PluginThreadListRegistration, PluginThreadPanelActionContext, PluginThreadPanelActionRegistration, PluginThreadPanelProps, PluginTimelineRendererProps, PluginTimelineRendererRegistration, PluginTimelineRendererRow, PluginTimelineRowPresentation, PluginTimelineRowStatus, PluginTurnFailedEvent, PluginUi, ServerAccessGrant, ServerAccessProviderDeclaration, SourceCodeLineRange, SourceCodeProps, StandardSchemaV1, StandardSchemaV1InferInput, StandardSchemaV1InferOutput, StandardSchemaV1Issue, StandardSchemaV1Result, ThreadChatMessageAction, ThreadChatMessageReference, ThreadChatProps, UrlLinkProps, UseBranchesArgs, UseCheckoutStateArgs };
+export type { BbContext, BbNavigate, BbPluginApi, BranchPickerProps, BranchesState, CheckoutState, CodeOverflowMode, ComposerCustomization, ComposerPlusMenuItem, ComposerRichTextSpec, ComposerStructuredDraft, ComposerView, DiffProps, DiffViewMode, ExperimentalAppIcons, ExperimentalAppOverlayProps, ExperimentalAppOverlayRegistration, ExperimentalAppPanel, ExperimentalAppPanelSurface, ExperimentalComposerSubmitOptions, ExperimentalDesktopBrowserAcquireInput, ExperimentalDesktopBrowserCreateInput, ExperimentalDesktopBrowserLease, ExperimentalDesktopBrowserScope, ExperimentalDesktopBrowsersArea, ExperimentalDiffFileContent, ExperimentalDiffFullFileContents, ExperimentalFileLinkProps, ExperimentalFileLocation, ExperimentalFileOpenOptions, ExperimentalFixedTabTargetContract, ExperimentalFixedTabTargetState, ExperimentalHostCallOptions, ExperimentalHostClient, ExperimentalHostEntry, ExperimentalHostPaths, ExperimentalHostRpcContext, ExperimentalHostRpcHandlers, ExperimentalHostSignalContract, ExperimentalHostSignalEvent, ExperimentalHostSignals, ExperimentalHostWatchChange, ExperimentalHostWatchChangeType, ExperimentalHostWatchEvent, ExperimentalHostWatchListener, ExperimentalHostWatchOptions, ExperimentalHostWatchSubscription, ExperimentalHostWorkerLease, ExperimentalIconProps, ExperimentalIconRegistration, ExperimentalLiveFileTarget, ExperimentalOpenFixedTabOptions, ExperimentalPermissionModePickerProps, ExperimentalPluginFixedTabReference, ExperimentalPluginProviderEnvContext, ExperimentalPluginProviderEnvEntry, ExperimentalPluginProviderEnvHealth, ExperimentalPluginProviderEnvHealthContext, ExperimentalPluginWebSocket, ExperimentalPluginWebSocketContext, ExperimentalPluginWebSocketHandler, ExperimentalPluginWebSocketHandlers, ExperimentalProviderIconProps, ExperimentalProviderModelPickerProps, ExperimentalProviderModelPickerRouting, ExperimentalProviderModelPickerValue, ExperimentalSidebarFooter, ExperimentalSidebarFooterActionContext, ExperimentalSidebarFooterActionRegistration, ExperimentalSidebarFooterDisclosureController, ExperimentalSidebarFooterDisclosureProps, ExperimentalSidebarFooterDisclosureRegistration, ExperimentalSidebarFooterItemBase, ExperimentalSidebarFooterItemRegistration, ExperimentalSidebarNavigationAction, ExperimentalSidebarNavigationActivationOptions, ExperimentalSidebarNavigationIcon, ExperimentalSidebarNavigationItem, ExperimentalSidebarNavigationProps, ExperimentalSidebarNavigationRegistration, ExperimentalSidebarNavigationShortcut, JsonValue, MachineBootstrapApi, MachineBootstrapRequest, MachineExecutor, MachineExecutorRequest, MarkdownProps, MessageDispatchHookContext, MessageDispatchHookDecision, NewThreadComposerProps, NewThreadRequest, PluginAgentConfiguration, PluginAgentConfigurationContext, PluginAgentToolContentPart, PluginAgentToolContext, PluginAgentToolLabels, PluginAgentToolPresentation, PluginAgentToolRegistrationBase, PluginAgentToolResult, PluginAgentToolSelection, PluginAgents, PluginAiServiceDeclaration, PluginAiServiceKind, PluginAiServices, PluginAppBuilder, PluginAppComposer, PluginAppContentScripts, PluginAppDefinition, PluginAppSetup, PluginAppSlots, PluginBackground, PluginBbSdk, PluginCli, PluginCliCommandInfo, PluginCliContext, PluginCliExecutionResult, PluginCliOutputLimitError, PluginCliRegistration, PluginCliResult, PluginCodeThemeData, PluginCodeThemeState, PluginCodeThemeTokenRule, PluginCommandPaletteActionContext, PluginCommandPaletteActionRegistration, PluginComposerApi, PluginComposerMention, PluginComposerScope, PluginComposerTextEffect, PluginComposerThreadRowStatus, PluginContentScriptContext, PluginContentScriptDisposer, PluginContentScriptRegistration, PluginDiffRendererProps, PluginDiffRendererRegistration, PluginDispatchAttemptKind, PluginDispatchEnvironmentIntent, PluginDispatchExecution, PluginDispatchExecutionSources, PluginDispatchInput, PluginEnvironmentProviderDeclaration, PluginEnvironmentProviderInputsChange, PluginEnvironmentProviderInputsProps, PluginEnvironmentProviderInputsRegistration, PluginEnvironmentProviderRequirements, PluginEnvironmentValidateDecision, PluginEnvironments, PluginEvents, PluginFileOpenerProps, PluginFileOpenerRegistration, PluginFileOpenerSource, PluginFixedTabDeclaration, PluginFixedTabRegistration, PluginHomepageSectionProps, PluginHomepageSectionRegistration, PluginHookHandler, PluginHookName, PluginHookSignatures, PluginHooks, PluginHosts, PluginHttp, PluginHttpAuthMode, PluginHttpHandler, PluginInteractionCancelReason, PluginInteractionRequest, PluginInteractionResult, PluginKvStorage, PluginLogger, PluginMachineProviderDeclaration, PluginMachineProviderInputsChange, PluginMachineProviderInputsProps, PluginMachineProviderInputsRegistration, PluginMachineValidateDecision, PluginMachines, PluginMentionItem, PluginMentionProviderRegistration, PluginMentionSearchContext, PluginMentionTrigger, PluginMessageActionContext, PluginMessageActionRegistration, PluginMessageDirectiveMessage, PluginMessageDirectiveOpenWorkspaceFile, PluginMessageDirectiveProps, PluginMessageDirectiveRegistration, PluginNavPanelProps, PluginNavPanelRegistration, PluginNewThreadPanelActionContext, PluginNewThreadPanelActionRegistration, PluginNewThreadPanelProps, PluginPanelActionOpenOptions, PluginPendingInteractionProps, PluginPendingInteractionRegistration, PluginPendingInteractionView, PluginProviderCapabilities, PluginProviderComposerAction, PluginProviderDeclaration, PluginProviderExtensionKindDeclaration, PluginProviderFallbackModel, PluginProviderIconRegistration, PluginProviderMaintenance, PluginProviderModelCatalogScope, PluginProviderNativeRootEntry, PluginProviderNativeRoots, PluginProviderOptionDescriptor, PluginProviderOptionsContext, PluginProviderPermissionMode, PluginProviderReasoningLevel, PluginProviderStrings, PluginProviders, PluginProvidersState, PluginRealtime, PluginRealtimeConnectionState, PluginRpc, PluginRpcCallArgs, PluginRpcClient, PluginRpcContract, PluginRpcError, PluginRpcErrorCode, PluginRpcHandlers, PluginRpcIssuePathSegment, PluginRpcMethodContract, PluginRpcResult, PluginRpcValidationIssue, PluginSdkApp, PluginServerAccess, PluginServerApi, PluginSettingDescriptor, PluginSettingDescriptors, PluginSettingValue, PluginSettings, PluginSettingsHandle, PluginSettingsSectionProps, PluginSettingsSectionRegistration, PluginSettingsState, PluginSettingsValues, PluginSharedPortTunnelIdentity, PluginSidebarFooterActionContext, PluginSidebarFooterActionProps, PluginSidebarFooterActionRegistration, PluginSidebarProject, PluginSidebarPullRequest, PluginSidebarSplitPane, PluginSidebarThread, PluginSidebarThreadActions, PluginSidebarThreadActivity, PluginSidebarThreadIndicator, PluginSidebarThreadPullRequestState, PluginSidebarThreadSplit, PluginSidebarThreadsState, PluginSourceCodeRendererProps, PluginSourceCodeRendererRegistration, PluginStatusApi, PluginStorage, PluginTargetedPanelActionOpenOptions, PluginThreadEventHandler, PluginThreadEventName, PluginThreadEventPayloads, PluginThreadHeaderActionProps, PluginThreadHeaderActionRegistration, PluginThreadListProps, PluginThreadListRegistration, PluginThreadPanelActionContext, PluginThreadPanelActionRegistration, PluginThreadPanelProps, PluginTimelineRendererProps, PluginTimelineRendererRegistration, PluginTimelineRendererRow, PluginTimelineRowPresentation, PluginTimelineRowStatus, PluginTurnFailedEvent, PluginUi, ReadonlyJsonValue, ServerAccessGrant, ServerAccessProviderDeclaration, SourceCodeLineRange, SourceCodeProps, StandardSchemaV1, StandardSchemaV1InferInput, StandardSchemaV1InferOutput, StandardSchemaV1Issue, StandardSchemaV1Result, ThreadChatMessageAction, ThreadChatMessageReference, ThreadChatProps, UrlLinkProps, UseBranchesArgs, UseCheckoutStateArgs };
