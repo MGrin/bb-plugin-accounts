@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
 import { agentShape, parseTranscriptLine, prettyProject } from "./transcripts.ts";
 
 /** Shaped from a real record — see the TOP KEYS/MSG KEYS survey in the plan. */
 const REAL = JSON.stringify({
   type: "assistant",
   timestamp: "2026-07-30T05:37:15.869Z",
-  cwd: "/Users/mgrin/Projects/mgrin/bb-plugin-accounts",
+  cwd: "/Users/me/Projects/mgrin/bb-plugin-accounts",
   sessionId: "sess-from-record",
   entrypoint: "sdk-cli",
   isSidechain: false,
@@ -32,7 +33,7 @@ test("parses a real assistant record", () => {
   assert.equal(row.messageId, "msg_01ABC");
   assert.equal(row.ts, Math.floor(Date.parse("2026-07-30T05:37:15.869Z") / 1000));
   assert.equal(row.model, "claude-haiku-4-5-20251001");
-  assert.equal(row.cwd, "/Users/mgrin/Projects/mgrin/bb-plugin-accounts");
+  assert.equal(row.cwd, "/Users/me/Projects/mgrin/bb-plugin-accounts");
   assert.equal(row.project, "proj");
   assert.equal(row.inputTokens, 10);
   assert.equal(row.cacheCreationTokens, 6971);
@@ -152,20 +153,20 @@ test("non-numeric token values are coerced to zero rather than NaN", () => {
 test("prettyProject splits real paths rather than dash-encoded names", () => {
   // The bug this replaced: splitting the encoded directory name on dashes
   // collapsed agentic-brain to "brain" and motion-client-dashboard-ops to "ops".
-  assert.equal(prettyProject("/Users/mgrin/Projects/mgrin/agentic-brain"), "agentic-brain");
+  assert.equal(prettyProject("/Users/me/Projects/mgrin/agentic-brain"), "agentic-brain");
   assert.equal(
-    prettyProject("/Users/mgrin/Projects/flare/motion-client-dashboard-ops"),
+    prettyProject("/Users/me/Projects/flare/motion-client-dashboard-ops"),
     "motion-client-dashboard-ops",
   );
-  assert.equal(prettyProject("/Users/mgrin/Dev/dotfiles"), "dotfiles");
-  assert.equal(prettyProject("/Users/mgrin"), "home");
+  assert.equal(prettyProject("/Users/me/Dev/dotfiles"), "dotfiles");
+  assert.equal(prettyProject(os.homedir()), "home");
   assert.equal(prettyProject(null), "unknown");
 });
 
 test("prettyProject marks bb-managed environments", () => {
-  assert.equal(prettyProject("/Users/mgrin/.bb/worktrees/env_6h83ds4w87/dotfiles"), "bb env: dotfiles");
+  assert.equal(prettyProject("/Users/me/.bb/worktrees/env_6h83ds4w87/dotfiles"), "bb env: dotfiles");
   assert.equal(
-    prettyProject("/Users/mgrin/.bb/personal-workspaces/env_4dcqxu7kgg"),
+    prettyProject("/Users/me/.bb/personal-workspaces/env_4dcqxu7kgg"),
     "bb env: env_4dcqxu7kgg",
   );
 });

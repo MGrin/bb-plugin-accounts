@@ -17,6 +17,9 @@
 // usage, never spanning more than one requestId. (requestId itself is
 // sometimes absent, so it must not be part of the key.)
 
+import os from "node:os";
+import path from "node:path";
+
 export interface TranscriptRow {
   sessionId: string;
   /** `message.id` — the dedupe key. See the note above; this is not decorative. */
@@ -77,11 +80,14 @@ export function agentShape(entrypoint: string | null | undefined): string {
  *
  * Takes the REAL working directory, not the transcript's directory name. Claude
  * Code encodes the path by replacing every separator with a dash, which makes
- * `/Users/mgrin/Projects/mgrin/agentic-brain` and a project literally called
+ * `/Users/me/Projects/mgrin/agentic-brain` and a project literally called
  * `brain` indistinguishable — the first attempt at this collapsed
  * "agentic-brain" to "brain" and "motion-client-dashboard-ops" to "ops". The
  * cwd column keeps the separators, so it can be split honestly.
  */
+/** The last segment of this machine's home directory, which reads as "home". */
+const HOME_LEAF = path.basename(os.homedir());
+
 export function prettyProject(cwd: string | null | undefined): string {
   if (!cwd) return "unknown";
   const segments = cwd.split("/").filter(Boolean);
@@ -105,7 +111,7 @@ export function prettyProject(cwd: string | null | undefined): string {
   if (dev >= 0 && segments.length > dev + 1) return segments[dev + 1]!;
 
   const leaf = segments[segments.length - 1];
-  return leaf === undefined ? "unknown" : leaf === "mgrin" ? "home" : leaf;
+  return leaf === undefined ? "unknown" : leaf === HOME_LEAF ? "home" : leaf;
 }
 
 /** Coerce anything to a finite non-negative integer. Absent, null and "lots" all mean 0. */
