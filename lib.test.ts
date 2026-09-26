@@ -164,7 +164,7 @@ test("isLimitError ignores the ordinary ways a thread dies", () => {
 // second signal, so the trigger stops depending on a field bb does not fill.
 
 test("a limit failure is recognised from the rate-limit snapshot when bb sends error:null", () => {
-  // The exact shape of the 2026-08-11 loss: thr_3waqz7vb9w died on "You've hit
+  // The exact shape of the 2026-08-11 loss: thr_example003 died on "You've hit
   // your session limit · resets 2:10am" recorded as provider/error, so
   // thread.failed carried error:null — but the preceding
   // provider/rateLimits/updated event had status "blocked".
@@ -241,7 +241,7 @@ test("no observation is null, never a status — no signal must not read as one"
 
 // ── the second half of the same outage: detection is not resumption ──────────
 //
-// Even with detection fixed, thr_3waqz7vb9w could not have been resumed by
+// Even with detection fixed, thr_example003 could not have been resumed by
 // bb's own route: `bb thread retry` refused it with "no-rate-limit-state",
 // because the limit arrived as an agentMessage rather than a stored recovery
 // candidate. What actually revived it by hand was an ordinary follow-up
@@ -1011,7 +1011,7 @@ test("MX-983: an UNREADABLE run state is not restarted, says UNKNOWN, and spends
 });
 
 test("MX-983: the run id is read from the header bb workflows puts on every child's prompt", () => {
-  // Measured 2026-09-17 on thr_3pub2sz9qp (curate:slice-9): originPluginId
+  // Measured 2026-09-17 on thr_example004 (curate:slice-9): originPluginId
   // "workflows", parentThreadId null, and this titleFallback.
   const measured = "[BB workflow dream-curate · run wfr_625767af-92a2-42a5-8661-b17dee0218da] You...";
   assert.equal(workflowRunIdFrom(measured), "wfr_625767af-92a2-42a5-8661-b17dee0218da");

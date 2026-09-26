@@ -12,12 +12,12 @@ import {
 } from "./repos.ts";
 
 const PROJECTS: KnownProject[] = [
-  { name: "MGrin/agentic-brain", paths: ["/Users/mgrin/Projects/mgrin/agentic-brain"] },
-  { name: "MGrin/dotfiles", paths: ["/Users/mgrin/Dev/dotfiles"] },
-  { name: "Flarexyz/motion", paths: ["/Users/mgrin/Projects/flare/motion"] },
+  { name: "MGrin/agentic-brain", paths: ["/Users/me/Projects/mgrin/agentic-brain"] },
+  { name: "MGrin/dotfiles", paths: ["/Users/me/Dev/dotfiles"] },
+  { name: "Flarexyz/motion", paths: ["/Users/me/Projects/flare/motion"] },
   {
     name: "Flarexyz/motion-client-dashboard-ops",
-    paths: ["/Users/mgrin/Projects/flare/motion-client-dashboard-ops"],
+    paths: ["/Users/me/Projects/flare/motion-client-dashboard-ops"],
   },
 ];
 
@@ -42,29 +42,29 @@ test("normalizeRemote refuses what it cannot read rather than guessing", () => {
 });
 
 test("envIdFromPath finds the environment in bb-managed paths", () => {
-  assert.equal(envIdFromPath("/Users/mgrin/.bb/personal-workspaces/env_4dcqxu7kgg"), "env_4dcqxu7kgg");
-  assert.equal(envIdFromPath("/Users/mgrin/.bb/worktrees/env_zwej6b4t8z/agentic-brain"), "env_zwej6b4t8z");
-  assert.equal(envIdFromPath("/Users/mgrin/.bb/worktrees/env_77tw9w4w38/motion/src/x"), "env_77tw9w4w38");
-  assert.equal(envIdFromPath("/Users/mgrin/Projects/mgrin/agentic-brain"), null);
+  assert.equal(envIdFromPath("/Users/me/.bb/personal-workspaces/env_4dcqxu7kgg"), "env_4dcqxu7kgg");
+  assert.equal(envIdFromPath("/Users/me/.bb/worktrees/env_zwej6b4t8z/agentic-brain"), "env_zwej6b4t8z");
+  assert.equal(envIdFromPath("/Users/me/.bb/worktrees/env_77tw9w4w38/motion/src/x"), "env_77tw9w4w38");
+  assert.equal(envIdFromPath("/Users/me/Projects/mgrin/agentic-brain"), null);
 });
 
 test("threadIdFromPath finds thread-storage paths", () => {
-  assert.equal(threadIdFromPath("/Users/mgrin/.bb/thread-storage/thr_xc4xs9b5wu"), "thr_xc4xs9b5wu");
-  assert.equal(threadIdFromPath("/Users/mgrin/Projects/mgrin/agentic-brain"), null);
+  assert.equal(threadIdFromPath("/Users/me/.bb/thread-storage/thr_example002"), "thr_example002");
+  assert.equal(threadIdFromPath("/Users/me/Projects/mgrin/agentic-brain"), null);
 });
 
 test("matchProjectByPath resolves a directory inside a project", () => {
   assert.equal(
-    matchProjectByPath("/Users/mgrin/Projects/mgrin/agentic-brain/src/deep/dir", PROJECTS),
+    matchProjectByPath("/Users/me/Projects/mgrin/agentic-brain/src/deep/dir", PROJECTS),
     "MGrin/agentic-brain",
   );
-  assert.equal(matchProjectByPath("/Users/mgrin/Projects/mgrin/agentic-brain", PROJECTS), "MGrin/agentic-brain");
+  assert.equal(matchProjectByPath("/Users/me/Projects/mgrin/agentic-brain", PROJECTS), "MGrin/agentic-brain");
 });
 
 test("matchProjectByPath resolves a worktree nested inside the project path", () => {
   // Real: this directory no longer exists, but its owner is not in doubt.
   assert.equal(
-    matchProjectByPath("/Users/mgrin/Projects/mgrin/agentic-brain/wt/core-and-seams", PROJECTS),
+    matchProjectByPath("/Users/me/Projects/mgrin/agentic-brain/wt/core-and-seams", PROJECTS),
     "MGrin/agentic-brain",
   );
 });
@@ -81,24 +81,24 @@ test("matchProjectByPath takes the LONGEST prefix, not the first", () => {
 test("matchProjectByPath does not match a sibling with a shared prefix", () => {
   // motion-client-dashboard-ops must never be filed under motion.
   assert.equal(
-    matchProjectByPath("/Users/mgrin/Projects/flare/motion-client-dashboard-ops/src", PROJECTS),
+    matchProjectByPath("/Users/me/Projects/flare/motion-client-dashboard-ops/src", PROJECTS),
     "Flarexyz/motion-client-dashboard-ops",
   );
 });
 
 test("matchProjectByLeaf recovers a deleted worktree from its directory name", () => {
   assert.equal(
-    matchProjectByLeaf("/Users/mgrin/.bb/worktrees/env_zwej6b4t8z/agentic-brain", PROJECTS),
+    matchProjectByLeaf("/Users/me/.bb/worktrees/env_zwej6b4t8z/agentic-brain", PROJECTS),
     "MGrin/agentic-brain",
   );
 });
 
 test("matchProjectByLeaf never invents a repo bb does not know", () => {
-  assert.equal(matchProjectByLeaf("/Users/mgrin/.bb/worktrees/env_x/some-random-dir", PROJECTS), null);
+  assert.equal(matchProjectByLeaf("/Users/me/.bb/worktrees/env_x/some-random-dir", PROJECTS), null);
 });
 
 test("resolution order: project path beats environment and git", () => {
-  const r = resolveRepo("/Users/mgrin/Projects/mgrin/agentic-brain/x", {
+  const r = resolveRepo("/Users/me/Projects/mgrin/agentic-brain/x", {
     projects: PROJECTS,
     environmentProject: "Wrong/one",
     gitRemote: "https://github.com/Wrong/two.git",
@@ -107,7 +107,7 @@ test("resolution order: project path beats environment and git", () => {
 });
 
 test("resolution order: environment beats git for bb-managed paths", () => {
-  const r = resolveRepo("/Users/mgrin/.bb/worktrees/env_a/whatever", {
+  const r = resolveRepo("/Users/me/.bb/worktrees/env_a/whatever", {
     projects: PROJECTS,
     environmentProject: "Flarexyz/motion",
     gitRemote: "https://github.com/Wrong/two.git",
@@ -116,7 +116,7 @@ test("resolution order: environment beats git for bb-managed paths", () => {
 });
 
 test("git answers when bb knows nothing about the path", () => {
-  const r = resolveRepo("/Users/mgrin/somewhere/else", {
+  const r = resolveRepo("/Users/me/somewhere/else", {
     projects: PROJECTS,
     gitRemote: "git@github.com:Someone/other.git",
   });
@@ -124,7 +124,7 @@ test("git answers when bb knows nothing about the path", () => {
 });
 
 test("a deleted worktree with no environment record still resolves by leaf", () => {
-  const r = resolveRepo("/Users/mgrin/.bb/worktrees/env_gone/agentic-brain", {
+  const r = resolveRepo("/Users/me/.bb/worktrees/env_gone/agentic-brain", {
     projects: PROJECTS,
     environmentProject: null,
     gitRemote: null,
@@ -133,9 +133,9 @@ test("a deleted worktree with no environment record still resolves by leaf", () 
 });
 
 test("work that belongs to no repo says so rather than guessing", () => {
-  assert.deepEqual(resolveRepo("/Users/mgrin", { projects: PROJECTS }), { repo: NO_REPO, source: "none" });
+  assert.deepEqual(resolveRepo("/Users/me", { projects: PROJECTS }), { repo: NO_REPO, source: "none" });
   assert.deepEqual(
-    resolveRepo("/Users/mgrin/.bb/personal-workspaces/env_4dcqxu7kgg", { projects: PROJECTS }),
+    resolveRepo("/Users/me/.bb/personal-workspaces/env_4dcqxu7kgg", { projects: PROJECTS }),
     { repo: NO_REPO, source: "none" },
   );
 });

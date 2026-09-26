@@ -183,7 +183,7 @@ test("latestSampleAt and countDistinctPolls", () => {
 
 - [ ] **Step 3: Run and verify it fails**
 
-Run: `cd /Users/mgrin/Projects/mgrin/bb-plugin-accounts && npm test`
+Run: `cd /Users/me/Projects/mgrin/bb-plugin-accounts && npm test`
 Expected: FAIL — `Cannot find module './store.ts'`
 
 - [ ] **Step 4: Update `package.json` test script**
@@ -435,7 +435,7 @@ import { parseTranscriptLine } from "./transcripts.ts";
 const REAL = JSON.stringify({
   type: "assistant",
   timestamp: "2026-08-11T10:00:00.000Z",
-  cwd: "/Users/mgrin/Projects/mgrin/bb-plugin-accounts",
+  cwd: "/Users/me/Projects/mgrin/bb-plugin-accounts",
   isSidechain: false,
   message: {
     model: "claude-opus-5",
