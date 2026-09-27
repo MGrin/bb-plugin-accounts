@@ -94,3 +94,10 @@ test('Codex cards expire a retained RPC observation and its active marker',()=>{
  assert.equal(stale[0].state,'unreadable');assert.equal(stale[0].active,false);
  assert.equal(stale[0].windows[0].usedPercent,null);
 });
+
+test("providers format the same reset instant identically",()=>{
+ const reset=Math.floor(NOW/1000)+400000;
+ const claude=claudeCards(claudeStatus({sevenDayResetsAt:new Date(reset*1000).toISOString()}),NOW)[0];
+ const codex=codexCards([codexAccount()],NOW)[0];
+ assert.equal(claude.windows[1].resetText,codex.windows[0].resetText);
+});

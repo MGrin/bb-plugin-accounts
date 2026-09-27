@@ -10,7 +10,7 @@ import { isFresh } from '../telemetry.ts';
 import type { CardAccount, CardWindow } from "./account-card.tsx";
 import type { ProviderAccount } from "../telemetry.ts";
 import type { Status } from "./current.tsx";
-import { clock, formatReset } from "./format.ts";
+import { formatReset } from "./format.ts";
 
 /** A window is spent when the provider says 100, not when we failed to read it. */
 const spent = (w: { usedPercent: number | null }) => w.usedPercent !== null && w.usedPercent >= 100;
@@ -67,7 +67,7 @@ export function codexCards(accounts: readonly ProviderAccount[], nowMs = Date.no
       label: w.durationMinutes === 10080 ? "7d" : w.durationMinutes === 300 ? "5h" : w.durationMinutes ? `${w.durationMinutes / 60}h` : "usage",
       usedPercent: fresh ? w.usedPercent : null,
       resetsAt: w.resetsAt,
-      resetText: w.resetsAt === null ? null : `resets ${clock(w.resetsAt)}`,
+      resetText: w.resetsAt === null ? null : resetTextFromIso(new Date(w.resetsAt * 1000).toISOString(), nowMs),
     }));
     const unreadable = !fresh || a.capacity === "unknown" || windows.every((w) => w.usedPercent === null);
     return {
@@ -80,7 +80,7 @@ export function codexCards(accounts: readonly ProviderAccount[], nowMs = Date.no
           ? "subscription usage unknown"
           : "reading unavailable or stale"
         : windows.some(spent) || a.capacity === "exhausted"
-          ? "window spent"
+          ? windows.some(spent) ? `${windows.filter(spent).map(w => w.label).join(" and ")} spent` : "subscription spent"
           : null,
       windows,
     };

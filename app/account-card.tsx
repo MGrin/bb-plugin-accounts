@@ -47,9 +47,9 @@ export type CardAccount = {
 };
 
 const STATE_TEXT: Record<CardAccount["state"], string> = {
-  ok: "ok",
-  walled: "walled",
-  unreadable: "unreadable",
+  ok: "available",
+  walled: "exhausted",
+  unreadable: "unavailable",
 };
 
 const STATE_CLASS: Record<CardAccount["state"], string> = {
@@ -63,19 +63,19 @@ const STATE_CLASS: Record<CardAccount["state"], string> = {
 function WindowRow({ window: w }: { window: CardWindow }) {
   const unknown = w.usedPercent === null;
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-      <span className="w-12 shrink-0 text-xs text-muted-foreground">{w.label}</span>
+    <div className="grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_3rem] items-center gap-x-3 gap-y-1.5">
+      <span className="text-xs text-muted-foreground">{w.label}</span>
       <span
-        className={`w-12 shrink-0 text-right text-xs tabular-nums ${
+        className={`col-start-3 row-start-1 text-right text-xs tabular-nums ${
           unknown ? "italic text-muted-foreground" : "text-foreground"
         }`}
       >
         {unknown ? "unknown" : `${Math.round(w.usedPercent!)}%`}
       </span>
-      <div className="min-w-16 flex-1">
+      <div className="col-start-2 row-start-1 min-w-0">
         <Meter value={w.usedPercent} label={`${w.label} usage`} />
       </div>
-      <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-muted-foreground">
+      <span className="col-span-3 text-xs tabular-nums text-muted-foreground">
         {w.resetText ?? "reset time unknown"}
       </span>
     </div>
@@ -84,15 +84,15 @@ function WindowRow({ window: w }: { window: CardWindow }) {
 
 export function AccountCard({ account: a }: { account: CardAccount }) {
   return (
-    <div className="space-y-2 rounded-md border border-border bg-muted/20 p-3">
+    <div className="min-w-0 space-y-3 rounded-md border border-border bg-muted/20 p-3">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
           {a.provider}
         </span>
-        <span className="text-sm text-foreground">{a.label}</span>
+        <span className="min-w-0 truncate text-sm text-foreground" title={a.label}>{a.label}</span>
         {a.active && (
           <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-primary">
-            {a.provider === "Codex" ? "active login" : "active"}
+            active login
           </span>
         )}
         <span className={`ml-auto text-xs ${STATE_CLASS[a.state]}`}>

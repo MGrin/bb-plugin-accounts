@@ -21,7 +21,7 @@ import type { Status } from "./current.tsx";
 import { AccountCard } from "./account-card.tsx";
 import { claudeCards, codexCards } from "./cards.ts";
 import { capacityNotice } from "./format.ts";
-import { Notice } from "./ui.tsx";
+import { Notice, LoadingBlock } from "./ui.tsx";
 
 const POLL_MS = 30_000;
 const n = (v: number) => v.toLocaleString("en-US");
@@ -72,34 +72,55 @@ export function SubscriptionsSection({ compact = false }: { compact?: boolean })
   const [jev, setJev] = useState<JevSpend | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
-  const load = async () => {
-    try { setStatus((await rpc.call("status", null)) as Status); } catch { /* keep the last good read */ }
-    try {
-      const t = (await rpc.call("telemetry", null)) as Telemetry;
-      setCodex((t.accounts ?? []).filter(a => a.providerId === "codex" && a.scope !== "thread"));
-    } catch { /* leave Codex as it was */ }
-    try { setJev(await rpc.call("jev", null)); } catch { setJev(null); }
-    setNow(Date.now());
+  const [pending, setPending] = useState({claude:true, codex:true, jev:true});
+  const [errors, setErrors] = useState({claude:false, codex:false, jev:false});
+  // Each source settles independently; one failed request cannot strand another provider.
+  const load = async (cancelled = () => false) => {
+    await Promise.all([
+      rpc.call("status", null).then(value => { if (!cancelled()) {setStatus(value as Status); setErrors(e=>({...e,claude:false}));} })
+        .catch(()=>{if (!cancelled()) setErrors(e=>({...e,claude:true}));})
+        .finally(()=>{if (!cancelled()) setPending(p=>({...p,claude:false}));}),
+      rpc.call("telemetry", null).then(value => { if (!cancelled()) {setCodex((value.accounts ?? []).filter(a=>a.providerId==="codex" && a.scope!=="thread")); setErrors(e=>({...e,codex:false}));} })
+        .catch(()=>{if (!cancelled()) setErrors(e=>({...e,codex:true}));})
+        .finally(()=>{if (!cancelled()) setPending(p=>({...p,codex:false}));}),
+      rpc.call("jev", null).then(value => { if (!cancelled()) {setJev(value); setErrors(e=>({...e,jev:false}));} })
+        .catch(()=>{if (!cancelled()) setErrors(e=>({...e,jev:true}));})
+        .finally(()=>{if (!cancelled()) setPending(p=>({...p,jev:false}));}),
+    ]);
+    if (!cancelled()) setNow(Date.now());
   };
   useEffect(() => {
-    void load();
-    const t = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(t);
+    let cancelled = false;
+    void load(()=>cancelled);
+    const t = setInterval(() => void load(()=>cancelled), POLL_MS);
+    return () => {cancelled=true; clearInterval(t);};
   }, []);
   useRealtime("accounts.switched", () => void load());
 
-  const cards = [...claudeCards(status, now), ...codexCards(codex, now)];
   const notice = status ? capacityNotice(status.capacity) : null;
-  return <div className="space-y-2">
-    {cards.length === 0
-      ? <p className="text-xs text-muted-foreground">Loading subscription telemetry…</p>
-      : cards.map(c => <AccountCard key={`${c.provider}/${c.label}`} account={c} />)}
-    <JevLine spend={jev} now={now / 1000} compact={compact} />
-    {notice ? <Notice tone={notice.tone}>{notice.text}</Notice> : null}
-    {status?.stale && <div className="text-xs text-destructive">usage cache stale — check claude.usage-poll</div>}
+  const groups = [
+    {provider:"Claude", cards:claudeCards(status,now), loading:pending.claude, error:errors.claude},
+    {provider:"Codex", cards:codexCards(codex,now), loading:pending.codex, error:errors.codex},
+  ];
+  return <div className="space-y-4">
+    <div className={`grid items-start gap-4 ${compact ? "" : "md:grid-cols-2"}`}>
+      {groups.map(g=><div key={g.provider} className="min-w-0 space-y-2" aria-label={`${g.provider} subscriptions`}>
+        <h3 className="text-xs font-medium text-muted-foreground">{g.provider}</h3>
+        {g.loading ? <div className="rounded-md border border-border bg-muted/20 p-3"><LoadingBlock label={`Loading ${g.provider} subscriptions`} rows={2} /></div>
+          : g.cards.length ? g.cards.map(c=><AccountCard key={`${c.provider}/${c.label}`} account={c} />)
+          : <div role="status" className="rounded-md border border-border bg-muted/20 p-3 text-xs text-muted-foreground">
+            {g.error ? `${g.provider} usage unavailable. Retrying automatically.` : `No ${g.provider} accounts reported.`}
+          </div>}
+        {g.error && g.cards.length>0 && <p role="status" className="text-xs text-muted-foreground">Refresh failed. Showing the last {g.provider} reading.</p>}
+        {g.provider==="Claude" && notice ? <Notice tone={notice.tone}>Claude: {notice.text}</Notice> : null}
+      </div>)}
+    </div>
+    {pending.jev ? <div className="rounded-md border border-border bg-muted/20 p-3"><LoadingBlock label="Loading Jev usage" rows={2} /></div>
+      : errors.jev && !jev ? <Notice tone="unknown">Jev usage unavailable. Retrying automatically.</Notice>
+      : <JevLine spend={jev} now={now / 1000} compact={compact} />}
     {!compact && status?.lastSwitch && (
       <div className="text-xs text-muted-foreground">
-        last switch: {status.lastSwitch.from} → {status.lastSwitch.to} · {status.lastSwitch.reason}
+        Last Claude switch: {status.lastSwitch.from} → {status.lastSwitch.to}
       </div>
     )}
   </div>;
