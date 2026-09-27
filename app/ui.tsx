@@ -34,7 +34,7 @@ export function Meter({ value, label }: { value: number | null; label?: string }
 
 export function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-4">
+    <section className="min-w-0 rounded-lg border border-border bg-card p-4">
       <div className="mb-3">
         <h2 className="text-sm font-medium text-foreground">{title}</h2>
         {hint && <p className="text-xs text-muted-foreground mt-0.5">{hint}</p>}
@@ -64,4 +64,14 @@ const TONE: Record<"warn" | "bad" | "unknown", string> = {
 
 export function Notice({ tone, children }: { tone: "warn" | "bad" | "unknown"; children: ReactNode }) {
   return <div className={`rounded-md border p-2 text-xs ${TONE[tone]}`}>{children}</div>;
+}
+
+/** Stable geometry while any provider or chart is awaiting its first reading. */
+export function LoadingBlock({ label = "Loading usage", rows = 3 }: { label?: string; rows?: number }) {
+  return <div role="status" aria-label={label} aria-busy="true" className="space-y-3 py-1">
+    <span className="sr-only">{label}</span>
+    {Array.from({length:rows}, (_, i) => <div key={i} aria-hidden="true" className="space-y-2 motion-safe:animate-pulse">
+      <div className="h-3 w-1/3 rounded bg-muted" /><div className="h-2 w-full rounded bg-muted" />
+    </div>)}
+  </div>;
 }

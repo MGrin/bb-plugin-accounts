@@ -84,18 +84,18 @@ export function BarList({
     return <div className="text-xs text-muted-foreground">nothing recorded in this window</div>;
   }
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-3 min-w-0">
       {slices.map((s) => {
         const pct = (s.weightedK / total) * 100;
         return (
-          <div key={s.key} className="grid grid-cols-[minmax(0,9rem)_1fr_auto] items-center gap-2">
+          <div key={s.key} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1.5">
             <div className="flex items-center gap-1.5 min-w-0">
               <Swatch index={slotFor(s.key, order)} />
               <span className="truncate text-xs text-foreground" title={s.key}>
                 {s.key}
               </span>
             </div>
-            <div className="h-2.5 w-full">
+            <div className="col-span-2 row-start-2 h-2.5 w-full min-w-0">
               <svg width="100%" height="10" role="img" aria-label={`${s.key}: ${pct.toFixed(1)} percent`}>
                 <rect x="0" y="0" width="100%" height="10" rx="4" className="fill-muted" />
                 <rect
@@ -109,7 +109,7 @@ export function BarList({
               </svg>
             </div>
             <span className="text-xs tabular-nums text-muted-foreground">
-              {pct.toFixed(1)}% · {Math.round(s.weightedK).toLocaleString()}
+              {pct.toFixed(1)}% · {s.weightedK.toLocaleString(undefined, {maximumFractionDigits: 1})}
               {unit}
             </span>
           </div>

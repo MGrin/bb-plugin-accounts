@@ -13,13 +13,13 @@
 import { useEffect, useState } from "react";
 import { useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
-import { BarList, Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
+import { Heatmap, PaletteVars, SlotCurve, Timeline } from "./charts.tsx";
 import { SubscriptionsSection } from "./subscriptions.tsx";
-import { CodexTokens } from './codex-analytics.tsx';
+import { CodexTokens, UsageBreakdown } from './codex-analytics.tsx';
 import type { CodexBreakdown } from '../analytics/codex.ts';
 import type { CodexForecast } from '../analytics/codex-forecast.ts';
 import { clock } from "./format.ts";
-import { Section } from "./ui.tsx";
+import { Section, LoadingBlock, Notice } from "./ui.tsx";
 
 type Forecast = {
   confidence: "provisional" | "fitted" | "stale";
@@ -45,9 +45,9 @@ type Analytics = {
 const RANGES = [7, 14, 30] as const;
 const RANGE_KEY = "accounts.analytics.days";
 
-function ForecastSection({ fc, codex }: { fc: Forecast | null; codex: CodexForecast[] }) {
+function ForecastSection({ fc, codex, failed = false }: { fc: Forecast | null; codex: CodexForecast[]; failed?: boolean }) {
   if (!fc) return <Section title="Subscription forecast">
-    <div className="text-xs text-muted-foreground">No Claude accounts in the usage cache.</div><Timeline points={[]} codex={codex} />
+    <div className="text-xs text-muted-foreground">{failed ? "Claude forecast unavailable." : "No Claude accounts in the usage cache."}</div><Timeline points={[]} codex={codex} />
   </Section>;
 
   if (fc.confidence !== "fitted") {
@@ -86,10 +86,10 @@ function ForecastSection({ fc, codex }: { fc: Forecast | null; codex: CodexForec
     <Section title="Subscription forecast" hint={`Next ${Math.round(fc.horizonSec / 86400)} days, at median demand.`}>
       <div className="mb-3">
         {fc.blackout.likely === null ? (
-          <div className="text-sm text-foreground">No point in the horizon where every account is walled.</div>
+          <div className="text-sm text-foreground">No projected period where every Claude account is exhausted.</div>
         ) : (
           <div className="text-sm text-foreground">
-            All accounts dry <span className="font-medium">{clock(fc.blackout.likely)}</span>{" "}
+            All Claude accounts dry <span className="font-medium">{clock(fc.blackout.likely)}</span>{" "}
             <span className="text-muted-foreground">
               ({clock(fc.blackout.earliest)} – {clock(fc.blackout.latest)})
             </span>
@@ -122,42 +122,42 @@ export function UsagePanel() {
     return RANGES.includes(stored as (typeof RANGES)[number]) ? stored : 14;
   });
   const [loading, setLoading] = useState(true);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     void (async () => {
-      const [f, a, c] = await Promise.all([
+      const [f, a, c] = await Promise.allSettled([
         rpc.call("forecast", null) as Promise<Forecast | null>,
         rpc.call("analytics", { days }) as Promise<Analytics>,
         rpc.call("codexForecast", null) as Promise<CodexForecast[]>,
       ]);
       if (cancelled) return;
-      setFc(f);
-      setCodexForecast(c);
-      setData(a);
+      setFc(f.status === "fulfilled" ? f.value : null);
+      setCodexForecast(c.status === "fulfilled" ? c.value : []);
+      setData(a.status === "fulfilled" ? a.value : null);
+      setErrors([...(f.status === "rejected" ? ["Claude forecast"] : []),
+        ...(c.status === "rejected" ? ["Codex forecast"] : []),
+        ...(a.status === "rejected" ? ["Usage breakdowns"] : [])]);
       setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [days]);
-
-  const modelOrder = (data?.byModel ?? []).map((s) => s.key);
-  const agentOrder = (data?.byAgent ?? []).map((s) => s.key);
-  const projectOrder = (data?.byProject ?? []).map((s) => s.key);
-  const repoOrder = (data?.byRepo ?? []).map((s) => s.key);
+  }, [days, retry]);
 
   return (
     <div className="acct-viz h-full overflow-y-auto">
       <PaletteVars />
-      <div className="p-4 pb-10 space-y-4 max-w-4xl mx-auto">
+      <div className="p-4 pb-10 space-y-4 max-w-6xl mx-auto">
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h1 className="text-base font-medium text-foreground">Subscription usage</h1>
           <p className="text-xs text-muted-foreground">
-            {data ? `${data.coverage.messages.toLocaleString()} Claude messages · ${data.codex.coverage.responses.toLocaleString()} Codex responses (${data.codex.coverage.unattributed} missing model/directory) indexed` : "loading…"}
+            {data ? `${data.coverage.messages.toLocaleString()} Claude messages · ${data.codex.coverage.responses.toLocaleString()} Codex responses (${data.codex.coverage.unattributed} missing model/directory) indexed` : loading ? "Loading subscription usage…" : "Usage history unavailable"}
             {data?.coverage.firstTs
               ? ` · since ${new Date(data.coverage.firstTs * 1000).toLocaleDateString()}`
               : ""}
@@ -183,15 +183,21 @@ export function UsagePanel() {
 
       {/* Current usage FIRST: it is the daily question ('can I start this now'),
           the forecast is the occasional one. */}
-      <Section title="Subscriptions" hint="Every provider, same card: Claude and Codex windows, then the Jev bill.">
+      <Section title="Subscriptions" hint="Current subscription windows and reset times.">
         <SubscriptionsSection />
       </Section>
 
-      <ForecastSection fc={fc} codex={codexForecast} />
+      {!loading && errors.length > 0 && <Notice tone="unknown">
+        {errors.join(", ")} unavailable. <button className="ml-2 underline underline-offset-2" onClick={()=>setRetry(r=>r+1)}>Retry</button>
+      </Notice>}
+      {loading ? <Section title="Subscription forecast"><LoadingBlock label="Loading subscription forecasts" rows={4} /></Section>
+        : errors.includes("Claude forecast") && errors.includes("Codex forecast") ? null
+        : <ForecastSection fc={fc} codex={codexForecast} failed={errors.includes("Claude forecast")} />}
 
-      {fc && fc.slotCurve.length > 0 && (
+
+      {!loading && fc && fc.slotCurve.length > 0 && (
         <Section
-          title="Would more accounts help?"
+          title="Would more Claude accounts help?"
           hint="The same simulation re-run with a different number of subscriptions. Assumes an added account has identical limits and that demand does not grow to fill the extra headroom — the second is the weaker assumption."
         >
           {fc.confidence !== "fitted" && (
@@ -206,31 +212,32 @@ export function UsagePanel() {
         </Section>
       )}
 
-      <Section title="When you burn it" hint="Claude weighted tokens by local hour of week.">
-        {data ? <Heatmap cells={data.byHourOfWeek} /> : <div className="text-xs text-muted-foreground">loading…</div>}
+      <Section title="By model" hint="Share within each provider for the selected period. These metrics do not measure subscription quota.">
+        <div className="grid items-start gap-6 md:grid-cols-2">
+          <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byModel ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+          <CodexTokens rows={data?.codex.byModel ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+        </div>
       </Section>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <Section title="By model">
-          {data ? <><p className="text-xs text-muted-foreground mb-2">Claude weighted tokens</p><BarList slices={data.byModel} order={modelOrder} /><CodexTokens rows={data.codex.byModel} /></> : null}
+      <Section title="By project" hint="Usage grouped by repository. Personal workspaces without a repository appear as (no repo).">
+        <div className="grid items-start gap-6 md:grid-cols-2">
+          <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byRepo ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+          <CodexTokens rows={data?.codex.byRepo ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+        </div>
+      </Section>
+      <Section title="By directory" hint="Usage grouped by working directory.">
+        <div className="grid items-start gap-6 md:grid-cols-2">
+          <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byProject ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+          <CodexTokens rows={data?.codex.byDirectory ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
+        </div>
+      </Section>
+      <div className="grid items-start gap-4 md:grid-cols-2">
+        <Section title="Claude activity" hint="Weighted tokens by local hour of week.">
+          {loading ? <LoadingBlock label="Loading Claude activity" /> : data ? <div className="overflow-x-auto"><Heatmap cells={data.byHourOfWeek} /></div> : <p className="text-xs text-muted-foreground">Usage history unavailable.</p>}
         </Section>
-        <Section title="By who spent it" hint="bb-agent is a bb-spawned thread; terminal is you typing.">
-          {data ? <BarList slices={data.byAgent} order={agentOrder} /> : null}
+        <Section title="Claude entrypoints" hint="bb-agent: BB threads · terminal: interactive sessions.">
+          <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byAgent ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
         </Section>
       </div>
-
-      <Section
-        title="By repo"
-        hint="Resolved from bb's own project records first, then the environment, then git — a bb worktree is disposable, so most of these directories no longer exist. (no repo) is work that genuinely belongs to none: personal workspaces and your home directory."
-      >
-        {data ? <><p className="text-xs text-muted-foreground mb-2">Claude weighted tokens</p><BarList slices={data.byRepo} order={repoOrder} /><CodexTokens rows={data.codex.byRepo} /></> : null}
-      </Section>
-
-      <Section title="By directory" hint="The working directory itself, for when the repo is not the interesting part.">
-        {data ? <><p className="text-xs text-muted-foreground mb-2">Claude weighted tokens</p><BarList slices={data.byProject} order={projectOrder} /><CodexTokens rows={data.codex.byDirectory} /></> : null}
-      </Section>
-
-        {loading && <div className="text-xs text-muted-foreground">refreshing…</div>}
       </div>
     </div>
   );
