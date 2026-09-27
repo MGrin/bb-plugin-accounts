@@ -72,15 +72,35 @@ test("the covers caveat survives every state, falling back to a plain sentence o
   assert.equal(normalizeJev({ ...reading(), covers: 7 }, now).covers, JEV_COVERS);
 });
 
-test("the text form prints a dollar figure ONLY from a console reading (control: a reading does)", () => {
+test("the text form separates console readings from scoped estimates and unknown counts", () => {
   const billed = formatJev(normalizeJev({ ...reading(), billing }, now), now);
   assert.match(billed, /\$12\.50 for Sep 2026/); assert.match(billed, /TypeSafe console/); assert.match(billed, /read 2h ago/);
   const ok = formatJev(normalizeJev(reading(), now), now);
-  assert.doesNotMatch(ok, /\$/); assert.match(ok, /no dollar figure/); assert.match(ok, /745,708 input tokens/); assert.match(ok, /covers/);
+  assert.match(ok, /estimated local cost \$0\.0313/); assert.match(ok, /no dollar figure/); assert.match(ok, /745,708 input tokens/); assert.match(ok, /covers/);
   for (const j of [unknownJev("mx not found"), normalizeJev({ ...reading(), log_present: false }, now)]) {
     const text = formatJev(j, now);
     assert.doesNotMatch(text, /\$/); assert.doesNotMatch(text, /\b0 calls/); assert.match(text, /covers/);
   }
   assert.match(formatJev(unknownJev("mx not found"), now), /UNKNOWN.*mx not found/);
   assert.match(formatJev(normalizeJev({ ...reading(), log_present: false }, now), now), /NO DATA/);
+});
+
+test('account billing preserves balance and collector block independently of missing local log', () => {
+  const j = normalizeJev({ ...reading(), log_present: false, billing: {...billing, source:'https://console.typesafe.ai/settings/billing', kind:'account-billing', balance_usd:-0.5, plan:'free_plan'},
+    billing_refresh: {version:1, state:'blocked', attempted_at:now, reason:'DO-NOT-ECHO', ray_id:'abc-DPS'} }, now);
+  assert.equal(j.billing?.balanceUsd, -0.5);
+  assert.equal(j.billing?.kind, 'account-billing');
+  assert.equal(j.billingRefresh?.state, 'blocked');
+  const text = formatJev(j, now);
+  assert.match(text, /Cloudflare/); assert.match(text, /\$12\.50/); assert.doesNotMatch(text, /DO-NOT-ECHO/);
+});
+
+test('local estimates use recorded tokens and expose unmetered compactions, never replace billing', () => {
+  const j = normalizeJev({...reading(), billing, compaction:{readable:true, windows:[{name:'24h', compactions:2, jev_requests:3, input_tokens:1000000, unmetered:1}]}}, now);
+  const text = formatJev(j, now);
+  assert.match(text, /estimated.*\$0\.0313/i);
+  assert.match(text, /compaction.*\$0\.0420/i);
+  assert.match(text, /1 unmetered/);
+  assert.match(text, /\$12\.50/);
+  assert.match(text, /recorded.*only/i);
 });

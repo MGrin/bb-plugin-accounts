@@ -1,64 +1,49 @@
-// Jev usage on the Subscription usage page (MX-1172), collapsed to three lines (MX-1226).
-//
-// The numbers come from `mx jev usage --json` (version 2) through the `jev` rpc and are
-// never recomputed here. Per-window rows are THIS key's calls and tokens; the ONE dollar
-// figure is `billing`, a recorded reading of TypeSafe's console across every key
-// (MX-1200). Three states and no fourth, same as the Übersicht widget: a reading, NO DATA
-// (no log, or nothing in it — not zero spend), and UNKNOWN with its reason. Only a
-// reading prints a figure; a failed refresh drops the old one rather than leaving a
-// number on screen nobody can vouch for.
-//
-// WHAT COLLAPSED, and why it is not information lost: the two caveat paragraphs and the
-// per-window cards moved behind `Details`. They are read once, not daily — but they are
-// exactly the sentences that stop someone reading this key's token count as the bill, so
-// they stay one click away and the dollar line keeps saying "console" in the open.
-// Pure, so it renders under test; the fetching half lives in providers.tsx.
-import { JEV_COVERS, jevAge, type JevSpend } from "../telemetry.ts";
+// One Jev card on both the homepage and usage page. Account billing and local estimates
+// have different provenance and periods; failures preserve a labelled account snapshot.
+import { JEV_COVERS, JEV_INPUT_USD_PER_MILLION, JEV_PRICE_CHECKED, billingIsStale, billingRefreshLabel, jevLocalEstimates, jevAge, type JevSpend } from "../telemetry.ts";
+import { LoadingBlock } from "./ui.tsx";
+const n = (v:number)=>v.toLocaleString("en-US");
 
-const n = (v: number) => v.toLocaleString("en-US");
-
-export function JevCard({ spend, failed, now }: { spend: JevSpend | null; failed: boolean; now: number }) {
-  const status = failed ? "UNKNOWN — Jev usage could not be refreshed" : !spend ? "Loading Jev usage…" :
-    spend.state === "unknown" ? `UNKNOWN — ${spend.reason}` : spend.state === "no-data" ? `No data — ${spend.reason}` : null;
-  const s = !failed && spend?.state === "ok" ? spend : null;
-  // The caveat stays on screen in EVERY state, including the ones with no numbers: a
-  // reader who arrives during an outage must still learn that these counts are one key's,
-  // not the bill. Two lines, so the collapsed card is still within its budget.
-  if (!s) return <div className="space-y-1">
-    <p className="text-xs text-muted-foreground">{status}</p>
-    <p className="text-xs text-muted-foreground">Covers {spend?.covers ?? JEV_COVERS}.</p>
-  </div>;
-  return <div className="space-y-1">
-    {/* 1. the bill — the only dollar figure, and it says where it came from. */}
-    <div className="text-sm tabular-nums text-foreground">
-      {s.billing
-        ? `Billed $${s.billing.amountUsd.toFixed(2)} · ${s.billing.period} · read ${jevAge(now - s.billing.recordedAt)} ago from the TypeSafe console`
-        : "Billed: no console reading, so no dollar figure"}
+export function JevCard({spend,failed,now,compact=false}:{spend:JevSpend|null;failed:boolean;now:number;compact?:boolean}) {
+  const b=spend?.billing, local=!failed && spend && spend.state !== "unknown" && (spend.windows.length>0 || spend.compaction?.length) ? spend : null;
+  const stale=failed || (!!spend && billingIsStale(spend,now));
+  const status=failed ? "UNKNOWN — Jev usage could not be refreshed" : spend?.state === "unknown" ? `UNKNOWN — ${spend.reason}` :
+    spend?.state === "no-data" ? `No data — ${spend.reason}` : null;
+  if (!spend && !failed) return <div className="rounded-md border border-border bg-muted/20 p-3"><LoadingBlock label="Loading Jev usage" rows={2} /></div>;
+  const estimates=local ? jevLocalEstimates(local) : [];
+  return <div className="space-y-3 rounded-md border border-border bg-muted/20 p-3" aria-label="Jev billing and local usage">
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">Jev</span>
+      <span className="text-sm text-foreground">TypeSafe</span>
+      {b && <span className="ml-auto text-xs text-muted-foreground">{stale ? "Stale reading" : "Last reading"}</span>}
     </div>
-    {/* 2. this key's traffic, one line for every window. */}
-    <div className="text-xs tabular-nums text-muted-foreground">
-      {s.windows.map(w => `${w.name} ${n(w.calls)} calls · ${n(w.inputTokens)} tok`).join("  ·  ") || "no windows reported"}
+    <div className="space-y-1">
+      <div className="text-sm tabular-nums text-foreground">{b
+        ? `${b.kind === "account-billing" ? "Last account spend" : "Last console estimate"} $${b.amountUsd.toFixed(2)} · ${b.period}`
+        : "Account billing: no console reading"}</div>
+      {b?.balanceUsd !== undefined && <div className="text-xs tabular-nums text-muted-foreground">Account balance ${b.balanceUsd.toFixed(2)}{b.plan ? ` · ${b.plan.replaceAll("_"," ")}` : ""}</div>}
+      {b && <p className="text-xs text-muted-foreground">TypeSafe console, every key · read {jevAge(now-b.recordedAt)} ago{stale ? " · stale; no fresh billing confirmed" : ""}</p>}
+      <p role="status" className="text-xs text-muted-foreground">{spend ? billingRefreshLabel(spend) : "Billing refresh unavailable"}
+        {spend?.billingRefresh?.attemptedAt ? ` · attempted ${jevAge(now-spend.billingRefresh.attemptedAt)} ago` : ""}
+        {spend?.billingRefresh?.rayId ? ` · Ray ID ${spend.billingRefresh.rayId}` : ""}</p>
+      {status && <p role="status" className="text-xs text-muted-foreground">{status}</p>}
     </div>
-    {/* 3. freshness, and the door to everything else. */}
+    {local && <div className="space-y-1 border-t border-border pt-2">
+      <div className="text-xs font-medium text-foreground">Local cost estimate · recorded usage only</div>
+      <div className="text-xs tabular-nums text-muted-foreground">{(compact ? estimates.slice(0,1) : estimates).map(w=>`${w.name} mx calls $${w.decisionUsd.toFixed(4)}`).join(" · ")}</div>
+      <div className="text-xs tabular-nums text-muted-foreground">{local.compaction?.length
+        ? (compact ? local.compaction.slice(0,1) : local.compaction).map(w=>`${w.name} compaction $${(w.inputTokens*JEV_INPUT_USD_PER_MILLION/1e6).toFixed(4)}${w.unmetered ? ` · ${n(w.unmetered)} unmetered` : w.unmetered == null ? " · completeness unknown" : ""}`).join(" · ")
+        : "Compaction estimate unavailable"}</div>
+      <p className="text-xs text-muted-foreground">Partial coverage; excludes unrecorded traffic and account credits.</p>
+    </div>}
     <details className="text-xs text-muted-foreground">
-      <summary className="cursor-pointer">
-        newest decision {s.lastDecisionAt === null ? "unknown" : `${jevAge(now - s.lastDecisionAt)} ago`}
-        {" · "}reading {s.generatedAt === null ? "age unknown" : `${jevAge(now - s.generatedAt)} old`}
-        {" · "}details
-      </summary>
+      <summary className="cursor-pointer">Usage details{local ? ` · newest decision ${jevAge(now-(local.lastDecisionAt??now))} ago · reading ${jevAge(now-(local.generatedAt??now))} old` : ""}</summary>
       <div className="mt-2 space-y-2">
-        <div className="grid gap-2 sm:grid-cols-3">
-          {s.windows.map(w => <div key={w.name} className="rounded-md border border-border bg-muted/20 p-3">
-            <div className="text-xs text-muted-foreground">{w.name}</div>
-            <div className="text-base tabular-nums text-foreground">{n(w.calls)} calls</div>
-            <div className="text-xs tabular-nums text-muted-foreground">{n(w.inputTokens)} input tokens</div>
-          </div>)}
-        </div>
-        <p>
-          Calls and tokens are this machine's key only; TypeSafe bills the account across every key,
-          so the only dollar figure shown is a reading of its console.
-        </p>
+        {local && <div className="grid gap-2 @2xl:grid-cols-3">{local.windows.map(w=><div key={w.name} className="rounded-md border border-border p-2">
+          <div>{w.name}</div><div>{n(w.calls)} calls</div><div>{n(w.inputTokens)} input tokens</div>
+        </div>)}</div>}
         <p>Covers {spend?.covers ?? JEV_COVERS}.</p>
+        {local && <p>Estimates use recorded input tokens at ${JEV_INPUT_USD_PER_MILLION}/million; output free. Rate checked {JEV_PRICE_CHECKED} at <a href="https://docs.typesafe.ai/models" target="_blank" rel="noreferrer" className="underline">TypeSafe</a>. Rolling local windows differ from the account billing cycle.</p>}
       </div>
     </details>
   </div>;

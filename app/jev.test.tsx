@@ -13,19 +13,19 @@ const billed: JevSpend = { ...ok, billing: { amountUsd: 12.5, recordedAt: now - 
   source: "https://console.typesafe.ai/usage", asOf: null } };
 const render = (spend: JevSpend | null, failed = false) => renderToStaticMarkup(createElement(JevCard, { spend, failed, now }));
 
-test("ok: three windows of calls and tokens, ages, both caveats, and NO dollar figure without a console reading", () => {
+test("ok: recorded windows and estimates have explicit scope while account billing is absent", () => {
   const html = render(ok);
   for (const name of JEV_WINDOWS) assert.match(html, new RegExp(`>${name}<`));
   assert.match(html, /413 calls/); assert.match(html, /745,708 input tokens/);
   assert.match(html, /newest decision 32m ago/); assert.match(html, /reading 90s old/);
-  assert.match(html, /no console reading, so no dollar figure/); assert.doesNotMatch(html, /\$/);
-  assert.match(html, /bills the account across every key/);
+  assert.match(html, /Account billing: no console reading/); assert.match(html, /Local cost estimate/);
+  assert.match(html, /Partial coverage/);
   assert.match(html, /compaction spend is NOT in these numbers/);
 });
 
-test("a console reading is the one dollar figure, with its period and age (control for every absence)", () => {
+test("legacy console estimate retains its period and age without pretending it is account billing", () => {
   const html = render(billed);
-  assert.match(html, /Billed \$12\.50 · Sep 2026 · read 2h ago from the TypeSafe console/);
+  assert.match(html, /Last console estimate \$12\.50 · Sep 2026/); assert.match(html,/read 2h ago/);
 });
 
 test("no data, unknown, a failed rpc and loading print no figure; control above shows ok does", () => {
@@ -38,6 +38,25 @@ test("no data, unknown, a failed rpc and loading print no figure; control above 
   for (const [name, html, says] of cases) {
     assert.match(html, says, name);
     assert.doesNotMatch(html, /\$/, name); assert.doesNotMatch(html, /\b0 calls/, name); assert.doesNotMatch(html, /\d calls/, name);
-    assert.match(html, /mx jev/, `${name}: the covers caveat is always on screen`);
+    if(name !== "loading") assert.match(html, /mx jev/, `${name}: the covers caveat is always on screen`);
   }
+});
+
+test('Cloudflare keeps last account billing visible and explicitly stale even with no decisions', () => {
+  const html=render({...billed,state:'no-data',billingRefresh:{state:'blocked',attemptedAt:now,rayId:null},billing:{...billed.billing!,kind:'account-billing',balanceUsd:2}});
+  assert.match(html,/Cloudflare/); assert.match(html,/Last account spend/); assert.match(html,/\$12\.50/);
+  assert.match(html,/\$2\.00/); assert.match(html,/stale/i); assert.doesNotMatch(html,/session expired/i);
+});
+
+test('local estimated cost stays distinct from account billing and unavailable coverage', () => {
+  const html=render(ok);
+  assert.match(html,/Local cost estimate/); assert.match(html,/\$0\.0313/);
+  assert.match(html,/recorded.*only/i); assert.match(html,/Compaction.*unavailable/);
+  assert.doesNotMatch(html,/Billed \$0\.0313/);
+});
+
+test('an RPC failure keeps previous billing with warning but hides old local estimates', () => {
+  const html=render(billed,true);
+  assert.match(html,/\$12\.50/); assert.match(html,/could not be refreshed/);
+  assert.match(html,/stale/i); assert.doesNotMatch(html,/\$0\.0313/);
 });

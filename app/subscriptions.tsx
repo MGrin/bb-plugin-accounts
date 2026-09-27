@@ -16,7 +16,7 @@ import { useEffect, useState } from "react";
 import { useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server.ts";
 import type { JevSpend, ProviderAccount, Telemetry } from "../telemetry.ts";
-import { jevAge } from "../telemetry.ts";
+import { JevCard } from "./jev.tsx";
 import type { Status } from "./current.tsx";
 import { AccountCard } from "./account-card.tsx";
 import { claudeCards, codexCards } from "./cards.ts";
@@ -24,39 +24,9 @@ import { capacityNotice } from "./format.ts";
 import { Notice, LoadingBlock } from "./ui.tsx";
 
 const POLL_MS = 30_000;
-const n = (v: number) => v.toLocaleString("en-US");
-
-/** The Jev line: the bill first, because it is the only figure that is money. */
-export function JevLine({ spend, now, compact }: { spend: JevSpend | null; now: number; compact: boolean }) {
-  if (!spend || spend.state !== "ok") {
-    return <div className="text-xs text-muted-foreground">
-      Jev — {spend === null ? "loading…" : `${spend.state === "no-data" ? "no data" : "UNKNOWN"} — ${spend.reason}`}
-    </div>;
-  }
-  const day = spend.windows.find(w => w.name === "24h") ?? spend.windows[0];
-  const compactedDay = spend.compaction?.find(w => w.name === "24h") ?? null;
-  return <div className="space-y-1 rounded-md border border-border bg-muted/20 p-3">
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-      <span className="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">Jev</span>
-      <span className="text-sm text-foreground">TypeSafe</span>
-      <span className="ml-auto text-sm tabular-nums text-foreground">
-        {spend.billing ? `$${spend.billing.amountUsd.toFixed(2)}` : "no console reading"}
-      </span>
-    </div>
-    <div className="text-xs text-muted-foreground">
-      {spend.billing
-        ? `${spend.billing.period} · read ${jevAge(now - spend.billing.recordedAt)} ago from the console, every key`
-        : "no dollar figure until TypeSafe's console is read"}
-    </div>
-    {day && <div className="text-xs tabular-nums text-muted-foreground">
-      24h · {n(day.calls)} calls · {n(day.inputTokens)} input tokens
-      {/* The number the page used to hide entirely. It dwarfs the metered one. */}
-      {compactedDay ? ` · compaction ${n(compactedDay.compactions)} runs, ${n(compactedDay.inputTokens)} tokens` : " · compaction unread"}
-    </div>}
-    {!compact && day && day.bySet.length > 0 && <div className="text-xs tabular-nums text-muted-foreground">
-      {day.bySet.map(s => `${s.set} ${n(s.calls)}`).join(" · ")}
-    </div>}
-  </div>;
+/** Shared with the detailed Jev section so freshness and estimates cannot drift. */
+export function JevLine({spend,now,compact,failed=false}:{spend:JevSpend|null;now:number;compact:boolean;failed?:boolean}) {
+  return <JevCard spend={spend} now={now} compact={compact} failed={failed} />;
 }
 
 /**
@@ -117,7 +87,7 @@ export function SubscriptionsSection({ compact = false }: { compact?: boolean })
     </div>
     {pending.jev ? <div className="rounded-md border border-border bg-muted/20 p-3"><LoadingBlock label="Loading Jev usage" rows={2} /></div>
       : errors.jev && !jev ? <Notice tone="unknown">Jev usage unavailable. Retrying automatically.</Notice>
-      : <JevLine spend={jev} now={now / 1000} compact={compact} />}
+      : <JevLine spend={jev} now={now / 1000} compact={compact} failed={errors.jev} />}
     {!compact && status?.lastSwitch && (
       <div className="text-xs text-muted-foreground">
         Last Claude switch: {status.lastSwitch.from} → {status.lastSwitch.to}
