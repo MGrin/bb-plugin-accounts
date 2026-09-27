@@ -166,17 +166,15 @@ unreadable account asserts nothing, and must not borrow the urgency of either an
 observation time, freshness, account ID (or null), windows and subscription capacity.
 `available` / `exhausted` / `unavailable` / `unknown` describes subscription capacity;
 paid credits never turn an exhausted subscription into an available one. The legacy
-`list`, `outage`, `place`, switching and analytics commands remain **Claude-only** with
+`list`, `outage`, `place`, `switch`, `stats` and `forecast` commands remain **Claude-only** with
 their existing meanings and JSON shapes. A telemetry command exits 0 on a successful
 report, including UNKNOWN; it is not an admission gate.
 
-Codex snapshots come from the custom dotfiles command `mx spawn availability`, which
-initializes Codex app-server and calls `account/rateLimits/read` without inference. This
-plugin invokes it on demand, at most once per minute across callers, with a 10-second
-and 256-KiB bound. It accepts v1 stdout JSON on exit 0 or 2 (Claude can be unknown while
-Codex has usable telemetry). An older or absent `mx`, timeout, malformed output, missing
-main bucket, partial windows, stale/future timestamp or elapsed reset produces UNKNOWN.
-The observation expires after 180 seconds; reset passage cannot prove that quota returned.
+Codex snapshots are collected by the dotfiles slot poller through `mx spawn availability`
+in isolated native credential homes. The plugin reads its private cache, bounded to
+256 KiB, and checks identity and freshness on every read. Missing main buckets, partial
+windows, stale/future timestamps and elapsed resets produce UNKNOWN. The observation
+expires after 180 seconds; reset passage cannot prove that quota returned.
 
 The v1 contract reads `codex_usage.rateLimitsByLimitId.codex`, falling back to
 `codex_usage.rateLimits` only when its own `limitId` is `codex`. Primary/secondary windows
@@ -207,8 +205,8 @@ into Claude analytics. Reads do not refresh an event's observation time.
 All failure detection, reconciliation, placement and recovery paths require exactly
 `claude-code` before acting on Claude accounts. Old misclassified Codex recovery records
 are removed by the sweeper, and provider identity is checked again before a resume.
-There is no Codex switcher, auth routing change or Pooler integration. This preserves the
-custom Claude primary and the separate Python deadman.
+Codex switching has its own opt-in watch decision and credential helper, described below.
+Claude recovery and the separate Python deadman retain their existing behavior.
 
 The SDK event notification requires bb 0.43 or newer. Verification includes the actual
 plugin failure handler, reconciliation, event listener, RPC and CLI under the public SDK
@@ -247,7 +245,9 @@ that contract. Issues and PRs generalizing this are welcome.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `autoSwitch` | `true` | master switch for every path, placement included |
+| `autoSwitch` | `true` | Claude master switch, placement included |
+| `codexAutoSwitch` | `false` | Codex watch decisions; enable after real session verification |
+| `codexSwitchAt` | `97` | Codex main window threshold %, with a 120-second switch cooldown |
 | `switchAt` | `97` | 5h utilization % that triggers a proactive switch |
 | `weeklyAt` | `100` | 7d utilization % that triggers a switch, and caps destinations |
 | `placeOnSpawn` | `true` | check a new thread's account has room for its model before it starts |
@@ -275,3 +275,37 @@ conservatively. Use at your own risk.
 ## License
 
 MIT
+
+## Codex account slots and analytics (MX-1328)
+
+The dotfiles `codex-acct` helper owns macOS Keychain slots and the live native Codex
+login. Capture the current login with `codex-acct capture <name>`, sign in to the
+second account through the official flow, then capture that slot too. The usage-only
+`codex.usage-poll` LaunchAgent writes `~/.config/codex-usage/usage.json` every 180 seconds.
+Both BB surfaces and Übersicht display each captured account and its active-login marker.
+The marker describes the file used by new processes; existing sessions may retain an
+older account. Automatic mode ships **off** pending a two-account running-session exercise.
+
+- `bb accounts codex use <slot>`: manual switch, expected-current identity checked;
+  a spent or unknown target reports a potential paid-credit warning.
+- `bb accounts codex auto`: one decision using `codexAutoSwitch` and `codexSwitchAt`.
+  Chooses only fresh, lower-use main subscription capacity; the credential helper checks
+  free capacity again inside the transaction. No Spark/credits selection or token-based quota.
+- `bb accounts telemetry --json`: unchanged v1 envelope, multiple Codex rows with additive
+  `slot` and `active` fields. Missing/malformed cache gives UNKNOWN, not a fabricated zero.
+
+The usage dashboard indexes structured native Codex session records every 15 minutes
+(`bb accounts reindex` triggers the existing indexer). `turn_context` supplies
+model and cwd; `token_usage_record.usage` supplies per-response tokens. Global response
+IDs dedupe replay/forks; cumulative turn/thread blocks are ignored. Cwd goes through the
+existing repo resolver. Unattributed records remain visible as unknown/unresolved.
+Input includes cached input and output includes reasoning, so these components are
+shown separately without being added twice. These are local indexed responses only,
+not a complete account-wide usage meter. Claude weighted-token views remain separate.
+
+The forecast overlays Codex window percentages on a shared time axis with Claude's
+summed headroom points, using distinct labeled scales. Codex uses only its own quota
+samples: at least three days and 1,440 fresh polls, including 1,296 valid adjacent
+intervals (at most ten minutes apart, same reset, no utilization decrease). Thin history
+is provisional; stale history has no projection. Each line follows observed average
+burn and ends at its window reset; it does not predict refills or infer quota from tokens.

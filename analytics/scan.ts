@@ -23,12 +23,26 @@ export interface ScanResult {
 }
 
 /** Called with each batch. Persisting rows and cursor together is the caller's job. */
-export type OnBatch = (rows: TranscriptRow[], filePath: string, cursor: ScanCursor) => void;
+export type OnBatch<T = TranscriptRow> = (rows: T[], filePath: string, cursor: ScanCursor) => void;
 
 const CHUNK = 1 << 20; // 1 MiB
 const BATCH = 1000;
 
-async function listTranscripts(root: string): Promise<string[]> {
+async function listTranscripts(root: string, recursive = false): Promise<string[]> {
+  if (recursive) {
+    const out: string[] = [];
+    async function visit(dir: string) {
+      let entries;
+      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) await visit(file);
+        else if (entry.isFile() && entry.name.endsWith('.jsonl')) out.push(file);
+      }
+    }
+    await visit(root);
+    return out.sort();
+  }
   const out: string[] = [];
   let projects: string[];
   try {
@@ -59,12 +73,13 @@ async function listTranscripts(root: string): Promise<string[]> {
  * independently would corrupt those characters and — worse — desynchronise the
  * byte offset, so every later scan of that file would start mid-line.
  */
-async function readFrom(
+async function readFrom<T>(
   filePath: string,
   from: number,
   size: number,
   mtime: number,
-  onBatch: OnBatch,
+  onBatch: OnBatch<T>,
+  parse: (line: string, session: string, project: string) => T | null,
 ): Promise<number> {
   const sessionId = path.basename(filePath, ".jsonl");
   const project = path.basename(path.dirname(filePath));
@@ -72,7 +87,7 @@ async function readFrom(
   /** Byte offset of the first byte NOT yet handed to onBatch. Line-aligned. */
   let consumed = from;
   let rows = 0;
-  let batch: TranscriptRow[] = [];
+  let batch: T[] = [];
   let leftover = Buffer.alloc(0);
 
   try {
@@ -92,7 +107,7 @@ async function readFrom(
       leftover = combined.subarray(lastNewline + 1);
 
       for (const line of complete.toString("utf8").split("\n")) {
-        const row = parseTranscriptLine(line, sessionId, project);
+        const row = parse(line, sessionId, project);
         if (row) batch.push(row);
       }
       // Only now is `complete` fully processed, so only now may the cursor
@@ -129,12 +144,14 @@ async function readFrom(
  * and it is re-read from zero. Rows are keyed on (sessionId, messageId)
  * downstream, so a full re-read is idempotent rather than duplicating.
  */
-export async function scanTranscripts(
+export async function scanTranscripts<T = TranscriptRow>(
   root: string,
   cursors: Map<string, ScanCursor>,
-  onBatch: OnBatch,
+  onBatch: OnBatch<T>,
+  parse: (line: string, session: string, project: string) => T | null = parseTranscriptLine as unknown as (line: string, session: string, project: string) => T | null,
+  recursive = false,
 ): Promise<ScanResult> {
-  const files = await listTranscripts(root);
+  const files = await listTranscripts(root, recursive);
   const result: ScanResult = { filesSeen: files.length, filesRead: 0, rowsParsed: 0 };
 
   for (const filePath of files) {
@@ -154,7 +171,7 @@ export async function scanTranscripts(
         continue;
       }
       result.filesRead++;
-      result.rowsParsed += await readFrom(filePath, from, size, mtime, onBatch);
+      result.rowsParsed += await readFrom(filePath, from, size, mtime, onBatch, parse);
     } catch {
       // One unreadable transcript must never stop the scan. A file being
       // rotated out from under us is normal, not exceptional.

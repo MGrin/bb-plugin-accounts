@@ -92,7 +92,7 @@ export function AccountCard({ account: a }: { account: CardAccount }) {
         <span className="text-sm text-foreground">{a.label}</span>
         {a.active && (
           <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-primary">
-            active
+            {a.provider === "Codex" ? "active login" : "active"}
           </span>
         )}
         <span className={`ml-auto text-xs ${STATE_CLASS[a.state]}`}>

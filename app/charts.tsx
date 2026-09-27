@@ -12,6 +12,7 @@
 // The light-mode contrast WARN is what obliges every bar here to carry a
 // visible label: relief, not decoration. Slots are assigned in fixed order and
 // never cycled, so a series keeps its colour when the set changes.
+import type { CodexForecast } from '../analytics/codex-forecast.ts';
 import { Fragment, useState } from "react";
 
 export const SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"];
@@ -203,17 +204,19 @@ export interface TimelinePoint {
  * Projected headroom over time, with blackout stretches called out in the
  * reserved critical colour plus a label — never colour alone.
  */
-export function Timeline({ points, height = 120 }: { points: TimelinePoint[]; height?: number }) {
+export function Timeline({ points, codex = [], height = 120 }: { points: TimelinePoint[]; codex?: CodexForecast[]; height?: number }) {
   const [hover, setHover] = useState<TimelinePoint | null>(null);
-  if (points.length < 2) {
-    return <div className="text-xs text-muted-foreground">not enough forecast to plot</div>;
-  }
+  const series = codex.filter(c=>c.confidence==='fitted' && c.points.length>=2);
+  const times = [...points.map(p=>p.ts),...series.flatMap(c=>c.points.map(p=>p.ts))];
+  const lo = Math.min(...times), hi = Math.max(...times);
   const W = 100;
   const max = Math.max(...points.map((p) => p.headroom), 1);
-  const x = (i: number) => (i / (points.length - 1)) * W;
+  const tx = (ts:number) => hi>lo?(ts-lo)/(hi-lo)*W:0;
+  const x = (i:number) => tx(points[i]!.ts);
   const y = (v: number) => height - (v / max) * (height - 8) - 4;
+  const cy = (v:number) => height - v/100*(height-8)-4;
   const line = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(2)},${y(p.headroom).toFixed(2)}`).join(" ");
-  const area = `${line} L${W},${height} L0,${height} Z`;
+  const area = points.length?`${line} L${x(points.length-1)},${height} L${x(0)},${height} Z`:'';
 
   const bands: Array<[number, number]> = [];
   for (let i = 0; i < points.length; i++) {
@@ -231,12 +234,13 @@ export function Timeline({ points, height = 120 }: { points: TimelinePoint[]; he
         className="w-full"
         style={{ height }}
         role="img"
-        aria-label="projected total headroom over the forecast horizon"
+        aria-label="Claude and Codex forecasts on a shared time axis with independent scales"
         onMouseLeave={() => setHover(null)}
         onMouseMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           const frac = (e.clientX - rect.left) / rect.width;
-          setHover(points[Math.min(points.length - 1, Math.max(0, Math.round(frac * (points.length - 1))))] ?? null);
+          const ts=lo+frac*(hi-lo);
+          setHover(points.length ? points.reduce((best,p)=>Math.abs(p.ts-ts)<Math.abs(best.ts-ts)?p:best) : null);
         }}
       >
         {bands.map(([a, b]) => (
@@ -252,6 +256,10 @@ export function Timeline({ points, height = 120 }: { points: TimelinePoint[]; he
         ))}
         <path d={area} style={{ fill: "var(--acct-series-0)" }} opacity={0.14} />
         <path d={line} fill="none" style={{ stroke: "var(--acct-series-0)" }} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+        {series.map((c,i)=><path key={`${c.accountId}:${c.window}:${c.durationMins}`} data-codex-series={`${c.accountId}:${c.window}`}
+          d={c.points.map((p,j)=>`${j?'L':'M'}${tx(p.ts).toFixed(2)},${cy(p.remaining).toFixed(2)}`).join(' ')}
+          fill="none" style={{stroke:`var(--acct-series-${1+codex.indexOf(c)%4})`}} strokeWidth={2} strokeDasharray="5 3" vectorEffect="non-scaling-stroke">
+          <title>{`${c.label} · ${c.window} · remaining subscription %`}</title></path>)}
         {hover && (
           <line
             x1={x(points.indexOf(hover))}
@@ -264,12 +272,21 @@ export function Timeline({ points, height = 120 }: { points: TimelinePoint[]; he
           />
         )}
       </svg>
+      <div className="text-[10px] text-muted-foreground flex justify-between">
+        <span>Claude · left scale 0–{Math.round(max)} summed headroom points</span><span>Codex · right scale 0–100% remaining per window</span>
+      </div>
+      {times.length>1 && <div className="text-[10px] text-muted-foreground flex justify-between"><span>{new Date(lo*1000).toLocaleString()}</span><span>{new Date(hi*1000).toLocaleString()}</span></div>}
+      {codex.length===0 && <p className="text-xs text-muted-foreground">Codex forecast provisional · no measured window history yet.</p>}
+      {codex.map((c,i)=><p key={`${c.accountId}:${c.window}:${c.durationMins}`} className="text-xs text-muted-foreground">
+        <span style={{color:`var(--acct-series-${1+i%4})`}}>┄ </span>{c.label} · {c.window} ({c.durationMins} min) · {c.confidence}
+        {c.confidence==='fitted'?` · ${c.ratePerHour?.toFixed(2)} percentage points/hour observed average · ends at reset`: ` · ${c.polls}/${c.neededPolls} polls; requires 3 days and continuous measurements`}
+      </p>)}
       <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
         <span>
           {hover
             ? `${new Date(hover.ts * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })} — ` +
               `${Math.round(hover.headroom)} points headroom${hover.blacked ? " · all accounts walled" : ""}`
-            : "total headroom across every account"}
+            : "solid: Claude summed headroom · dashed: individual Codex windows"}
         </span>
         {bands.length > 0 && (
           <span className="flex items-center gap-1">

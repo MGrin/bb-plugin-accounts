@@ -21,9 +21,9 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import { createCodexSnapshotReader, createJevUsageReader } from "./telemetry-source.ts";
+import { createCodexSlotReader, createJevUsageReader } from "./telemetry-source.ts";
 import { telemetryShape, normalizeClaude, normalizeCodexEvents, isClaudeProvider, isFresh,
-  formatTelemetry, jevSpendShape, formatJev, type JevSpend, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
+  chooseCodexSlot, formatTelemetry, jevSpendShape, formatJev, type JevSpend, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
 import {
@@ -62,6 +62,8 @@ import { buildForecast, type Forecast } from "./analytics/forecast.ts";
 import { ingestUsage } from "./analytics/ingest.ts";
 import { buildProfile } from "./analytics/profile.ts";
 import { scanTranscripts } from "./analytics/scan.ts";
+import { parseCodexLine, writeCodexRows, codexBreakdown, codexCoverage, codexBreakdownShape } from './analytics/codex.ts';
+import { recordCodexWindows, readCodexForecast, codexForecastShape } from './analytics/codex-forecast.ts';
 import { agentShape, prettyProject } from "./analytics/transcripts.ts";
 import {
   envIdFromPath,
@@ -222,6 +224,7 @@ export const rpcContract = defineRpcContract({
   // Its own method, not a key on `telemetry`: the dotfiles widget feed pins that shape to version 1.
   jev: { input: z.null(), output: jevSpendShape },
   forecast: { input: z.null(), output: forecastShape.nullable() },
+  codexForecast: { input: z.null(), output: z.array(codexForecastShape) },
   analytics: {
     input: z.object({ days: z.number() }),
     output: z.object({
@@ -230,6 +233,10 @@ export const rpcContract = defineRpcContract({
         messages: z.number(),
         firstTs: z.number().nullable(),
         lastTs: z.number().nullable(),
+      }),
+      codex: z.object({
+        coverage:z.object({responses:z.number(),firstTs:z.number().nullable(),lastTs:z.number().nullable(),unattributed:z.number()}),
+        byModel:z.array(codexBreakdownShape),byRepo:z.array(codexBreakdownShape),byDirectory:z.array(codexBreakdownShape),
       }),
       byModel: z.array(burnSliceShape),
       byAgent: z.array(burnSliceShape),
@@ -361,12 +368,18 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   runClaudeAccount?: (args: string[]) => Promise<string>;
   readClaudeUsage?: typeof readUsageCache;
   readCodexSnapshot?: () => Promise<ProviderAccount>;
+  readCodexSlots?: () => Promise<ProviderAccount[]>;
+  runCodexAccount?: (args: string[]) => Promise<string>;
   readJevUsage?: () => Promise<JevSpend>;
 } = {}) {
   const readUsage = dependencies.readClaudeUsage ?? readUsageCache;
   const runClaudeAccount = dependencies.runClaudeAccount ?? (async (args: string[]) =>
     (await run(CLAUDE_ACCT, args, { timeout: 30_000 })).stdout);
-  const readCodexSnapshot = dependencies.readCodexSnapshot ?? createCodexSnapshotReader(`${os.homedir()}/.local/bin/mx`);
+  const readCodexSlots = dependencies.readCodexSlots ?? (dependencies.readCodexSnapshot
+    ? async () => [await dependencies.readCodexSnapshot!()]
+    : createCodexSlotReader(`${os.homedir()}/.config/codex-usage/usage.json`));
+  const runCodexAccount = dependencies.runCodexAccount ?? (async (args: string[]) =>
+    (await run(`${os.homedir()}/.local/bin/codex-acct`, args, {timeout:30_000,maxBuffer:262144})).stdout);
   const readJevUsage = dependencies.readJevUsage ?? createJevUsageReader(`${os.homedir()}/.local/bin/mx`);
   const observedThreads = new Map<string, { account: ProviderAccount | null; tokens: TokenObservation | null }>();
   const inspectingThreads = new Set<string>();
@@ -402,14 +415,16 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     forgetThread(thread.id);
   });
   async function currentTelemetry(): Promise<Telemetry> {
-    const [claude, codex] = await Promise.all([readUsage(), readCodexSnapshot()]);
+    const [claude, codex] = await Promise.all([readUsage(), readCodexSlots()]);
     const now = Date.now() / 1000;
     return { version: 1,
-      accounts: [...normalizeClaude(claude.accounts, claude.polledAt, now), codex,
+      accounts: [...normalizeClaude(claude.accounts, claude.polledAt, now), ...codex,
         ...[...observedThreads.values()].flatMap(v => v.account ? [{ ...v.account, fresh: isFresh(v.account.observedAt, now) }] : [])],
       tokens: [...observedThreads.values()].flatMap(v => v.tokens ? [{ ...v.tokens, fresh: isFresh(v.tokens.observedAt, now) }] : []) };
   }
   const settings = bb.settings.define({
+    codexAutoSwitch: { type: "boolean", label: "Codex automatic switching (enable after session verification)", default: false },
+    codexSwitchAt: { type: "string", label: "Codex main window switch threshold %", default: "97" },
     autoSwitch: { type: "boolean", label: "Auto-switch accounts", default: true },
     switchAt: { type: "string", label: "5h utilization % that triggers a proactive switch", default: "97" },
     // 100 = the wall, not a margin. At 95 an account was abandoned with 5% of its
@@ -812,7 +827,41 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     }
   }
 
+  let codexSwitching = false;
+  async function switchCodex(slot: string, rows: ProviderAccount[], automatic = false) {
+    const active = rows.filter(r=>r.active && r.slot);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(slot) || active.length !== 1 || !rows.some(r=>r.slot===slot))
+      return {exitCode:2,stderr:'Codex slot or active identity unavailable; poll accounts first'};
+    if (codexSwitching) return {exitCode:2,stderr:'Codex switch already in progress'};
+    codexSwitching = true;
+    try {
+      const raw = await runCodexAccount(['use',slot,'--expected-current',active[0]!.slot!,...(automatic?['--require-free']:[])]);
+      const result = JSON.parse(raw);
+      if (result.from !== active[0]!.slot || result.to !== slot || typeof result.changed !== 'boolean')
+        throw new Error('invalid result');
+      if (result.changed) {
+        await bb.storage.kv.set('last-codex-switch',{at:Date.now()/1000,from:result.from,to:slot});
+      }
+      return {exitCode:0,stdout:JSON.stringify({from:result.from,to:slot,changed:result.changed,capacity:['available','exhausted','unknown'].includes(result.capacity)?result.capacity:null,warning:result.capacity==='available'?null:'Confirm free capacity before starting new work; enabled credits may be used'})};
+    } catch { return {exitCode:2,stderr:'Codex switch failed; check the current login and capture state'}; }
+    finally {codexSwitching=false;}
+  }
+  async function autoCodex() {
+    const config = await settings.get();
+    if (!config.codexAutoSwitch) return {exitCode:0,stdout:'Codex auto-switch is off'};
+    const last = await bb.storage.kv.get<{at:number}>('last-codex-switch');
+    if (last && Date.now()/1000-last.at < 120) return {exitCode:0,stdout:'Codex switch cooldown'};
+    const rows=await readCodexSlots();
+    const active=rows.find(r=>r.active)?.slot;
+    const target=active ? chooseCodexSlot(rows,active,Number(config.codexSwitchAt)) : null;
+    if (!target) return {exitCode:0,stdout:'Codex waiting: no switch with fresh free capacity'};
+    return switchCodex(target,rows,true);
+  }
+
   bb.background.schedule("watch", "*/2 * * * *", async () => {
+    try { recordCodexWindows(db,await readCodexSlots(),Date.now()/1000); }
+    catch { bb.log.warn('Codex quota history unavailable'); }
+    try { await autoCodex(); } catch { bb.log.warn("Codex watch unavailable"); }
     const { autoSwitch, switchAt, weeklyAt, spreadMargin, cooldownSec, spreadCooldownSec, outageConfirmPolls } =
       await settings.get();
     const { polledAt, accounts } = await readUsage();
@@ -1029,11 +1078,14 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         written += writeTranscriptRows(db, rows);
         writeCursor(db, filePath, cursor);
       });
+      const codexResult = await scanTranscripts(`${process.env.CODEX_HOME || `${os.homedir()}/.codex`}/sessions`, cursors, (rows,file,cursor)=>{
+        writeCodexRows(db,rows); writeCursor(db,file,cursor);
+      },parseCodexLine,true);
       const resolved = await resolveRepos();
       const cov = transcriptCoverage(db);
       return (
         `indexed ${written} new message(s) from ${result.filesRead}/${result.filesSeen} transcript(s) ` +
-        `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} total` +
+        `in ${Math.round((Date.now() - startedAt) / 1000)}s — ${cov.messages} Claude total; ${codexResult.rowsParsed} Codex structured records read` +
         (resolved ? `, resolved ${resolved} new working director${resolved === 1 ? "y" : "ies"} to repos` : "")
       );
     } finally {
@@ -1428,6 +1480,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     async forecast() {
       return (await currentForecast()) ?? null;
     },
+    codexForecast: () => readCodexForecast(db,Date.now()/1000),
     async analytics({ days }) {
       const now = Math.floor(Date.now() / 1000);
       const since = now - Math.max(1, days) * 86400;
@@ -1435,6 +1488,8 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       return {
         days,
         coverage: transcriptCoverage(db),
+        codex: {coverage:codexCoverage(db),byModel:codexBreakdown(db,'model',since),
+          byRepo:codexBreakdown(db,'repo',since),byDirectory:codexBreakdown(db,'cwd',since)},
         byModel: burnBy(db, "model", since),
         byAgent: mergeByKey(burnBy(db, "entrypoint", since).map((x) => ({ ...x, key: agentShape(x.key) }))),
         byRepo: burnBy(db, "repo", since).slice(0, 12),
@@ -1476,6 +1531,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     name: "accounts",
     summary: "Claude switching and provider-scoped subscription telemetry",
     commands: [
+      { name: "codex", summary: "Switch captured Codex logins", usage: "bb accounts codex use <slot> | auto" },
       { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
       { name: "jev", summary: "Jev usage from mx jev usage: this key's counts, and the TypeSafe console bill when one was read", usage: "bb accounts jev [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
@@ -1510,6 +1566,11 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     ],
     async run(argv) {
       const cmd = argv[0] ?? "list";
+      if (cmd === 'codex') {
+        if (argv[1] === 'use' && argv.length === 3) return switchCodex(argv[2]!, await readCodexSlots());
+        if (argv[1] === 'auto' && argv.length === 2) return autoCodex();
+        return {exitCode:2,stderr:'usage: bb accounts codex use <slot> | codex auto'};
+      }
       if (cmd === "telemetry") {
         const telemetry = await currentTelemetry();
         return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(telemetry) : formatTelemetry(telemetry) };

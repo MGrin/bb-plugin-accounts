@@ -418,7 +418,7 @@ export function readModelWeights(db: Database): { weights: Record<string, number
 export function unresolvedCwds(db: Database, limit = 500): string[] {
   const rows = db
     .prepare(
-      `SELECT DISTINCT m.cwd AS cwd FROM transcript_msg m
+      `SELECT DISTINCT m.cwd AS cwd FROM (SELECT cwd FROM transcript_msg UNION SELECT cwd FROM codex_turn) m
          LEFT JOIN cwd_repo r ON r.cwd = m.cwd
         WHERE m.cwd IS NOT NULL AND r.cwd IS NULL LIMIT ?`,
     )

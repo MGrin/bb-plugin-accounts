@@ -9,7 +9,7 @@ import { AccountCard } from "./account-card.tsx";
 import { claudeCards, codexCards } from "./cards.ts";
 import type { Status } from "./current.tsx";
 
-const NOW = Date.parse("2026-09-23T04:00:00Z");
+const NOW = Date.now();
 
 const claudeStatus = (over: Partial<Status["accounts"][number]> = {}, stale = false): Status => ({
   polledAt: Math.floor(NOW / 1000),
@@ -84,4 +84,13 @@ test("a stale Codex reading is unreadable, never a percentage", () => {
   assert.equal(card.state, "unreadable");
   assert.equal(card.windows[0].usedPercent, null);
   assert.match(renderToStaticMarkup(createElement(AccountCard, { account: card })), /unknown/);
+});
+
+test('Codex cards expire a retained RPC observation and its active marker',()=>{
+ const at=Math.floor(Date.now()/1000);
+ const fresh={...codexAccount(),active:true,observedAt:at};
+ const live=codexCards([fresh]);assert.equal(live[0].active,true);
+ const stale=codexCards([{...fresh,observedAt:at-181}]);
+ assert.equal(stale[0].state,'unreadable');assert.equal(stale[0].active,false);
+ assert.equal(stale[0].windows[0].usedPercent,null);
 });
