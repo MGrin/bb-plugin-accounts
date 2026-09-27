@@ -102,8 +102,8 @@ export function SubscriptionsSection({ compact = false }: { compact?: boolean })
     {provider:"Claude", cards:claudeCards(status,now), loading:pending.claude, error:errors.claude},
     {provider:"Codex", cards:codexCards(codex,now), loading:pending.codex, error:errors.codex},
   ];
-  return <div className="space-y-4">
-    <div className={`grid items-start gap-4 ${compact ? "" : "md:grid-cols-2"}`}>
+  return <div className="@container space-y-4">
+    <div className={`grid items-start gap-4 ${compact ? "" : "@2xl:grid-cols-2"}`}>
       {groups.map(g=><div key={g.provider} className="min-w-0 space-y-2" aria-label={`${g.provider} subscriptions`}>
         <h3 className="text-xs font-medium text-muted-foreground">{g.provider}</h3>
         {g.loading ? <div className="rounded-md border border-border bg-muted/20 p-3"><LoadingBlock label={`Loading ${g.provider} subscriptions`} rows={2} /></div>

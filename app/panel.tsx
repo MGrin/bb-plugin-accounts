@@ -149,7 +149,7 @@ export function UsagePanel() {
   }, [days, retry]);
 
   return (
-    <div className="acct-viz h-full overflow-y-auto">
+    <div className="acct-viz @container h-full overflow-y-auto">
       <PaletteVars />
       <div className="p-4 pb-10 space-y-4 max-w-6xl mx-auto">
 
@@ -213,24 +213,24 @@ export function UsagePanel() {
       )}
 
       <Section title="By model" hint="Share within each provider for the selected period. These metrics do not measure subscription quota.">
-        <div className="grid items-start gap-6 md:grid-cols-2">
+        <div className="grid items-start gap-6 @2xl:grid-cols-2">
           <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byModel ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
           <CodexTokens rows={data?.codex.byModel ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
         </div>
       </Section>
       <Section title="By project" hint="Usage grouped by repository. Personal workspaces without a repository appear as (no repo).">
-        <div className="grid items-start gap-6 md:grid-cols-2">
+        <div className="grid items-start gap-6 @2xl:grid-cols-2">
           <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byRepo ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
           <CodexTokens rows={data?.codex.byRepo ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
         </div>
       </Section>
       <Section title="By directory" hint="Usage grouped by working directory.">
-        <div className="grid items-start gap-6 md:grid-cols-2">
+        <div className="grid items-start gap-6 @2xl:grid-cols-2">
           <UsageBreakdown provider="Claude" metric="Weighted tokens · thousands" slices={data?.byProject ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
           <CodexTokens rows={data?.codex.byDirectory ?? []} loading={loading} error={!data && !loading ? "Usage history unavailable." : null} />
         </div>
       </Section>
-      <div className="grid items-start gap-4 md:grid-cols-2">
+      <div className="grid items-start gap-4 @2xl:grid-cols-2">
         <Section title="Claude activity" hint="Weighted tokens by local hour of week.">
           {loading ? <LoadingBlock label="Loading Claude activity" /> : data ? <div className="overflow-x-auto"><Heatmap cells={data.byHourOfWeek} /></div> : <p className="text-xs text-muted-foreground">Usage history unavailable.</p>}
         </Section>
