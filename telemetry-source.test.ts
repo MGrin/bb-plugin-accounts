@@ -80,3 +80,22 @@ test("Jev reader: missing, not JSON, oversized and slow each say why they are UN
     assert.equal((await createJevUsageReader(cli)()).state, "ok");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('Jev reader merges bounded refresh status and preserves only account snapshot on mx failure', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'accounts-jev-status-'));
+  const cli = path.join(dir, 'mx'), statusFile = path.join(dir, 'billing-status.json');
+  let now=1800000000;
+  try {
+    const data = {...jevReading(now), billing:{amount_usd:3,recorded_ts:now-100,period:'September',source:'https://console.typesafe.ai/settings/billing',kind:'account-billing',balance_usd:2}};
+    await writeFile(cli, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify(data))});`, {mode:0o755});
+    await writeFile(statusFile, JSON.stringify({version:1,state:'blocked',attempted_at:now,reason:'secret'}));
+    const read=createJevUsageReader(cli,()=>now,5000,statusFile);
+    const good=await read();
+    assert.equal(good.billingRefresh?.state,'blocked');
+    await writeFile(cli, `#!${process.execPath}\nprocess.exit(2);`);
+    now+=61;
+    const failed=await read();
+    assert.equal(failed.state,'unknown'); assert.equal(failed.billing?.amountUsd,3);
+    assert.deepEqual(failed.windows,[]); assert.doesNotMatch(JSON.stringify(failed),/secret/);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});

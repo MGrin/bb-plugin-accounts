@@ -1,5 +1,7 @@
 import { open } from "node:fs/promises";
-import { normalizeCodexSlots } from "./telemetry.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { normalizeBillingRefresh, normalizeCodexSlots } from "./telemetry.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeCodex, unknownCodex, normalizeJev, unknownJev, type JevSpend, type ProviderAccount } from "./telemetry.ts";
@@ -49,7 +51,8 @@ function whyMxFailed(error: unknown, timeoutMs: number): string {
 }
 
 /** `mx jev usage --json`, bounded like the Codex reader. rc 2 is blind or usage: UNKNOWN, never a reading. */
-export function createJevUsageReader(command: string, now = () => Date.now() / 1000, timeoutMs = 10_000) {
+export function createJevUsageReader(command: string, now = () => Date.now() / 1000, timeoutMs = 10_000,
+  statusFile = join(process.env.MX_JEV_STATE_DIR || join(homedir(), ".local/state/mx-jev"), "billing-status.json")) {
   let pending: Promise<JevSpend> | null = null;
   let attemptedAt = -Infinity;
   let last: JevSpend = unknownJev("Jev usage has not been read");
@@ -58,16 +61,27 @@ export function createJevUsageReader(command: string, now = () => Date.now() / 1
     if (now() - attemptedAt < 60) return last;
     attemptedAt = now();
     pending = (async () => {
+      let status:unknown=null;
+      try {
+        const handle=await open(statusFile,"r");
+        try {
+          if ((await handle.stat()).size > 16384) throw new Error("large");
+          const buffer=Buffer.alloc(16385), {bytesRead}=await handle.read(buffer,0,buffer.length,0);
+          if(bytesRead>16384) throw new Error("large");
+          status=JSON.parse(buffer.subarray(0,bytesRead).toString("utf8"));
+        } finally {await handle.close();}
+      } catch(error) {if((error as NodeJS.ErrnoException).code!=="ENOENT") status={};}
+      const fail=(reason:string):JevSpend => last={...unknownJev(reason),billing:last.billing,billingRefresh:normalizeBillingRefresh(status)};
       let stdout: string;
       try {
         ({ stdout } = await run(command, ["jev", "usage", "--json"], { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8", killSignal: "SIGKILL" }));
-      } catch (error) {
-        return last = unknownJev(whyMxFailed(error, timeoutMs));
-      } finally { pending = null; }
+      } catch (error) {return fail(whyMxFailed(error, timeoutMs));}
       let parsed: unknown;
-      try { parsed = JSON.parse(stdout); } catch { return last = unknownJev("mx jev usage printed something that is not JSON"); }
-      return last = normalizeJev(parsed, now());
-    })();
+      try {parsed=JSON.parse(stdout);} catch {return fail("mx jev usage printed something that is not JSON");}
+      const next=normalizeJev(parsed, now());
+      if(next.state === "unknown") return fail(next.reason);
+      return last={...next,billingRefresh:normalizeBillingRefresh(status)};
+    })().finally(()=>{pending=null;});
     return pending;
   };
 }

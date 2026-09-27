@@ -183,22 +183,29 @@ export function formatTelemetry(t: Telemetry): string {
   return lines.join("\n\n");
 }
 
-/**
- * Jev spend, read from `mx jev usage --json` (MX-1172) and never recomputed here: mx and the
- * Übersicht widget read the same log through the same code, so a second reader would be a
- * second number. Three states and no fourth. `no-data` (no log, or no decision in it) is NOT
- * zero spend, and `unknown` is anything we could not trust; neither carries a figure.
+/** Jev's measured local token windows and independent last account snapshot.
+ * Dollar estimates below never replace account billing; missing usage is not zero.
  */
 export const JEV_COVERS = "calls made through `mx jev` only. The fast-jev-compaction plugin and any script that posts to TypeSafe directly are NOT in these numbers";
 const jevCountsShape = z.object({ calls: z.number(), inputTokens: z.number() });
-/** The ONE dollar figure (MX-1200): a recorded reading of TypeSafe's console, every key. */
-const jevBillingShape = z.object({ amountUsd: z.number(), recordedAt: z.number(), period: z.string(), source: z.string(), asOf: z.string().nullable() });
+/** Recorded console reading, separate from estimates based on local token counts. */
+const jevBillingShape = z.object({ amountUsd: z.number(), recordedAt: z.number(), period: z.string(), source: z.string(), asOf: z.string().nullable(),
+  kind: z.literal("account-billing").optional(), balanceUsd: z.number().optional(), plan: z.string().optional() });
+const billingRefreshShape = z.object({state:z.enum(["ok","blocked","login-required","rate-limited","unavailable","invalid-response","unknown"]), attemptedAt:z.number().nullable(), rayId:z.string().nullable()});
+const refreshLabels = {ok:"Account billing refreshed", blocked:"Cloudflare blocked billing refresh", "login-required":"Console login required",
+  "rate-limited":"Billing refresh rate limited", unavailable:"Billing service unavailable", "invalid-response":"Unrecognized billing response", unknown:"Billing refresh status unavailable"};
+// Vendor list price, verified 2026-09-27: https://docs.typesafe.ai/models. Estimates are separate from account billing.
+export const JEV_INPUT_USD_PER_MILLION = 0.042;
+export const JEV_PRICE_CHECKED = "2026-09-27";
+export const JEV_BILLING_MAX_AGE = 13 * 3600; // scheduled at most twice daily, with one hour of scheduling tolerance
+
 export const jevSpendShape = z.object({
   state: z.enum(["ok", "no-data", "unknown"]),
   reason: z.string(),
   generatedAt: z.number().nullable(), // when mx took the reading, epoch seconds
   lastDecisionAt: z.number().nullable(),
   billing: jevBillingShape.nullable(),
+  billingRefresh: billingRefreshShape.nullable(),
   covers: z.string(),
   windows: z.array(jevCountsShape.extend({ name: z.string(), since: z.number(), bySet: z.array(jevCountsShape.extend({ set: z.string() })) })),
   /**
@@ -210,13 +217,13 @@ export const jevSpendShape = z.object({
    * page reported it nowhere. Null when the plugin's log is absent or unreadable: that is
    * NOT zero compaction.
    */
-  compaction: z.array(jevCountsShape.extend({ name: z.string(), compactions: z.number(), jevRequests: z.number() })).nullable(),
+  compaction: z.array(jevCountsShape.extend({ name: z.string(), compactions: z.number(), jevRequests: z.number(), unmetered: z.number().nullable().optional() })).nullable(),
 });
 export type JevSpend = z.infer<typeof jevSpendShape>;
 export const JEV_WINDOWS = ["24h", "7d", "30d"] as const;
 
 export function unknownJev(reason: string): JevSpend {
-  return { state: "unknown", reason, generatedAt: null, lastDecisionAt: null, billing: null, covers: JEV_COVERS, windows: [], compaction: null };
+  return { state: "unknown", reason, generatedAt: null, lastDecisionAt: null, billing: null, billingRefresh:null, covers: JEV_COVERS, windows: [], compaction: null };
 }
 
 const nonNegative = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
@@ -228,7 +235,9 @@ const jevBilling = (value: unknown): JevSpend["billing"] => {
   const b = value as Record<string, unknown>, recordedAt = epochSeconds(b.recorded_ts);
   if (!nonNegative(b.amount_usd) || recordedAt === null || typeof b.period !== "string" || typeof b.source !== "string") return null;
   return { amountUsd: b.amount_usd, recordedAt, period: b.period.slice(0, 80), source: b.source.slice(0, 200),
-    asOf: typeof b.as_of === "string" ? b.as_of.slice(0, 80) : null };
+    asOf: typeof b.as_of === "string" ? b.as_of.slice(0, 80) : null,
+    ...(b.kind === "account-billing" && b.source === "https://console.typesafe.ai/settings/billing" && typeof b.balance_usd === "number" && Number.isFinite(b.balance_usd)
+      ? {kind:"account-billing" as const, balanceUsd:b.balance_usd, ...(typeof b.plan === "string" ? {plan:b.plan.slice(0,80)} : {})} : {}) };
 };
 
 /**
@@ -243,17 +252,36 @@ const jevCompaction = (value: unknown): JevSpend["compaction"] => {
     const counts = nonNegative(w.input_tokens) ? { calls: 0, inputTokens: w.input_tokens } : null;
     const name = word(w.name);
     if (!counts || !name || !nonNegative(w.compactions) || !nonNegative(w.jev_requests)) return [];
-    return [{ name, ...counts, compactions: w.compactions, jevRequests: w.jev_requests }];
+    return [{ name, ...counts, compactions: w.compactions, jevRequests: w.jev_requests, unmetered:nonNegative(w.unmetered) ? w.unmetered : null }];
   });
   return out.length ? out : null;
 };
+
+export function normalizeBillingRefresh(value: unknown): JevSpend["billingRefresh"] {
+  if (value === null || value === undefined) return null;
+  const v=object(value), state=billingRefreshShape.shape.state.safeParse(v.state);
+  if (v.version !== 1 || !state.success || epochSeconds(v.attempted_at) === null)
+    return {state:"unknown",attemptedAt:null,rayId:null};
+  return {state:state.data,attemptedAt:epochSeconds(v.attempted_at),rayId:typeof v.ray_id === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(v.ray_id) ? v.ray_id : null};
+}
+
+export function billingRefreshLabel(j: JevSpend): string {
+  return j.billingRefresh ? refreshLabels[j.billingRefresh.state] : "Billing refresh has not been observed";
+}
+export function billingIsStale(j: JevSpend, now:number): boolean {
+  return !j.billing || j.state === "unknown" || now-j.billing.recordedAt > JEV_BILLING_MAX_AGE || now<j.billing.recordedAt ||
+    (!!j.billingRefresh && j.billingRefresh.state !== "ok");
+}
+export function jevLocalEstimates(j:JevSpend) {
+  return j.windows.map(w=>({name:w.name, decisionUsd:w.inputTokens*JEV_INPUT_USD_PER_MILLION/1e6}));
+}
 
 export function normalizeJev(value: unknown, _now: number): JevSpend {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return unknownJev("mx jev usage printed something that is not a JSON object");
   const v = value as Record<string, unknown>;
   if (v.version !== 2) return unknownJev(`mx jev usage reported version ${JSON.stringify(v.version) ?? "none"}, this page reads version 2`);
   if (typeof v.log_present !== "boolean") return unknownJev("mx jev usage gave no boolean log_present");
-  const out: JevSpend = { ...unknownJev(""), generatedAt: epochSeconds(v.generated_at), billing: jevBilling(v.billing),
+  const out: JevSpend = { ...unknownJev(""), generatedAt: epochSeconds(v.generated_at), billing: jevBilling(v.billing), billingRefresh:normalizeBillingRefresh(v.billing_refresh), compaction:jevCompaction(v.compaction),
     covers: typeof v.covers === "string" && v.covers.length > 0 && v.covers.length <= 600 ? v.covers : JEV_COVERS };
   if (!v.log_present) return { ...out, state: "no-data", reason: "the Jev decision log does not exist" };
   if (v.last_decision_ts === null) return { ...out, state: "no-data", reason: "the Jev decision log holds no readable decision" };
@@ -285,11 +313,14 @@ export function formatJev(j: JevSpend, now: number): string {
     `Jev usage (this key, mx calls) · newest decision ${jevAge(now - (j.lastDecisionAt ?? now))} ago` +
     ` · reading ${j.generatedAt === null ? "age unknown" : `${jevAge(now - j.generatedAt)} old`}`;
   const rows = j.state !== "ok" ? [] : j.windows.map(w => `  ${w.name.padEnd(4)} ${w.calls.toLocaleString("en-US")} calls · ${w.inputTokens.toLocaleString("en-US")} input tokens`);
-  const b = j.state === "ok" ? j.billing : null;
-  const billed = j.state !== "ok" ? [] : [b
-    ? `  billed (TypeSafe console, every key): $${b.amountUsd.toFixed(2)} for ${b.period} · page as of ${b.asOf ?? "(no stamp shown)"} · read ${jevAge(now - b.recordedAt)} ago`
+  const b = j.billing;
+  const billed = [b
+    ? `  ${b.kind === "account-billing" ? "account spend" : "legacy console estimate"} (TypeSafe console, every key): $${b.amountUsd.toFixed(2)} for ${b.period} · page as of ${b.asOf ?? "(no stamp shown)"} · read ${jevAge(now - b.recordedAt)} ago`
     : "  billed: no dollar figure, nobody has recorded a TypeSafe console reading (mx jev billing record)"];
-  return [head, ...billed, ...rows, `  covers: ${j.covers}`].join("\n");
+  const estimates = j.state === "ok" ? jevLocalEstimates(j).map(w=>`  ${w.name} estimated local cost $${w.decisionUsd.toFixed(4)} (recorded mx calls only)`) : [];
+  const compaction = j.state !== "unknown" ? (j.compaction ?? []).map(w=>`  ${w.name} compaction estimate $${(w.inputTokens*JEV_INPUT_USD_PER_MILLION/1e6).toFixed(4)} (recorded tokens only; ${w.unmetered ?? "unknown"} unmetered)`) : [];
+  return [head, ...billed, `  ${billingRefreshLabel(j)}${b && billingIsStale(j,now) ? "; last reading is stale" : ""}`,
+    ...rows, ...estimates, ...compaction, `  covers: ${j.covers}`].join("\n");
 }
 
 /** Captured slots preserve identity even when a quota probe failed. */

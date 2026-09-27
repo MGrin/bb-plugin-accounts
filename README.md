@@ -213,20 +213,26 @@ plugin failure handler, reconciliation, event listener, RPC and CLI under the pu
 fake host, fake `mx` process tests, and rendering the quota cards. Live install/reload is a
 separate coordinated deployment step.
 
-### Jev spend (MX-1172)
+### Jev billing and local estimates (MX-1329)
 
-`bb accounts jev [--json]` and the `jev` RPC render `mx jev usage --json` (v2), bounded the
-same way as the Codex read and never recomputed here: the Übersicht widget reads the same
-command, so two readers cannot become two numbers. It is its own RPC rather than a key on
-`telemetry`, whose version-1 shape the dotfiles widget feed pins. Three states and no
-fourth: `ok` (24h / 7d / 30d calls and input tokens; dollars ONLY from `billing`, a recorded
-reading of TypeSafe's console across every key, MX-1200), `no-data` (no log, or no
-decision in it, which is **not** zero spend) and `unknown` with its reason (mx missing,
-slow, non-zero exit, not JSON, `version` not 1, `estimate` not true, or a window that is
-not non-negative finite numbers). Only `ok` carries a figure. Every surface prints the two
-caveats beside the numbers: it is an estimate (input tokens × a price constant; TypeSafe
-has no billing endpoint), and it covers `mx jev` calls only, so the fast-jev-compaction
-plugin and any direct TypeSafe caller are missing from it. Exit 0 on any report.
+`bb accounts jev [--json]` and the `jev` RPC read `mx jev usage --json` (v2),
+bounded to one process per minute. Account billing and local usage are independent:
+an absent decision log does not hide a valid account snapshot. Failed reads preserve
+only the previous account snapshot, labelled stale; local counts are not reused.
+
+The dotfiles HTTP collector reads TypeSafe's `getBillingOverviewResult` server action
+and appends account spend, balance and period to `~/.local/state/mx-jev/billing.jsonl`.
+The plugin reads `billing-status.json` alongside that ledger (or under
+`MX_JEV_STATE_DIR`) to distinguish Cloudflare blocks, login failures, rate limits and
+unavailable service. A missing status is unknown, not a successful refresh. Account
+readings older than 13 h are stale. Legacy `/usage` rows are console estimates.
+
+Both the homepage and usage page share one Jev card. Separate local estimates use
+recorded decision and compaction input tokens at the vendor's $0.042/M input rate
+(output free), verified 2026-09-27. They cover recorded traffic only, exclude credits
+and unrecorded callers, and report unmetered compactions. Missing logs are unavailable,
+never zero. Rolling local windows and the vendor's billing cycle remain distinct.
+The plugin never reads session credentials or makes TypeSafe billing/inference calls.
 
 ## Requirements
 
