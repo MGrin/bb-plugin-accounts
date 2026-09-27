@@ -4,12 +4,14 @@ import { z } from "zod";
 export const MAX_AGE_SEC = 180;
 export const providerAccountShape = z.object({
   providerId: z.enum(["claude-code", "codex"]),
+  slot: z.string().nullable().optional(),
+  active: z.boolean().optional(),
   scope: z.enum(["account", "local-session", "thread"]),
   accountId: z.string().nullable(),
   email: z.string().nullable(),
   threadId: z.string().nullable(),
   label: z.string(),
-  source: z.enum(["claude-usage-cache", "mx-spawn-availability", "bb-sdk-event"]),
+  source: z.enum(["claude-usage-cache", "mx-spawn-availability", "bb-sdk-event", "codex-slot-cache"]),
   observedAt: z.number().nullable(), // epoch seconds, never the time a cached result was read
   fresh: z.boolean(),
   capacity: z.enum(["available", "exhausted", "unavailable", "unknown"]), // subscription only
@@ -288,4 +290,46 @@ export function formatJev(j: JevSpend, now: number): string {
     ? `  billed (TypeSafe console, every key): $${b.amountUsd.toFixed(2)} for ${b.period} · page as of ${b.asOf ?? "(no stamp shown)"} · read ${jevAge(now - b.recordedAt)} ago`
     : "  billed: no dollar figure, nobody has recorded a TypeSafe console reading (mx jev billing record)"];
   return [head, ...billed, ...rows, `  covers: ${j.covers}`].join("\n");
+}
+
+/** Captured slots preserve identity even when a quota probe failed. */
+export function normalizeCodexSlots(value: unknown, now: number): ProviderAccount[] {
+  const root = object(value);
+  if (root.version !== 1 || !Array.isArray(root.accounts) || root.accounts.length > 32 || !root.accounts.length)
+    return [unknownCodex('Codex slots unavailable; capture and poll accounts')];
+  const seenSlots = new Set<string>(), seenIds = new Set<string>();
+  const rows: ProviderAccount[] = [];
+  for (const raw of root.accounts) {
+    const row = object(raw);
+    const slot = typeof row.slot === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(row.slot) ? row.slot : null;
+    const id = word(row.accountId);
+    if (!slot || !id || seenSlots.has(slot) || seenIds.has(id))
+      return [unknownCodex('Codex slot manifest has invalid or duplicate identity')];
+    seenSlots.add(slot); seenIds.add(id);
+    const snap = object(row.snapshot), out = normalizeCodex(snap, now);
+    const matches = out.accountId === id && row.observedAt === snap.codex_observed_at;
+    if (!matches || row.error || row.reauthRequired === true) {
+      Object.assign(out, unknownCodex('Codex slot identity or authentication unavailable'));
+    }
+    Object.assign(out, {slot, active: row.active === true, accountId: id, scope: 'account', source: 'codex-slot-cache'});
+    out.label = out.email ?? emailAddress(row.label) ?? slot;
+    rows.push(out);
+  }
+  if (rows.filter(r=>r.active).length > 1) return [unknownCodex('Codex cache has multiple active identities')];
+  return rows;
+}
+
+/** Main subscription only; unknown readings and paid balances cannot be selected. */
+export function chooseCodexSlot(rows: readonly ProviderAccount[], activeSlot: string, switchAt = 97, now = Date.now()/1000): string | null {
+  if (!Number.isFinite(switchAt) || switchAt < 1 || switchAt > 100) return null;
+  const usable = (r: ProviderAccount) => r.providerId === 'codex' && r.scope === 'account' && r.slot && r.accountId &&
+    r.fresh && isFresh(r.observedAt, now) && ['available','exhausted'].includes(r.capacity) &&
+    r.windows.some(w=>w.bucket==='codex') && r.windows.filter(w=>w.bucket==='codex').every(w=>
+      w.usedPercent !== null && w.usedPercent >= 0 && w.usedPercent <= 100 && w.resetsAt !== null && w.resetsAt > now);
+  const active = rows.filter(r=>r.active);
+  if (active.length !== 1 || active[0]!.slot !== activeSlot || !usable(active[0]!)) return null;
+  const used = (r: ProviderAccount) => Math.max(...r.windows.filter(w=>w.bucket==='codex').map(w=>w.usedPercent!));
+  if (active[0]!.capacity !== 'exhausted' && used(active[0]!) < switchAt) return null;
+  return rows.filter(r=>r.slot !== activeSlot && usable(r) && r.capacity === 'available' && used(r) < used(active[0]!) && used(r)<switchAt)
+    .sort((a,b)=>used(a)-used(b) || a.slot!.localeCompare(b.slot!))[0]?.slot ?? null;
 }

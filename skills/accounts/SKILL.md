@@ -1,6 +1,6 @@
 ---
 name: accounts
-description: Read custom Claude and Codex subscription telemetry, or inspect Claude account switching in the accounts plugin.
+description: Read custom Claude and Codex subscription telemetry, or switch captured Claude/Codex accounts in the accounts plugin.
 ---
 
 # Custom subscription accounts
@@ -20,12 +20,23 @@ this is a reporting command, not an admission gate.
   quota observations stay thread-scoped and cannot replace the current local snapshot.
 - Missing, malformed, stale, future-dated or incomplete main quota is UNKNOWN. A reset
   passing is not evidence of recovery: read a fresh observation.
-- The source invokes only `mx spawn availability`, bounded to 10 seconds, 256 KiB and
-  at most once per minute across callers. It performs no inference or auth mutation.
+- Codex account rows read the private `~/.config/codex-usage/usage.json` slot cache (256 KiB max). The dotfiles usage-only poller gathers native app-server quota in isolated credential homes every 180 seconds. Stale rows are UNKNOWN. `slot` and `active` identify the live login on disk, not every running process.
 
 The legacy `bb accounts list`, `outage`, `place`, `auto`, `switch`, `log`, `stats` and
 `forecast` commands remain Claude-only. In particular, `outage` includes Claude paid
 credits by design; it is not the new subscription-only capacity field.
 
-`bb accounts switch <slot>` deliberately changes live Claude credentials. Telemetry has
-no Codex switch command, routing controls, Pooler integration or credential exports.
+`bb accounts switch <slot>` changes live Claude credentials.
+`bb accounts codex use <slot>` changes the live Codex login through the dotfiles
+`codex-acct` helper with expected-current identity protection. Capture logins using
+`codex-acct capture <slot>` after an official human sign-in. Never read or print auth blobs.
+`bb accounts codex auto` runs one decision; `codexAutoSwitch` defaults off. Enable only
+after running-session refresh behavior has been verified. `codexSwitchAt` defaults to
+97; candidates require fresh free main windows and the helper rechecks capacity during
+switching. Cooldown is 120 seconds. Spark and credits cannot make a candidate eligible.
+
+The usage page includes native Codex response tokens by model/repo/directory. Input
+includes cache; output includes reasoning; neither maps to quota percent. Missing turn
+context is shown as unknown/unresolved. Codex forecasts use each account/window's own
+measured quota history; they remain provisional until three days, 1,440 polls, and 1,296
+valid adjacent intervals. Forecasts stop at reset and do not predict post-reset use.

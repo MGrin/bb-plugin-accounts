@@ -1,3 +1,5 @@
+import { open } from "node:fs/promises";
+import { normalizeCodexSlots } from "./telemetry.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeCodex, unknownCodex, normalizeJev, unknownJev, type JevSpend, type ProviderAccount } from "./telemetry.ts";
@@ -67,5 +69,22 @@ export function createJevUsageReader(command: string, now = () => Date.now() / 1
       return last = normalizeJev(parsed, now());
     })();
     return pending;
+  };
+}
+
+
+/** Private usage cache only: no credentials or inference, bounded even during a concurrent write. */
+export function createCodexSlotReader(file: string, now = () => Date.now()/1000) {
+  return async (): Promise<ProviderAccount[]> => {
+    try {
+      const handle = await open(file, 'r');
+      try {
+        if ((await handle.stat()).size > 262144) throw new Error('large');
+        const buffer = Buffer.alloc(262145);
+        const { bytesRead } = await handle.read(buffer,0,buffer.length,0);
+        if (bytesRead > 262144) throw new Error('large');
+        return normalizeCodexSlots(JSON.parse(buffer.subarray(0,bytesRead).toString('utf8')),now());
+      } finally { await handle.close(); }
+    } catch { return [unknownCodex('Codex slot cache unavailable; capture and poll accounts')]; }
   };
 }

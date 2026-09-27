@@ -88,7 +88,7 @@ export function SubscriptionsSection({ compact = false }: { compact?: boolean })
   }, []);
   useRealtime("accounts.switched", () => void load());
 
-  const cards = [...claudeCards(status, now), ...codexCards(codex)];
+  const cards = [...claudeCards(status, now), ...codexCards(codex, now)];
   const notice = status ? capacityNotice(status.capacity) : null;
   return <div className="space-y-2">
     {cards.length === 0

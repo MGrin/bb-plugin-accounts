@@ -1,3 +1,4 @@
+import { isFresh } from '../telemetry.ts';
 // Provider adapters for the one account card (MX-1226).
 //
 // Pure, and deliberately separate from the card: this is where each provider's own
@@ -58,26 +59,24 @@ export function claudeCards(status: Status | null, nowMs: number): CardAccount[]
 }
 
 /** Codex accounts, from the `telemetry` RPC. Its windows already carry epoch resets. */
-export function codexCards(accounts: readonly ProviderAccount[]): CardAccount[] {
+export function codexCards(accounts: readonly ProviderAccount[], nowMs = Date.now()): CardAccount[] {
   return accounts.map((a) => {
+    const fresh = a.fresh && isFresh(a.observedAt, nowMs/1000);
     const main = a.windows.filter((w) => w.bucket === "codex");
     const windows: CardWindow[] = main.map((w) => ({
       label: w.durationMinutes === 10080 ? "7d" : w.durationMinutes === 300 ? "5h" : w.durationMinutes ? `${w.durationMinutes / 60}h` : "usage",
-      usedPercent: a.fresh ? w.usedPercent : null,
+      usedPercent: fresh ? w.usedPercent : null,
       resetsAt: w.resetsAt,
       resetText: w.resetsAt === null ? null : `resets ${clock(w.resetsAt)}`,
     }));
-    const unreadable = !a.fresh || a.capacity === "unknown" || windows.every((w) => w.usedPercent === null);
+    const unreadable = !fresh || a.capacity === "unknown" || windows.every((w) => w.usedPercent === null);
     return {
       provider: "Codex" as const,
-      label: a.email ?? "Codex account (identity unavailable)",
-      // Codex has one subscription on this machine and no switching, so there is no
-      // "active" to claim. Claiming one would invent a distinction Claude has and it
-      // does not.
-      active: false,
+      label: a.email ?? a.label ?? "Codex account (identity unavailable)",
+      active: a.active === true && fresh,
       state: unreadable ? "unreadable" : windows.some(spent) || a.capacity === "exhausted" ? "walled" : "ok",
       stateNote: unreadable
-        ? a.fresh
+        ? fresh
           ? "subscription usage unknown"
           : "reading unavailable or stale"
         : windows.some(spent) || a.capacity === "exhausted"

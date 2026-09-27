@@ -147,3 +147,48 @@ test("status serialises accounts as JSON even when the optional fields are absen
     assert.equal(status.accounts[0].email, "a@example.com");
   } finally { await harness.lifecycle.dispose(); }
 });
+
+function codexRows() {
+  const now=Date.now()/1000;
+  return ['one','two'].map((slot,i)=>({...unknownCodex(),providerId:'codex' as const,scope:'account' as const,
+    accountId:slot,slot,active:i===0,fresh:true,observedAt:now,capacity:'available' as const,
+    windows:[{bucket:'codex',key:'primary',usedPercent:i===0?99:10,resetsAt:now+3600,durationMinutes:300,reportedStatus:null}]}));
+}
+test('Codex RPC and manual CLI preserve slots, use expected identity, and cooldown auto decisions',async()=>{
+  let calls:string[][]=[];
+  const {bb,harness}=createFakePluginHost({pluginId:'accounts',settings:{autoSwitch:false,codexAutoSwitch:true}});
+  try {
+    await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:null,accounts:[]}),readCodexSlots:async()=>codexRows(),
+      runCodexAccount:async (args:string[])=>{calls.push(args);return JSON.stringify({from:'one',to:'two',changed:true});}} as any);
+    const data=await harness.behavior.callRpc('telemetry',null) as any;
+    assert.deepEqual(data.accounts.map((a:any)=>a.slot),['one','two']);
+    const result=await harness.behavior.runCli(['codex','use','two']);
+    assert.equal(result.exitCode,0); assert.deepEqual(calls,[['use','two','--expected-current','one']]);
+    await harness.behavior.runSchedule('watch');
+    assert.equal(calls.length,1,'manual switch starts the shared Codex cooldown');
+  } finally {await harness.lifecycle.dispose();}
+});
+test('Codex watch switches once when enabled and ignores unknown rows',async()=>{
+  let calls=0;
+  const {bb,harness}=createFakePluginHost({pluginId:'accounts',settings:{autoSwitch:false,codexAutoSwitch:true}});
+  try {
+    let rows=codexRows();
+    await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:null,accounts:[]}),readCodexSlots:async()=>rows,
+      runCodexAccount:async(args:string[])=>{assert.ok(args.includes('--require-free'));calls++;return JSON.stringify({from:'one',to:'two',changed:true});}} as any);
+    rows[1]!.fresh=false; await harness.behavior.runSchedule('watch'); assert.equal(calls,0);
+    rows=codexRows(); await harness.behavior.runSchedule('watch'); assert.equal(calls,1);
+    await harness.behavior.runSchedule('watch'); assert.equal(calls,1);
+  } finally {await harness.lifecycle.dispose();}
+});
+
+test('Codex history records with switching disabled and RPC remains provider-scoped',async()=>{
+ const {bb,harness}=createFakePluginHost({pluginId:'accounts',settings:{autoSwitch:false,codexAutoSwitch:false}});
+ try {
+  await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:null,accounts:[]}),readCodexSlots:async()=>codexRows()});
+  await harness.behavior.runSchedule('watch');
+  const fc=await harness.behavior.callRpc('codexForecast',null) as any[];
+  assert.equal(fc.length,2);assert.ok(fc.every(f=>f.confidence==='provisional'&&f.polls===1));
+  const analytics=await harness.behavior.callRpc('analytics',{days:7}) as any;
+  assert.deepEqual(analytics.codex.byModel,[]);assert.equal(analytics.codex.coverage.responses,0);
+ }finally{await harness.lifecycle.dispose();}
+});

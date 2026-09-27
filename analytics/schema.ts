@@ -156,4 +156,20 @@ export const MIGRATIONS: string[] = [
      source TEXT NOT NULL,
      resolved_at INTEGER NOT NULL
    )`,
+  // Codex native per-response usage. Separate from Claude weighted/calibration data.
+  `CREATE TABLE IF NOT EXISTS codex_turn (
+     turn_id TEXT PRIMARY KEY, model TEXT, cwd TEXT
+   )`,
+  `CREATE TABLE IF NOT EXISTS codex_response (
+     response_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, session_id TEXT NOT NULL,
+     ts INTEGER NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+     cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+     reasoning_tokens INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_codex_response_ts ON codex_response (ts)`,
+  `CREATE TABLE IF NOT EXISTS codex_window_sample (
+     account_id TEXT NOT NULL, label TEXT NOT NULL, window TEXT NOT NULL,
+     duration_mins INTEGER NOT NULL, at INTEGER NOT NULL, used REAL NOT NULL,
+     reset INTEGER NOT NULL, PRIMARY KEY (account_id, window, duration_mins, at)
+   )`,
 ];
