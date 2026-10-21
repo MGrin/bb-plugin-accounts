@@ -125,3 +125,22 @@ test("a subsequent identity-less snapshot never retains the previous email", () 
   assert.equal(normalizeCodex({ ...snapshot(), codex_account_email: "first@example.com" }, now).email, "first@example.com");
   assert.equal(normalizeCodex(snapshot(), now).email, null);
 });
+
+// MX-1527
+test("a paused Claude account is PAUSED with its last read shown as last-known, never fresh or an alarm", () => {
+  const a = { slot: "p", email: "p@example.com", fiveHour: null, sevenDay: null, fiveHourResetsAt: null, sevenDayResetsAt: null,
+    credits: "unknown", paused: { at: now - 100 }, lastRead: { at: now - 50, fiveHour: 41, sevenDay: 22 } };
+  const [row] = normalizeClaude([a], now - 10, now);
+  assert.deepEqual(row.paused, { at: now - 100 });
+  assert.equal(row.capacity, "unknown");
+  assert.equal(row.fresh, false);
+  assert.equal(row.observedAt, now - 50, "observed time is the last read, not the cache poll");
+  assert.match(row.reason, /^Paused since 20\d\d-.*Z — no requests made$/);
+  assert.deepEqual(row.windows.map(w => w.usedPercent), [41, 22]);
+  const text = formatTelemetry({ version: 1, accounts: [row], tokens: [] });
+  assert.match(text, /PAUSED/); assert.doesNotMatch(text, /subscription UNKNOWN/);
+  // No last read: honest UNKNOWN windows, still paused.
+  const [bare] = normalizeClaude([{ ...a, lastRead: undefined }], now - 10, now);
+  assert.equal(bare.observedAt, null); assert.deepEqual(bare.windows.map(w => w.usedPercent), [null, null]);
+  assert.ok(!("paused" in normalizeClaude([{ ...a, paused: undefined }], now, now)[0]));
+});

@@ -43,3 +43,24 @@ test('cache reader bounds files and rechecks freshness on every read',async()=>{
     await writeFile(file,'x'.repeat(300000)); assert.equal((await read())[0].capacity,'unknown');
   } finally {await rm(dir,{recursive:true,force:true});}
 });
+
+// MX-1527: paused means NO request, so the cached row is the PREVIOUS observation.
+test('a paused Codex slot keeps identity and last-known windows, reads PAUSED not unknown, and is never fresh',()=>{
+  const p={...slot('two',10),paused:{at:now-30}};
+  const rows=telemetry.normalizeCodexSlots({version:1,accounts:[slot('one',99,true),p]},now);
+  const two=rows.find(r=>r.slot==='two')!;
+  assert.deepEqual(two.paused,{at:now-30});
+  assert.equal(two.capacity,'unknown');
+  assert.equal(two.fresh,false,'a retained observation is never fresh, even inside 180s');
+  assert.match(two.reason,/^Paused since 20\d\d-\d\d-\d\dT.*Z — no requests made$/);
+  assert.equal(two.windows.find(w=>w.bucket==='codex')?.usedPercent,10,'last-known usage stays visible');
+  assert.equal(two.label,'two@example.test');
+  assert.ok(!('paused' in rows.find(r=>r.slot==='one')!),'an unpaused row carries no paused key at all (RPC wire)');
+});
+test('selection never chooses a paused slot, even one that reads available and fresh',()=>{
+  const rows=telemetry.normalizeCodexSlots({version:1,accounts:[slot('one',99,true),slot('two',10),slot('three',20)]},now);
+  const forced=rows.map(r=>r.slot==='two'?{...r,paused:{at:now-5}}:r);
+  assert.equal(forced.find(r=>r.slot==='two')!.capacity,'available');
+  assert.equal(telemetry.chooseCodexSlot(forced,'one',97,now),'three');
+  assert.equal(telemetry.chooseCodexSlot(forced.filter(r=>r.slot!=='three'),'one',97,now),null);
+});

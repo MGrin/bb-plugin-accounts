@@ -81,3 +81,13 @@ test("a window reset across polls is recorded as a reset", () => {
   assert.equal(row!.isReset, true);
   assert.equal(row!.deltaUtil, 4);
 });
+
+// MX-1527: a paused row has no reading; recording it would write a null sample every poll.
+test("a paused account records no sample", () => {
+  const db = freshDb();
+  const out = ingestUsage(db, 1000, [acct({ slot: "a" }), acct({ slot: "p", active: false, fiveHour: null, sevenDay: null, paused: { at: 900 } })]);
+  assert.equal(out.inserted, 1);
+  assert.deepEqual(readSamples(db, "p", 0), []);
+  assert.equal(readSamples(db, "a", 0).length, 1);
+  assert.deepEqual(ingestUsage(db, 1180, [acct({ slot: "p", fiveHour: null, sevenDay: null, paused: { at: 900 } })]), { inserted: 0, intervals: 0 });
+});

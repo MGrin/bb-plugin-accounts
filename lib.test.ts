@@ -1040,3 +1040,47 @@ test('a missing weekly quota is unknown and cannot be selected as free capacity'
   assert.equal(capacityVerdict([partial]),'unknown');
   assert.equal(pickBest([partial],'out'),null);
 });
+
+// MX-1527: a paused account is shown everywhere and decided on nowhere. Paused means NO
+// request of any kind, so it is neither a destination nor a reading — and, equally, never a
+// missing reading that makes the rest of the fleet "unknown".
+const paused = (slot: string, over: Partial<AccountUsage> = {}): AccountUsage =>
+  ({ slot, active: false, fiveHour: null, sevenDay: null, paused: { at: 1_800_000_000 }, ...over });
+
+test("pickBest never returns a paused slot, even one whose last read looks roomy", () => {
+  const fleet = [acct("a", 99, 50, true), paused("p", { fiveHour: 0, sevenDay: 0 }), acct("b", 40, 40)];
+  assert.equal(pickBest(fleet, "a")?.slot, "b");
+  assert.equal(pickBest([acct("a", 99, 50, true), paused("p", { fiveHour: 0, sevenDay: 0 })], "a"), null);
+});
+
+test("capacityVerdict skips a paused account: it is neither blind nor capacity", () => {
+  // A paused row has no reading; counting it would turn a certain 'none' into 'unknown'.
+  assert.equal(capacityVerdict([{ ...acct("a", 100, 100, true), credits: "off" }, paused("p")]), "none");
+  // Paused credits do not make the machine 'paid-only'.
+  assert.equal(
+    capacityVerdict([{ ...acct("a", 100, 100, true), credits: "off" }, paused("p", { credits: "on" })]),
+    "none",
+  );
+  // A paused account with a free-looking last read is not free capacity.
+  assert.equal(
+    capacityVerdict([{ ...acct("a", 100, 100, true), credits: "off" }, paused("p", { fiveHour: 0, sevenDay: 0 })]),
+    "none",
+  );
+  // Nothing in service at all is not knowable, and is not an outage.
+  assert.equal(capacityVerdict([paused("p"), paused("q")]), "unknown");
+});
+
+test("decideSwitch never moves to a paused slot and never counts its credits as a paid alternative", () => {
+  const d = decideSwitch([acct("a", 98, 10, true), paused("p", { fiveHour: 0, sevenDay: 0 })], POLICY, 3600);
+  assert.equal(d.action, "none");
+  assert.match(d.reason, /no eligible alternative slot/);
+  const e = decideSwitch(
+    [{ ...acct("a", 98, 10, true) }, paused("p", { credits: "on", fiveHour: 100, sevenDay: 10 })],
+    POLICY,
+    3600,
+  );
+  assert.match(e.reason, /no eligible alternative slot/);
+  // Positive control: an unpaused neighbour is still chosen.
+  const f = decideSwitch([acct("a", 98, 10, true), paused("p"), acct("b", 5, 5)], POLICY, 3600);
+  assert.equal(f.action === "none" ? null : f.to, "b");
+});

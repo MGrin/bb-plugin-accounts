@@ -37,7 +37,7 @@ export function recordCodexWindows(db:Database,rows:ProviderAccount[],now:number
  const stmt=db.prepare('INSERT OR IGNORE INTO codex_window_sample VALUES (?,?,?,?,?,?,?)');
  db.transaction(()=>{for(const row of rows) {
   const at=row.observedAt;
-  if(row.providerId!=='codex'||!row.accountId||!row.fresh||at===null||now-at<0||now-at>180||row.capacity==='unknown')continue;
+  if(row.providerId!=='codex'||row.paused||!row.accountId||!row.fresh||at===null||now-at<0||now-at>180||row.capacity==='unknown')continue;
   for(const w of row.windows) {
    if(w.bucket!=='codex'||w.usedPercent===null||!Number.isFinite(w.usedPercent)||w.usedPercent<0||w.usedPercent>100||
       w.resetsAt===null||w.resetsAt<=now||w.durationMinutes===null||w.durationMinutes<=0)continue;
