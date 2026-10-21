@@ -10,7 +10,7 @@ import { isFresh } from '../telemetry.ts';
 import type { CardAccount, CardWindow } from "./account-card.tsx";
 import type { ProviderAccount } from "../telemetry.ts";
 import type { Status } from "./current.tsx";
-import { formatReset } from "./format.ts";
+import { formatAge, formatReset } from "./format.ts";
 
 /** A window is spent when the provider says 100, not when we failed to read it. */
 const spent = (w: { usedPercent: number | null }) => w.usedPercent !== null && w.usedPercent >= 100;
@@ -28,7 +28,24 @@ function resetTextFromIso(iso: string | null, nowMs: number): string | null {
  */
 export function claudeCards(status: Status | null, nowMs: number): CardAccount[] {
   if (!status) return [];
-  return status.accounts.map((a) => {
+  return status.accounts.map((a): CardAccount => {
+    const control = { provider: "claude-code" as const, slot: a.slot, active: a.active };
+    const label = a.email || "Claude account (identity unavailable)";
+    if (a.paused) {
+      // Nothing was asked of this account, so nothing here is a reading: its last read is shown
+      // as last-known with its own age, and a stale cache or a missing error does not make it
+      // an alarm (MX-1527).
+      const last = a.lastRead;
+      const win = (name: string, util: number | null | undefined): CardWindow =>
+        ({ label: name, usedPercent: util ?? null, resetsAt: null, resetText: null });
+      return {
+        provider: "Claude", label, active: a.active, state: "paused",
+        stateNote: last ? `last read ${formatAge(nowMs, last.at)}` : "no last read",
+        windows: [win("5h", last?.fiveHour), win("7d", last?.sevenDay)],
+        paused: { at: a.paused.at, lastReadAt: last?.at ?? null },
+        control,
+      };
+    }
     const windows: CardWindow[] = [
       { label: "5h", usedPercent: a.fiveHour, resetsAt: null, resetText: resetTextFromIso(a.fiveHourResetsAt, nowMs) },
       { label: "7d", usedPercent: a.sevenDay, resetsAt: null, resetText: resetTextFromIso(a.sevenDayResetsAt, nowMs) },
@@ -39,7 +56,7 @@ export function claudeCards(status: Status | null, nowMs: number): CardAccount[]
     const unreadable = needsLogin || Boolean(a.error) || status.stale || windows.every((w) => w.usedPercent === null);
     return {
       provider: "Claude" as const,
-      label: a.email || "Claude account (identity unavailable)",
+      label,
       active: a.active,
       state: unreadable ? "unreadable" : windows.some(spent) ? "walled" : "ok",
       stateNote: unreadable
@@ -54,13 +71,30 @@ export function claudeCards(status: Status | null, nowMs: number): CardAccount[]
           ? `${windows.filter(spent).map((w) => w.label).join(" and ")} spent`
           : null,
       windows,
+      control,
     };
   });
 }
 
 /** Codex accounts, from the `telemetry` RPC. Its windows already carry epoch resets. */
 export function codexCards(accounts: readonly ProviderAccount[], nowMs = Date.now()): CardAccount[] {
-  return accounts.map((a) => {
+  return accounts.map((a): CardAccount => {
+    const control = a.slot ? { provider: "codex" as const, slot: a.slot, active: a.active === true } : undefined;
+    if (a.paused) {
+      // The cached snapshot is the PREVIOUS observation: last-known, with its own age (MX-1527).
+      const main = a.windows.filter((w) => w.bucket === "codex");
+      const windows: CardWindow[] = main.map((w) => ({
+        label: w.durationMinutes === 10080 ? "7d" : w.durationMinutes === 300 ? "5h" : w.durationMinutes ? `${w.durationMinutes / 60}h` : "usage",
+        usedPercent: w.usedPercent, resetsAt: null, resetText: null,
+      }));
+      const read = windows.some((w) => w.usedPercent !== null);
+      return {
+        provider: "Codex", label: a.email ?? a.label ?? "Codex account (identity unavailable)", active: false, state: "paused",
+        stateNote: read ? `last read ${formatAge(nowMs, a.observedAt)}` : "no last read",
+        windows, paused: { at: a.paused.at, lastReadAt: read ? a.observedAt : null },
+        ...(control ? { control } : {}),
+      };
+    }
     const fresh = a.fresh && isFresh(a.observedAt, nowMs/1000);
     const main = a.windows.filter((w) => w.bucket === "codex");
     const windows: CardWindow[] = main.map((w) => ({
@@ -83,6 +117,7 @@ export function codexCards(accounts: readonly ProviderAccount[], nowMs = Date.no
           ? windows.some(spent) ? `${windows.filter(spent).map(w => w.label).join(" and ")} spent` : "subscription spent"
           : null,
       windows,
+      ...(control ? { control } : {}),
     };
   });
 }

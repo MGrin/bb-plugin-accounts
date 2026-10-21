@@ -45,6 +45,10 @@ export type Status = {
     sevenDayResetsAt: string | null;
     credits: CreditState;
     creditSpend: CreditSpend | null;
+    /** MX-1527: paused by mgrin — no request is made on it; its windows are null. */
+    paused?: { at: number };
+    /** The last good reading, with its own time. The only usage a paused account has. */
+    lastRead?: { at: number; fiveHour: number | null; sevenDay: number | null };
   }[];
   lastSwitch: { at: number; from: string; to: string; reason: string } | null;
 };

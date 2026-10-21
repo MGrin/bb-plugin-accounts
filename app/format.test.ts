@@ -146,3 +146,16 @@ test("creditLabel: an unpolled account is `credits ?`, never `off`", () => {
   assert.equal(creditLabel("unknown", null), "credits ?");
   assert.notEqual(creditLabel("unknown", null), creditLabel("off", null));
 });
+
+// MX-1527
+import { formatAge } from "./format.ts";
+test("formatAge: how old a last-known reading is, in the units a person reads", () => {
+  const now = 1_800_000_000_000;
+  const ago = (sec: number) => formatAge(now, Math.floor(now / 1000) - sec);
+  assert.equal(ago(20), "just now");
+  assert.equal(ago(12 * 60), "12m ago");
+  assert.equal(ago(3 * 3600 + 5 * 60), "3h ago");
+  assert.equal(ago(2 * 86400 + 3600), "2d ago");
+  assert.equal(formatAge(now, null), "age unknown", "no time is not 'just now'");
+  assert.equal(formatAge(now, Math.floor(now / 1000) + 600), "just now", "a clock skew never reads as negative");
+});

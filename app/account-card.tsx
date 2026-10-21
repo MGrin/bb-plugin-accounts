@@ -38,18 +38,28 @@ export type CardAccount = {
    * `ok` — the provider answered and there is headroom.
    * `walled` — it answered and a window is spent.
    * `unreadable` — nothing was read: stale, failed or never polled. NOT an amount.
+   * `paused` — mgrin paused it (MX-1527): no request is made on it, so its windows are the
+   *   LAST-KNOWN ones. Not an alarm and not unreadable: nothing is wrong, nothing was asked.
    */
-  state: "ok" | "walled" | "unreadable";
+  state: "ok" | "walled" | "unreadable" | "paused";
   /** Why, when the state is not `ok`. One short clause. */
   stateNote: string | null;
   windows: CardWindow[];
   details?: ReactNode;
+  /** Present on a paused account. `lastReadAt` is epoch seconds, or null when nothing was ever read. */
+  paused?: { at: number; lastReadAt: number | null };
+  /**
+   * What the pause button needs to act on this account. `active` is the RAW login marker, not the
+   * badge: an active login with a stale reading is still the account in use and cannot be paused.
+   */
+  control?: { provider: "claude-code" | "codex"; slot: string; active: boolean };
 };
 
 const STATE_TEXT: Record<CardAccount["state"], string> = {
   ok: "available",
   walled: "exhausted",
   unreadable: "unavailable",
+  paused: "paused",
 };
 
 const STATE_CLASS: Record<CardAccount["state"], string> = {
@@ -58,12 +68,15 @@ const STATE_CLASS: Record<CardAccount["state"], string> = {
   // Muted on purpose: an unread account asserts nothing and must not borrow the urgency
   // of a real wall.
   unreadable: "italic text-muted-foreground",
+  // Muted, like unreadable and for the same reason: pausing is a choice, never a fault.
+  paused: "text-muted-foreground",
 };
 
-function WindowRow({ window: w }: { window: CardWindow }) {
+/** `last` = a last-known reading (a paused account): dimmed, and its old reset time says nothing now. */
+function WindowRow({ window: w, last = false }: { window: CardWindow; last?: boolean }) {
   const unknown = w.usedPercent === null;
   return (
-    <div className="grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_3rem] items-center gap-x-3 gap-y-1.5">
+    <div className={`grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_3rem] items-center gap-x-3 gap-y-1.5${last ? " opacity-60" : ""}`}>
       <span className="text-xs text-muted-foreground">{w.label}</span>
       <span
         className={`col-start-3 row-start-1 text-right text-xs tabular-nums ${
@@ -75,14 +88,59 @@ function WindowRow({ window: w }: { window: CardWindow }) {
       <div className="col-start-2 row-start-1 min-w-0">
         <Meter value={w.usedPercent} label={`${w.label} usage`} />
       </div>
-      <span className="col-span-3 text-xs tabular-nums text-muted-foreground">
-        {w.resetText ?? "reset time unknown"}
-      </span>
+      {!last && (
+        <span className="col-span-3 text-xs tabular-nums text-muted-foreground">
+          {w.resetText ?? "reset time unknown"}
+        </span>
+      )}
     </div>
   );
 }
 
-export function AccountCard({ account: a }: { account: CardAccount }) {
+/**
+ * Pause / Resume (MX-1527). Pausing is mgrin's act, so this is a button he presses and nothing
+ * else calls. The active login cannot be paused — the dotfiles CLI refuses it — so the button
+ * says why instead of failing after the click.
+ */
+function PauseControl({ account: a, onSetPaused, busy, message }: {
+  account: CardAccount;
+  onSetPaused: (paused: boolean) => void;
+  busy: boolean;
+  message: string | null;
+}) {
+  const paused = a.state === "paused";
+  const blocked = !paused && a.control?.active === true;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      <button
+        type="button"
+        className="rounded border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        disabled={busy || blocked}
+        title={
+          blocked
+            ? "This is the active login — switch away first"
+            : paused
+              ? "Resume polling and switching for this account"
+              : "Stop all requests on this account; it stays listed"
+        }
+        onClick={() => onSetPaused(!paused)}
+      >
+        {paused ? "Resume" : "Pause"}
+      </button>
+      {blocked && <span className="text-xs text-muted-foreground">switch away first</span>}
+      {message && <span role="status" className="min-w-0 text-xs text-muted-foreground">{message}</span>}
+    </div>
+  );
+}
+
+export function AccountCard({ account: a, onSetPaused, busy = false, message = null }: {
+  account: CardAccount;
+  /** Absent in read-only embeds: no button is drawn. */
+  onSetPaused?: (paused: boolean) => void;
+  busy?: boolean;
+  message?: string | null;
+}) {
+  const paused = a.state === "paused";
   return (
     <div className="min-w-0 space-y-3 rounded-md border border-border bg-muted/20 p-3">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -95,14 +153,23 @@ export function AccountCard({ account: a }: { account: CardAccount }) {
             active login
           </span>
         )}
+        {paused && (
+          <span
+            className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] tracking-wide text-muted-foreground"
+            title={a.paused && a.paused.at > 0 ? `Paused ${new Date(a.paused.at * 1000).toLocaleString()} — no requests are made on this account` : "No requests are made on this account"}
+          >
+            PAUSED
+          </span>
+        )}
         <span className={`ml-auto text-xs ${STATE_CLASS[a.state]}`}>
-          {STATE_TEXT[a.state]}
-          {a.stateNote ? ` · ${a.stateNote}` : ""}
+          {paused ? (a.stateNote ?? "") : STATE_TEXT[a.state]}
+          {!paused && a.stateNote ? ` · ${a.stateNote}` : ""}
         </span>
       </div>
       {a.windows.map((w) => (
-        <WindowRow key={`${a.provider}/${a.label}/${w.label}`} window={w} />
+        <WindowRow key={`${a.provider}/${a.label}/${w.label}`} window={w} last={paused} />
       ))}
+      {onSetPaused && a.control ? <PauseControl account={a} onSetPaused={onSetPaused} busy={busy} message={message} /> : null}
       {a.details ? (
         <details className="text-xs text-muted-foreground">
           <summary className="cursor-pointer">Details</summary>

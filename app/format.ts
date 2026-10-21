@@ -58,6 +58,20 @@ export function formatRelative(ms: number): string {
 }
 
 /**
+ * How old a last-known reading is ("3h ago"), for an account nothing is polling (MX-1527).
+ * No time is "age unknown", never "just now" — the same rule as a null percentage. A clock that
+ * runs behind the cache never prints a negative age.
+ */
+export function formatAge(nowMs: number, atSec: number | null | undefined): string {
+  if (atSec === null || atSec === undefined || !Number.isFinite(atSec)) return "age unknown";
+  const sec = Math.max(0, nowMs / 1000 - atSec);
+  if (sec < 60) return "just now";
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+/**
  * Both forms of a reset instant, from the ISO string the poller cache carries.
  * `null` in, `null` out — a missing reset time is reported as missing rather
  * than guessed at, same rule as the percentage.
