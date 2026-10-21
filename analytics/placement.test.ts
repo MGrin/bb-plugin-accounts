@@ -188,3 +188,17 @@ test("haiku stays put where fable would be moved, because the floor is in units"
   assert.equal(planPlacement({ ...common, modelWeight: HAIKU }).action, "none");
   assert.equal(planPlacement({ ...common, modelWeight: FABLE }).action, "switch");
 });
+
+// MX-1527
+test("placement never lands on a paused account, however roomy its last read", () => {
+  const accounts = [
+    { slot: "a", fiveUtil: 98, sevenUtil: 50, active: true },
+    { slot: "p", fiveUtil: 0, sevenUtil: 0, active: false, paused: true },
+  ];
+  assert.equal(placeWork({ accounts, modelWeight: HAIKU }).slot, null);
+  const plan = planPlacement({ accounts, modelWeight: HAIKU, activeSlot: "a" });
+  assert.equal(plan.action, "warn");
+  assert.equal(plan.to, null);
+  const withB = planPlacement({ accounts: [...accounts, { slot: "b", fiveUtil: 10, sevenUtil: 10, active: false }], modelWeight: HAIKU, activeSlot: "a" });
+  assert.equal(withB.to, "b");
+});

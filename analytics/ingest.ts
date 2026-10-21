@@ -19,6 +19,8 @@ export interface IngestAccount {
   sevenDay: number | null;
   fiveHourResetsAt: string | null;
   sevenDayResetsAt: string | null;
+  /** MX-1527: a paused row has no reading; recording it would write a null sample every poll. */
+  paused?: unknown;
 }
 
 export interface IngestResult {
@@ -48,8 +50,9 @@ const REDERIVE_LOOKBACK_SEC = 6 * 3600;
 export function ingestUsage(
   db: Database,
   polledAt: number | null,
-  accounts: IngestAccount[],
+  all: IngestAccount[],
 ): IngestResult {
+  const accounts = all.filter((a) => !a.paused);
   if (polledAt === null || accounts.length === 0) return { inserted: 0, intervals: 0 };
 
   const inserted = insertSamples(

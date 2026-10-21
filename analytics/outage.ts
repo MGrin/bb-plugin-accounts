@@ -34,6 +34,7 @@ export const EXHAUSTED_AT = 100;
 export const DEFAULT_CONFIRM_POLLS = 3;
 
 export interface OutageAccount extends PlacementAccount {
+  // `paused` (MX-1527) arrives from PlacementAccount: a paused account is not assessed.
   /** ISO-8601 from the poller, or null — which it always is when util is 0. */
   fiveResetsAt: string | null;
   sevenResetsAt: string | null;
@@ -144,7 +145,7 @@ export function earliestUsable(
   accounts: readonly OutageAccount[],
   weeklyAt: number = DEFAULT_WEEKLY_AT,
 ): { at: string | null; slot: string | null; unknownReason: UnknownReason } {
-  const walled = accounts.map((a) => accountOutage(a, weeklyAt)).filter((o) => o.exhausted);
+  const walled = accounts.filter((a) => !a.paused).map((a) => accountOutage(a, weeklyAt)).filter((o) => o.exhausted);
   if (walled.length === 0) return { at: null, slot: null, unknownReason: null };
   if (walled.some((o) => o.usableAt === null)) return { at: null, slot: null, unknownReason: "no-reset-time" };
   const first = walled.reduce((best, o) => (o.usableAt! < best.usableAt! ? o : best));
@@ -171,10 +172,13 @@ export function earliestUsable(
  * machine. An empty account list is likewise an absence of data, not an outage.
  */
 export function assessOutage(
-  accounts: readonly OutageAccount[],
+  all: readonly OutageAccount[],
   opts: { weeklyAt?: number; stale?: boolean; capacity: CapacityVerdict },
 ): OutageVerdict {
   const weeklyAt = opts.weeklyAt ?? DEFAULT_WEEKLY_AT;
+  // A paused account is neither a reading nor a wall (MX-1527), so it is out of the fleet
+  // being assessed; shown by the callers, never counted here.
+  const accounts = all.filter((a) => !a.paused);
   const per = accounts.map((a) => accountOutage(a, weeklyAt));
 
   if (opts.stale) {
@@ -197,7 +201,7 @@ export function assessOutage(
       earliestUsableAt: null,
       earliestUsableSlot: null,
       unknownReason: null,
-      reason: "no accounts in the usage cache",
+      reason: all.length > 0 ? `every account is paused (${all.length}) — nothing in service to assess` : "no accounts in the usage cache",
       accounts: per,
     };
   }

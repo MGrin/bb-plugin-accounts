@@ -19,6 +19,8 @@ export interface PlacementAccount {
   /** 0..100, or null. */
   sevenUtil: number | null;
   active: boolean;
+  /** MX-1527: paused accounts take no work, however roomy their last read looked. */
+  paused?: boolean;
 }
 
 export interface PlacementArgs {
@@ -87,6 +89,7 @@ export function placeWork(args: PlacementArgs): Placement {
   const weight = args.modelWeight > 0 ? args.modelWeight : Number.POSITIVE_INFINITY;
 
   const scored = args.accounts
+    .filter((a) => !a.paused)
     .map((a) => {
       const headroom = usableHeadroom(a, switchAt, weeklyAt);
       return { a, headroom, units: headroom / weight };

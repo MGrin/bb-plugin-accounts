@@ -15,6 +15,10 @@ export const providerAccountShape = z.object({
   observedAt: z.number().nullable(), // epoch seconds, never the time a cached result was read
   fresh: z.boolean(),
   capacity: z.enum(["available", "exhausted", "unavailable", "unknown"]), // subscription only
+  // MX-1527: present only on a paused account (mgrin's act): NO request is made on it, so every
+  // number here is the last-known one and capacity stays `unknown` — never a new enum value,
+  // because the dotfiles widget feed validates it. Absent, never undefined, on the RPC wire.
+  paused: z.object({ at: z.number() }).optional(),
   reason: z.string(),
   planType: z.string().nullable(),
   credits: z.object({ hasCredits: z.boolean().nullable(), unlimited: z.boolean().nullable(), balance: z.string().nullable() }),
@@ -112,13 +116,30 @@ export function normalizeCodex(value: unknown, now: number): ProviderAccount {
   return out;
 }
 
+/** One sentence for a paused account, shared by every provider so the surfaces read alike. */
+export const pausedReason = (at: number): string =>
+  at > 0 ? `Paused since ${new Date(at * 1000).toISOString()} — no requests made` : "Paused — no requests made";
+
 /** The existing Claude reader supplies its sanitized account rows; attribution remains the cache's slot. */
 export function normalizeClaude(accounts: readonly { slot: string; email: string; fiveHour: number | null; sevenDay: number | null;
-  fiveHourResetsAt: string | null; sevenDayResetsAt: string | null; credits: string }[], observedAt: number | null, now: number): ProviderAccount[] {
+  fiveHourResetsAt: string | null; sevenDayResetsAt: string | null; credits: string;
+  paused?: { at: number }; lastRead?: { at: number; fiveHour: number | null; sevenDay: number | null } }[], observedAt: number | null, now: number): ProviderAccount[] {
   observedAt = epochSeconds(observedAt);
   return accounts.slice(0, 64).map(a => {
     const accountId = word(a.slot);
     const label = typeof a.email === "string" ? a.email.slice(0, 256) : "Claude account (identity unavailable)";
+    if (a.paused) {
+      // No request was made, so nothing here is a reading: the last read is shown as last-known
+      // (its own time, never fresh) and capacity asserts nothing.
+      const at = number(a.paused.at) ?? 0;
+      const last = a.lastRead;
+      return { providerId: "claude-code", scope: "account", accountId, email: emailAddress(a.email), threadId: null, label,
+        source: "claude-usage-cache", observedAt: epochSeconds(last?.at), fresh: false, capacity: "unknown", paused: { at },
+        reason: pausedReason(at), planType: null,
+        windows: [["five-hour", last?.fiveHour, 300], ["seven-day", last?.sevenDay, 10080]].map(([key, used, durationMinutes]) => ({
+          bucket: "claude", key: key as string, usedPercent: percent(used), resetsAt: null, durationMinutes: durationMinutes as number, reportedStatus: null })),
+        credits: { hasCredits: null, unlimited: null, balance: null } };
+    }
     const fresh = isFresh(observedAt, now);
     const windows = [["five-hour", a.fiveHour, a.fiveHourResetsAt, 300], ["seven-day", a.sevenDay, a.sevenDayResetsAt, 10080]] as const;
     const normalized = windows.map(([key, used, reset, durationMinutes]) => ({ bucket: "claude", key, usedPercent: percent(used),
@@ -177,7 +198,7 @@ export function normalizeCodexEvents(threadId: string, rows: readonly unknown[],
 export function formatTelemetry(t: Telemetry): string {
   const lines = t.accounts.map(a => {
     const windows = a.windows.map(w => `${w.bucket}/${w.key} ${w.usedPercent === null ? "?" : `${w.usedPercent}%`} reset=${w.resetsAt === null ? "?" : new Date(w.resetsAt * 1000).toISOString()}`).join("; ");
-    return `${a.providerId} ${a.scope}${a.threadId ? ` ${a.threadId}` : ""} ${a.label}\n  subscription ${a.capacity.toUpperCase()} · ${a.reason}\n  observed=${a.observedAt ?? "?"} fresh=${a.fresh} source=${a.source}${a.planType ? ` plan=${a.planType}` : ""}\n  ${windows || "windows UNKNOWN"}\n  paid credits=${a.credits.hasCredits === null ? "UNKNOWN" : a.credits.hasCredits ? "on" : "off"}${a.credits.balance === null ? "" : ` balance=${a.credits.balance}`} (separate from subscription)`;
+    return `${a.providerId} ${a.scope}${a.threadId ? ` ${a.threadId}` : ""} ${a.label}\n  ${a.paused ? "PAUSED" : `subscription ${a.capacity.toUpperCase()}`} · ${a.reason}\n  observed=${a.observedAt ?? "?"} fresh=${a.fresh} source=${a.source}${a.planType ? ` plan=${a.planType}` : ""}\n  ${windows || "windows UNKNOWN"}\n  paid credits=${a.credits.hasCredits === null ? "UNKNOWN" : a.credits.hasCredits ? "on" : "off"}${a.credits.balance === null ? "" : ` balance=${a.credits.balance}`} (separate from subscription)`;
   });
   for (const tkn of t.tokens) lines.push(`codex thread ${tkn.threadId}: ${tkn.totalTokens} tokens (not quota), observed=${tkn.observedAt} fresh=${tkn.fresh}`);
   return lines.join("\n\n");
@@ -204,6 +225,13 @@ export function normalizeCodexSlots(value: unknown, now: number): ProviderAccoun
     }
     Object.assign(out, {slot, active: row.active === true, accountId: id, scope: 'account', source: 'codex-slot-cache'});
     out.label = out.email ?? emailAddress(row.label) ?? slot;
+    const paused = object(row.paused);
+    if (row.paused !== undefined && row.paused !== null && typeof row.paused === 'object') {
+      // The cached snapshot is the PREVIOUS observation: keep its windows as last-known, but it
+      // is neither fresh nor a capacity answer (MX-1527).
+      const at = number(paused.at) ?? 0;
+      Object.assign(out, {paused: {at}, fresh: false, capacity: 'unknown', reason: pausedReason(at)});
+    }
     rows.push(out);
   }
   if (rows.filter(r=>r.active).length > 1) return [unknownCodex('Codex cache has multiple active identities')];
@@ -213,7 +241,7 @@ export function normalizeCodexSlots(value: unknown, now: number): ProviderAccoun
 /** Main subscription only; unknown readings and paid balances cannot be selected. */
 export function chooseCodexSlot(rows: readonly ProviderAccount[], activeSlot: string, switchAt = 97, now = Date.now()/1000): string | null {
   if (!Number.isFinite(switchAt) || switchAt < 1 || switchAt > 100) return null;
-  const usable = (r: ProviderAccount) => r.providerId === 'codex' && r.scope === 'account' && r.slot && r.accountId &&
+  const usable = (r: ProviderAccount) => !r.paused && r.providerId === 'codex' && r.scope === 'account' && r.slot && r.accountId &&
     r.fresh && isFresh(r.observedAt, now) && ['available','exhausted'].includes(r.capacity) &&
     r.windows.some(w=>w.bucket==='codex') && r.windows.filter(w=>w.bucket==='codex').every(w=>
       w.usedPercent !== null && w.usedPercent >= 0 && w.usedPercent <= 100 && w.resetsAt !== null && w.resetsAt > now);

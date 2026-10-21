@@ -397,3 +397,22 @@ test('unknown accounts are not advertised as headroom', () => {
   assert.match(unknown.reason,/unknown/);
   assert.equal(unknown.cannotServe,false);
 });
+
+// MX-1527: a paused account is not a reading and not a wall.
+test("assessOutage ignores paused accounts: they neither hide an outage nor cause 'unknown'", () => {
+  const walled = acct({ slot: "a", fiveUtil: 100, sevenUtil: 100, active: true, fiveResetsAt: "2026-08-18T10:19:59Z", sevenResetsAt: "2026-08-24T03:59:59Z" });
+  const p = acct({ slot: "p", fiveUtil: null, sevenUtil: null, paused: true });
+  const v = assessOutage([walled, p], { capacity: "none" });
+  assert.equal(v.cannotServe, true);
+  assert.deepEqual(v.accounts.map((a) => a.slot), ["a"]);
+  // A paused account whose last read was roomy is not usable headroom either.
+  const roomy = acct({ slot: "p", fiveUtil: 0, sevenUtil: 0, paused: true });
+  assert.equal(assessOutage([walled, roomy], { capacity: "none" }).cannotServe, true);
+});
+
+test("all accounts paused is nothing to assess, never an outage", () => {
+  const v = assessOutage([acct({ slot: "p", paused: true }), acct({ slot: "q", paused: true })], { capacity: "unknown" });
+  assert.equal(v.cannotServe, false);
+  assert.match(v.reason, /paused/);
+  assert.equal(outageSignals(v, false).exitCode, 2);
+});

@@ -40,7 +40,18 @@ export interface AccountUsage {
   /** Absent means the caller did not look, which is "unknown", never "off". */
   credits?: CreditState;
   creditSpend?: CreditSpend | null;
+  /**
+   * MX-1527: the account is paused (mgrin's act) — NO request of any kind is made on it.
+   * Shown everywhere, decided on nowhere: never a destination, never a reading, and never
+   * the blind spot that turns a certain verdict into "unknown". Its fiveHour/sevenDay are
+   * null in the real cache and are not to be trusted if a caller fills them from a last read.
+   */
+  paused?: { at: number };
 }
+
+/** In service: not paused. Every decision runs over these, every display over all of them. */
+export const inService = <T extends { paused?: unknown }>(accounts: readonly T[]): T[] =>
+  accounts.filter((a) => !a.paused);
 
 /** The 5-hour wall. Unlike weeklyAt this is not a policy knob — at 100 the
  *  window is simply gone until it rolls, and no threshold changes that. */
@@ -92,7 +103,9 @@ export type CapacityVerdict = "free" | "paid-only" | "none" | "unknown";
  * every account was actually read — one unreadable account leaves the whole
  * verdict UNKNOWN rather than counting itself as exhausted.
  */
-export function capacityVerdict(accounts: AccountUsage[], weeklyAt: number = WEEKLY_AT): CapacityVerdict {
+export function capacityVerdict(all: AccountUsage[], weeklyAt: number = WEEKLY_AT): CapacityVerdict {
+  // A paused account is not capacity and not a blind spot (MX-1527): it is out of the count.
+  const accounts = inService(all);
   if (accounts.length === 0) return "unknown";
   let paid = false;
   let blind = false;
@@ -212,7 +225,7 @@ export function pickBest(
 ): AccountUsage | null {
   const billable = (a: AccountUsage) => (a.credits === "on" ? 1 : 0);
   const candidates = accounts
-    .filter((a) => a.slot !== exceptSlot && hasFreeWindow(a, weeklyAt) === true)
+    .filter((a) => !a.paused && a.slot !== exceptSlot && hasFreeWindow(a, weeklyAt) === true)
     .sort(
       (a, b) =>
         candidateTier(a, weeklyAt)! - candidateTier(b, weeklyAt)! ||
@@ -313,7 +326,7 @@ export function decideSwitch(
   // rather than this — `anyAccountHasCapacity` holds only on "none" — because a
   // machine mgrin has deliberately put ON the credit account must keep working.
   if (!best) {
-    const paidAlt = accounts.find((a) => a.slot !== active.slot && candidateTier(a, weeklyAt) === 1);
+    const paidAlt = accounts.find((a) => !a.paused && a.slot !== active.slot && candidateTier(a, weeklyAt) === 1);
     if (!paidAlt) return { action: "none", reason: "no eligible alternative slot" };
     const where = `(${active.slot} at 5h ${active.fiveHour ?? "unknown"}%, 7d ${active.sevenDay ?? "unknown"}%)`;
     if (why === null) {

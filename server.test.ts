@@ -4,7 +4,7 @@ import { register } from "node:module";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { unknownCodex } from "./telemetry.ts";
 register("./tests/sdk-loader.mjs", import.meta.url);
-const { default: plugin } = await import("./server.ts");
+const { default: plugin, usageFromRaw } = await import("./server.ts");
 
 test("actual thread.failed handler ignores Codex and unknown providers before any Claude read or recovery", async () => {
   let reads = 0;
@@ -220,4 +220,203 @@ test('status and log report the newest observed login change, without rewriting 
   await bb.storage.kv.set('last-switch',newer);
   assert.deepEqual((await harness.behavior.callRpc('status',null) as any).lastSwitch,newer);
  } finally {await harness.lifecycle.dispose();}
+});
+
+// ── MX-1527: pause an account ───────────────────────────────────────────────────────────
+// Paused = NO request of any kind on that account, shown everywhere marked PAUSED, never an
+// alarm. mgrin's act: the plugin refuses to pause/resume on its own and surfaces the
+// dotfiles CLI's refusals verbatim.
+const nowSec = () => Math.floor(Date.now() / 1000);
+const row = (slot: string, over: Record<string, unknown> = {}) => ({
+  slot, email: `${slot}@example.com`, active: false, fiveHour: 10, sevenDay: 10,
+  fiveHourResetsAt: null, sevenDayResetsAt: null, credits: "off" as const, creditSpend: null, ...over,
+});
+const pausedRow = (slot: string, over: Record<string, unknown> = {}) => row(slot, {
+  fiveHour: null, sevenDay: null, credits: "unknown" as const,
+  paused: { at: nowSec() - 3 * 3600 },
+  lastRead: { at: nowSec() - (3 * 3600 + 5 * 60), fiveHour: 41, sevenDay: 22 }, ...over,
+});
+const fleet = (...accounts: any[]) => async () => ({ polledAt: nowSec(), accounts });
+
+test("usageFromRaw reads paused and lastGood onto the account, with no undefined on the wire", () => {
+  const out = usageFromRaw({
+    polledAt: 5,
+    accounts: [
+      { slot: "p", email: "p@example.com", active: false, paused: { at: 100 },
+        lastGood: { at: 90, fiveHour: { util: 41, resetsAt: "x" }, sevenDay: { util: 22, resetsAt: "y" } } },
+      // Rate-limited rows already carry lastGood today, alongside an error.
+      { slot: "r", email: "r@example.com", active: true, error: "429", fiveHour: null, sevenDay: null,
+        lastGood: { at: 80, fiveHour: { util: 100 }, sevenDay: { util: 50 } } },
+      { slot: "o", email: "o@example.com", active: false, fiveHour: { util: 1 }, sevenDay: { util: 2 } },
+    ],
+  });
+  const [p, r, o] = out.accounts as any[];
+  assert.deepEqual(p.paused, { at: 100 });
+  assert.deepEqual(p.lastRead, { at: 90, fiveHour: 41, sevenDay: 22 });
+  assert.equal(p.error, undefined); assert.equal(p.fiveHour, null);
+  assert.deepEqual(r.lastRead, { at: 80, fiveHour: 100, sevenDay: 50 });
+  assert.ok(!("paused" in r) && !("lastRead" in o) && !("paused" in o), "absent means absent, never undefined");
+  assert.deepStrictEqual(out, JSON.parse(JSON.stringify(out)));
+  // A malformed lastGood is no last read, never a fabricated one.
+  const bad = usageFromRaw({ accounts: [{ slot: "b", email: "b@x", active: false, paused: { at: 1 }, lastGood: { at: "soon" } as any }] });
+  assert.ok(!("lastRead" in bad.accounts[0]!));
+});
+
+test("status shows a paused account marked paused and does not let it blind the verdict", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true, fiveHour: 100, sevenDay: 100, credits: "off" }), pausedRow("p")), readCodexSnapshot: async () => unknownCodex() });
+    const status = await harness.behavior.callRpc("status", null) as any;
+    assert.equal(status.accounts.length, 2, "shown, not hidden");
+    assert.deepEqual(status.accounts[1].paused.at > 0, true);
+    assert.deepEqual(status.accounts[1].lastRead.fiveHour, 41);
+    assert.equal(status.capacity, "none", "a paused account is neither capacity nor a blind spot");
+    assert.deepStrictEqual(status, JSON.parse(JSON.stringify(status)));
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("bb accounts list marks the paused row with its last read and age, and the JSON carries the fields", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true }), pausedRow("p"), pausedRow("q", { lastRead: undefined })), readCodexSnapshot: async () => unknownCodex() });
+    const text = (await harness.behavior.runCli(["list"])).stdout!;
+    assert.match(text, /^  p\s+PAUSED since .+ — no requests \(last read 5h 41% 7d 22%, 3h05m ago\)$/m);
+    assert.match(text, /^  q\s+PAUSED since .+ — no requests \(last read UNKNOWN\)$/m);
+    assert.doesNotMatch(text, /p\s+5h/, "no usage bars for a row that was not read");
+    assert.match(text, /▶ a\s+5h/);
+    const json = JSON.parse((await harness.behavior.runCli(["list", "--json"])).stdout!);
+    const p = json.accounts.find((a: any) => a.slot === "p");
+    assert.ok(p.paused.at > 0); assert.equal(p.lastRead.sevenDay, 22);
+    assert.equal(json.capacity, "free");
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("outage ignores a paused account: not unknown, not an outage by itself, and listed as paused", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true, fiveHour: 100, sevenDay: 100 }), pausedRow("p", { fiveHour: 0, sevenDay: 0 })), readCodexSnapshot: async () => unknownCodex() });
+    const j = JSON.parse((await harness.behavior.runCli(["outage", "--json"])).stdout!);
+    assert.equal(j.capacity, "none"); assert.equal(j.cannotServe, true);
+    assert.equal(j.confirmed, false, "one poll never confirms");
+    assert.deepEqual(j.accounts.map((a: any) => a.slot), ["a"]);
+    const t = (await harness.behavior.runCli(["outage"])).stdout!;
+    assert.match(t, /p\s+PAUSED — not counted/);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("switch to a paused slot is refused in the plugin, names resume, and never calls claude-acct", async () => {
+  const calls: string[][] = [];
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true }), pausedRow("p")), readCodexSnapshot: async () => unknownCodex(),
+      runClaudeAccount: async (args: string[]) => { calls.push(args); return ""; } });
+    const r = await harness.behavior.runCli(["switch", "p"]);
+    assert.notEqual(r.exitCode, 0);
+    assert.match(r.stderr!, /paused/); assert.match(r.stderr!, /bb accounts resume p/);
+    assert.deepEqual(calls, []);
+    // Positive control: an unpaused slot still switches.
+    assert.equal((await harness.behavior.runCli(["switch", "a"])).exitCode, 0);
+    assert.deepEqual(calls[0], ["use", "a", "--expected-current", "a"]);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("pause and resume call claude-acct, surface its refusal, and appear in the help list", async () => {
+  const calls: string[][] = [];
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  let spec: any;
+  const register = (bb as any).cli.register.bind((bb as any).cli);
+  (bb as any).cli.register = (s: any) => { spec = s; return register(s); };
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true }), row("b")), readCodexSnapshot: async () => unknownCodex(),
+      runClaudeAccount: async (args: string[]) => {
+        calls.push(args);
+        if (args[1] === "a") throw Object.assign(new Error("Command failed"), { stderr: "refusing to pause the active account 'a'\n", code: 2 });
+        return `${args[0] === "pause" ? "paused" : "resumed"}: ${args[1]}\n`;
+      } });
+    const ok = await harness.behavior.runCli(["pause", "b"]);
+    assert.equal(ok.exitCode, 0); assert.match(ok.stdout!, /paused: b/);
+    const back = await harness.behavior.runCli(["resume", "b"]);
+    assert.equal(back.exitCode, 0); assert.match(back.stdout!, /resumed: b/);
+    assert.deepEqual(calls, [["pause", "b"], ["resume", "b"]]);
+    const refused = await harness.behavior.runCli(["pause", "a"]);
+    assert.notEqual(refused.exitCode, 0); assert.match(refused.stderr!, /refusing to pause the active account/);
+    assert.notEqual((await harness.behavior.runCli(["pause"])).exitCode, 0, "needs a slot");
+    assert.ok(spec, "the CLI spec was registered");
+    for (const usage of ["bb accounts pause <slot>", "bb accounts resume <slot>", "bb accounts codex use <slot> | pause <slot> | resume <slot> | auto"])
+      assert.ok(spec.commands.some((c: any) => c.usage === usage), `help lists: ${usage}`);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("the pause and resume RPCs return ok/message for both providers, refusals included", async () => {
+  const claude: string[][] = []; const codex: string[][] = [];
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(row("a", { active: true })), readCodexSlots: async () => codexRows(),
+      runClaudeAccount: async (args: string[]) => { claude.push(args); if (args[1] === "a") throw Object.assign(new Error("x"), { stderr: "refusing: active\n" }); return `paused: ${args[1]}\n`; },
+      runCodexAccount: async (args: string[]) => { codex.push(args); return JSON.stringify({ slot: args[1], paused: args[0] === "pause" }); } } as any);
+    assert.deepEqual(await harness.behavior.callRpc("pause", { provider: "claude-code", slot: "b" }), { ok: true, message: "paused: b" });
+    assert.deepEqual(await harness.behavior.callRpc("pause", { provider: "claude-code", slot: "a" }), { ok: false, message: "refusing: active" });
+    assert.deepEqual(await harness.behavior.callRpc("resume", { provider: "codex", slot: "two" }), { ok: true, message: "resumed: two" });
+    assert.deepEqual(await harness.behavior.callRpc("pause", { provider: "codex", slot: "two" }), { ok: true, message: "paused: two" });
+    assert.deepEqual(claude, [["pause", "b"], ["pause", "a"]]); assert.deepEqual(codex, [["resume", "two"], ["pause", "two"]]);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("codex pause/resume run codex-acct; codex use of a paused slot is refused without calling it", async () => {
+  const calls: string[][] = [];
+  const rows = codexRows(); (rows[1] as any).paused = { at: nowSec() - 60 }; (rows[1] as any).capacity = "unknown"; rows[1]!.fresh = false;
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts", settings: { autoSwitch: false } });
+  try {
+    await plugin(bb as any, { readClaudeUsage: async () => ({ polledAt: null, accounts: [] }), readCodexSlots: async () => rows,
+      runCodexAccount: async (args: string[]) => { calls.push(args); return JSON.stringify({ slot: args[1], paused: args[0] === "pause" }); } } as any);
+    const used = await harness.behavior.runCli(["codex", "use", "two"]);
+    assert.equal(used.exitCode, 2); assert.match(used.stderr!, /bb accounts codex resume two/);
+    assert.deepEqual(calls, []);
+    const p = await harness.behavior.runCli(["codex", "pause", "one"]);
+    assert.equal(p.exitCode, 0); assert.match(p.stdout!, /paused: one/);
+    const r = await harness.behavior.runCli(["codex", "resume", "two"]);
+    assert.equal(r.exitCode, 0); assert.match(r.stdout!, /resumed: two/);
+    assert.deepEqual(calls, [["pause", "one"], ["resume", "two"]]);
+    const tel = await harness.behavior.callRpc("telemetry", null) as any;
+    assert.deepStrictEqual(tel, JSON.parse(JSON.stringify(tel)));
+    assert.match((await harness.behavior.runCli(["telemetry"])).stdout!, /PAUSED/);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("watch never switches toward, or records a sample for, a paused account", async () => {
+  const calls: string[][] = [];
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, {
+      readClaudeUsage: fleet(row("a", { active: true, fiveHour: 99, sevenDay: 50 }), pausedRow("p", { fiveHour: 0, sevenDay: 0 })),
+      readCodexSnapshot: async () => unknownCodex(),
+      runClaudeAccount: async (args: string[]) => { calls.push(args); return args[0] === "current" ? "a\n" : ""; } });
+    await harness.behavior.runSchedule("watch");
+    assert.ok(!calls.some((c) => c[0] === "use"), `no switch toward a paused slot: ${JSON.stringify(calls)}`);
+    const db = bb.storage.database();
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM usage_sample WHERE slot = ?").get("p") as any).n, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM usage_sample WHERE slot = ?").get("a") as any).n, 1);
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("a fine active account beside a paused one raises no alarm and switches nothing", async () => {
+  const calls: string[][] = [];
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, {
+      readClaudeUsage: fleet(row("a", { active: true, fiveHour: 20, sevenDay: 20 }), pausedRow("p")),
+      readCodexSnapshot: async () => unknownCodex(),
+      runClaudeAccount: async (args: string[]) => { calls.push(args); return args[0] === "current" ? "a\n" : ""; } });
+    await harness.behavior.runSchedule("watch");
+    assert.equal(await bb.storage.kv.get("cornered-since"), undefined);
+    assert.ok(!calls.some((c) => c[0] === "use"));
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("the forecast leaves paused accounts out, and is null when nothing is in service", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
+  try {
+    await plugin(bb as any, { readClaudeUsage: fleet(pausedRow("p"), pausedRow("q")), readCodexSnapshot: async () => unknownCodex() });
+    assert.equal(await harness.behavior.callRpc("forecast", null), null);
+  } finally { await harness.lifecycle.dispose(); }
 });

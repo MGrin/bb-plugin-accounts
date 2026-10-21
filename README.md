@@ -20,6 +20,8 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-accounts.git@main
 bb accounts telemetry     provider-scoped subscription windows (--json supported)
 bb accounts [list]        Claude per-account 5h/7d utilization
 bb accounts switch <slot> switch the live credentials to a slot
+bb accounts pause <slot>  stop ALL requests on an account; it stays listed, marked PAUSED
+bb accounts resume <slot> take it back
 bb accounts auto          run one auto-switch evaluation now
 bb accounts log           the last switch decision and why
 bb accounts place         where should work on a model START? ask BEFORE spawning
@@ -157,6 +159,45 @@ looks like an outage to anything that only counts windows, and it is not one: th
 serves, and it BILLS. The panel says so in those words. `unknown` is muted rather than
 alarming, the same rule as a null utilization and as `exit 2` on the CLI — a stale poll or an
 unreadable account asserts nothing, and must not borrow the urgency of either answer.
+
+## Pausing an account (MX-1527)
+
+*"Pause an account. It must be still shown everywhere, not hidden, but marked as paused."*
+(mgrin, 2026-10-21.) **Paused means no request of any kind on that account** — the dotfiles
+poller stops polling it and neither this plugin nor `claude-acct use` / `codex-acct use` will
+switch or place work onto it. It is **not disabled**: resuming is one command.
+
+```
+bb accounts pause <slot>          bb accounts codex pause <slot>
+bb accounts resume <slot>         bb accounts codex resume <slot>
+```
+
+The pause and resume RPCs behind the panel's **Pause / Resume** button run the same functions.
+The **active** account cannot be paused — switch away first; the dotfiles CLI refuses it
+(rc 2) and the plugin surfaces its reason verbatim. **Pausing and resuming are mgrin's acts**:
+nothing in this plugin pauses or resumes on its own, and agents never do either.
+
+A paused account is shown on every surface, never hidden and never an alarm:
+
+- `bb accounts list` — `PAUSED since <time> — no requests (last read 5h 41% 7d 22%, 3h05m ago)`,
+  or `last read UNKNOWN`; `--json` carries `paused` and `lastRead`. The panel and homepage card
+  show a muted PAUSED badge with the last-known usage dimmed and its age.
+- `bb accounts telemetry` — `paused: {at}`, reason `Paused since <ISO> — no requests made`,
+  `capacity` stays `unknown` (no new enum value: the widget feed validates it) and prints
+  `PAUSED` in place of `subscription UNKNOWN`. Claude's last read is shown as last-known, never fresh.
+- **Decisions ignore it.** `pickBest`, `decideSwitch`, placement, `chooseCodexSlot`, the
+  forecast and the outage predicate run over accounts in service. A paused account is not
+  capacity and — the part that is easy to get wrong — not a blind spot either: a fleet that is
+  walled apart from a paused slot is still `none`, not `unknown`; a fleet with every account
+  paused is `unknown` and is not an outage. No sample is recorded for it, so a pause leaves no
+  run of null readings in the history.
+- `bb accounts switch <paused>` and `bb accounts codex use <paused>` are refused here, before the
+  helper is called, with the message naming `bb accounts resume <slot>`.
+
+The cache contract (dotfiles): a paused Claude row is `{slot, email, active, paused: {at}}` with
+no `error`, no `authState` and no top-level windows, plus `lastGood` — which rate-limited rows
+already carry — as the last read; a paused Codex row carries `paused: {at}` and the PREVIOUS
+`snapshot`/`observedAt`.
 
 ## Provider-scoped telemetry (MX-1038)
 
