@@ -9,7 +9,7 @@ const forecast:CodexForecast={accountId:'a',label:'Account A',window:'primary',d
 test('forecast overlays use common timestamps and separate labeled scales; thin history has no path',()=>{
  const html=renderToStaticMarkup(createElement(Timeline,{points:[{ts:100,headroom:200,blacked:false},{ts:300,headroom:0,blacked:true}],codex:[forecast,{...forecast,accountId:'b',label:'Account B',confidence:'provisional',points:[]}]}));
  assert.match(html,/Claude.*200/);assert.match(html,/Codex.*100%/);assert.match(html,/Account A.*primary/);assert.match(html,/Account B.*provisional/);
- assert.match(html,/data-codex-series="a:primary"/);assert.doesNotMatch(html,/data-codex-series="b:primary"/);
+ assert.match(html,/data-codex-projection="a:primary"/);assert.doesNotMatch(html,/data-codex-projection="b:primary"/);
  // Codex reset at 200 is halfway across the common 100..300 time axis.
  assert.match(html,/M0.00,32.00 L50.00,37.60/);
 });
@@ -33,3 +33,14 @@ for (const provider of ["Claude", "Codex"]) {
   assert.match(render({}),/nothing recorded/);
  });
 }
+
+// Reproduces the real 180-second freshness boundary between history ticks.
+test('Codex series identity survives fitted to stale and missing history renders',()=>{
+ const render=(codex:CodexForecast[])=>renderToStaticMarkup(createElement(Timeline,{points:[],codex}));
+ const fresh=render([forecast]);
+ const stale=render([{...forecast,confidence:'stale',points:[]}]);
+ assert.match(fresh,/data-codex-series="a:primary"/);
+ assert.match(stale,/data-codex-series="a:primary"/);
+ assert.match(stale,/stale.*UNKNOWN/);
+ assert.match(render([]),/Codex.*UNKNOWN/);
+});

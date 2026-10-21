@@ -18,7 +18,6 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-accounts.git@main
 
 ```
 bb accounts telemetry     provider-scoped subscription windows (--json supported)
-bb accounts jev           Jev usage from mx jev usage: counts, plus the console bill if read (--json supported)
 bb accounts [list]        Claude per-account 5h/7d utilization
 bb accounts switch <slot> switch the live credentials to a slot
 bb accounts auto          run one auto-switch evaluation now
@@ -213,27 +212,6 @@ plugin failure handler, reconciliation, event listener, RPC and CLI under the pu
 fake host, fake `mx` process tests, and rendering the quota cards. Live install/reload is a
 separate coordinated deployment step.
 
-### Jev billing and local estimates (MX-1329)
-
-`bb accounts jev [--json]` and the `jev` RPC read `mx jev usage --json` (v2),
-bounded to one process per minute. Account billing and local usage are independent:
-an absent decision log does not hide a valid account snapshot. Failed reads preserve
-only the previous account snapshot, labelled stale; local counts are not reused.
-
-The dotfiles HTTP collector reads TypeSafe's `getBillingOverviewResult` server action
-and appends account spend, balance and period to `~/.local/state/mx-jev/billing.jsonl`.
-The plugin reads `billing-status.json` alongside that ledger (or under
-`MX_JEV_STATE_DIR`) to distinguish Cloudflare blocks, login failures, rate limits and
-unavailable service. A missing status is unknown, not a successful refresh. Account
-readings older than 13 h are stale. Legacy `/usage` rows are console estimates.
-
-Both the homepage and usage page share one Jev card. Separate local estimates use
-recorded decision and compaction input tokens at the vendor's $0.042/M input rate
-(output free), verified 2026-09-27. They cover recorded traffic only, exclude credits
-and unrecorded callers, and report unmetered compactions. Missing logs are unavailable,
-never zero. Rolling local windows and the vendor's billing cycle remain distinct.
-The plugin never reads session credentials or makes TypeSafe billing/inference calls.
-
 ## Requirements
 
 This plugin is the brain and the UI; it does **not** manage credentials itself. It needs:
@@ -315,3 +293,7 @@ samples: at least three days and 1,440 fresh polls, including 1,296 valid adjace
 intervals (at most ten minutes apart, same reset, no utilization decrease). Thin history
 is provisional; stale history has no projection. Each line follows observed average
 burn and ends at its window reset; it does not predict refills or infer quota from tokens.
+
+Forecast provider identities remain visible when data is stale or unavailable (UNKNOWN).
+Failed refreshes retain the last series roster without projecting old measurements.
+Opening the panel records current Codex windows independently of the history schedule.

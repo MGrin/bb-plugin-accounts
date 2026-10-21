@@ -25,3 +25,11 @@ test('records only fresh main subscription windows, dedupes polls and keeps acco
  const fc=readCodexForecast(db,now); assert.equal(fc.length,2);assert.deepEqual(fc.map(f=>f.polls),[1,1]);
  assert.deepEqual(fc.map(f=>f.usedPercent),[30,90]);db.close();
 });
+
+test('last known window stays visible beyond the history lookback as stale',()=>{
+ const db=new Database(':memory:');for(const m of MIGRATIONS)db.exec(m);
+ db.prepare('INSERT INTO codex_window_sample VALUES (?,?,?,?,?,?,?)').run('old','Old','primary',300,start,40,start+3600);
+ const rows=readCodexForecast(db,start+31*86400);
+ assert.equal(rows.length,1);assert.equal(rows[0]!.confidence,'stale');assert.deepEqual(rows[0]!.points,[]);
+ db.close();
+});

@@ -256,7 +256,7 @@ export function Timeline({ points, codex = [], height = 120 }: { points: Timelin
         ))}
         <path d={area} style={{ fill: "var(--acct-series-0)" }} opacity={0.14} />
         <path d={line} fill="none" style={{ stroke: "var(--acct-series-0)" }} strokeWidth={2} vectorEffect="non-scaling-stroke" />
-        {series.map((c,i)=><path key={`${c.accountId}:${c.window}:${c.durationMins}`} data-codex-series={`${c.accountId}:${c.window}`}
+        {series.map((c,i)=><path key={`${c.accountId}:${c.window}:${c.durationMins}`} data-codex-projection={`${c.accountId}:${c.window}`}
           d={c.points.map((p,j)=>`${j?'L':'M'}${tx(p.ts).toFixed(2)},${cy(p.remaining).toFixed(2)}`).join(' ')}
           fill="none" style={{stroke:`var(--acct-series-${1+codex.indexOf(c)%4})`}} strokeWidth={2} strokeDasharray="5 3" vectorEffect="non-scaling-stroke">
           <title>{`${c.label} · ${c.window} · remaining subscription %`}</title></path>)}
@@ -273,13 +273,13 @@ export function Timeline({ points, codex = [], height = 120 }: { points: Timelin
         )}
       </svg>
       <div className="text-[10px] text-muted-foreground flex justify-between">
-        <span>Claude · left scale 0–{Math.round(max)} summed headroom points</span><span>Codex · right scale 0–100% remaining per window</span>
+        <span>Claude{points.length===0 ? ' · UNKNOWN' : ''} · left scale 0–{Math.round(max)} summed headroom points</span><span>Codex · right scale 0–100% remaining per window</span>
       </div>
       {times.length>1 && <div className="text-[10px] text-muted-foreground flex justify-between"><span>{new Date(lo*1000).toLocaleString()}</span><span>{new Date(hi*1000).toLocaleString()}</span></div>}
-      {codex.length===0 && <p className="text-xs text-muted-foreground">Codex forecast provisional · no measured window history yet.</p>}
-      {codex.map((c,i)=><p key={`${c.accountId}:${c.window}:${c.durationMins}`} className="text-xs text-muted-foreground">
+      {codex.length===0 && <p data-provider="codex" className="text-xs text-muted-foreground">Codex forecast UNKNOWN · no measured window history available.</p>}
+      {codex.map((c,i)=><p key={`${c.accountId}:${c.window}:${c.durationMins}`} data-codex-series={`${c.accountId}:${c.window}`} className="text-xs text-muted-foreground">
         <span style={{color:`var(--acct-series-${1+i%4})`}}>┄ </span>{c.label} · {c.window} ({c.durationMins} min) · {c.confidence}
-        {c.confidence==='fitted'?` · ${c.ratePerHour?.toFixed(2)} percentage points/hour observed average · ends at reset`: ` · ${c.polls}/${c.neededPolls} polls; requires 3 days and continuous measurements`}
+        {c.confidence==='stale'?' · UNKNOWN · no fresh measurement; projection withheld':c.confidence==='fitted'?` · ${c.ratePerHour?.toFixed(2)} percentage points/hour observed average · ends at reset`: ` · ${c.polls}/${c.neededPolls} polls; requires 3 days and continuous measurements`}
       </p>)}
       <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
         <span>

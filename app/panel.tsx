@@ -18,6 +18,7 @@ import { SubscriptionsSection } from "./subscriptions.tsx";
 import { CodexTokens, UsageBreakdown } from './codex-analytics.tsx';
 import type { CodexBreakdown } from '../analytics/codex.ts';
 import type { CodexForecast } from '../analytics/codex-forecast.ts';
+import { settleCodexForecast } from "./forecast.ts";
 import { clock } from "./format.ts";
 import { Section, LoadingBlock, Notice } from "./ui.tsx";
 
@@ -136,7 +137,7 @@ export function UsagePanel() {
       ]);
       if (cancelled) return;
       setFc(f.status === "fulfilled" ? f.value : null);
-      setCodexForecast(c.status === "fulfilled" ? c.value : []);
+      setCodexForecast(previous => settleCodexForecast(previous,c));
       setData(a.status === "fulfilled" ? a.value : null);
       setErrors([...(f.status === "rejected" ? ["Claude forecast"] : []),
         ...(c.status === "rejected" ? ["Codex forecast"] : []),
@@ -191,7 +192,6 @@ export function UsagePanel() {
         {errors.join(", ")} unavailable. <button className="ml-2 underline underline-offset-2" onClick={()=>setRetry(r=>r+1)}>Retry</button>
       </Notice>}
       {loading ? <Section title="Subscription forecast"><LoadingBlock label="Loading subscription forecasts" rows={4} /></Section>
-        : errors.includes("Claude forecast") && errors.includes("Codex forecast") ? null
         : <ForecastSection fc={fc} codex={codexForecast} failed={errors.includes("Claude forecast")} />}
 
 

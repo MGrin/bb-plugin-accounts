@@ -21,9 +21,9 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import { createCodexSlotReader, createJevUsageReader } from "./telemetry-source.ts";
+import { createCodexSlotReader } from "./telemetry-source.ts";
 import { telemetryShape, normalizeClaude, normalizeCodexEvents, isClaudeProvider, isFresh,
-  chooseCodexSlot, formatTelemetry, jevSpendShape, formatJev, type JevSpend, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
+  chooseCodexSlot, formatTelemetry, type ProviderAccount, type TokenObservation, type Telemetry } from "./telemetry.ts";
 // The judgement lives in lib.ts so `node --test` can exercise it without a
 // Keychain, a poller or a clock. A second copy here is how the two drift.
 import {
@@ -221,8 +221,6 @@ const forecastShape = z.object({
 
 export const rpcContract = defineRpcContract({
   telemetry: { input: z.null(), output: telemetryShape },
-  // Its own method, not a key on `telemetry`: the dotfiles widget feed pins that shape to version 1.
-  jev: { input: z.null(), output: jevSpendShape },
   forecast: { input: z.null(), output: forecastShape.nullable() },
   codexForecast: { input: z.null(), output: z.array(codexForecastShape) },
   analytics: {
@@ -370,7 +368,6 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   readCodexSnapshot?: () => Promise<ProviderAccount>;
   readCodexSlots?: () => Promise<ProviderAccount[]>;
   runCodexAccount?: (args: string[]) => Promise<string>;
-  readJevUsage?: () => Promise<JevSpend>;
 } = {}) {
   const readUsage = dependencies.readClaudeUsage ?? readUsageCache;
   const runClaudeAccount = dependencies.runClaudeAccount ?? (async (args: string[]) =>
@@ -380,7 +377,6 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     : createCodexSlotReader(`${os.homedir()}/.config/codex-usage/usage.json`));
   const runCodexAccount = dependencies.runCodexAccount ?? (async (args: string[]) =>
     (await run(`${os.homedir()}/.local/bin/codex-acct`, args, {timeout:30_000,maxBuffer:262144})).stdout);
-  const readJevUsage = dependencies.readJevUsage ?? createJevUsageReader(`${os.homedir()}/.local/bin/mx`);
   const observedThreads = new Map<string, { account: ProviderAccount | null; tokens: TokenObservation | null }>();
   const inspectingThreads = new Set<string>();
   const invalidatedReads = new Set<string>();
@@ -1476,11 +1472,21 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
 
   bb.rpc.register(rpcContract, {
     telemetry: currentTelemetry,
-    jev: () => readJevUsage(),
     async forecast() {
       return (await currentForecast()) ?? null;
     },
-    codexForecast: () => readCodexForecast(db,Date.now()/1000),
+    async codexForecast() {
+      // Read independently of Claude and seed before the first scheduled history tick.
+      // A failed/missing live observation invalidates projections, never identities.
+      let rows: ProviderAccount[] = [];
+      try { rows = await readCodexSlots(); } catch { /* history remains visible as UNKNOWN */ }
+      const now = Date.now()/1000;
+      recordCodexWindows(db,rows,now);
+      return readCodexForecast(db,now).map(f => rows.some(r => r.accountId===f.accountId && r.fresh && r.capacity!=='unknown' &&
+        r.observedAt!==null && r.observedAt<=now && now-r.observedAt<=180 &&
+        r.windows.some(w=>w.bucket==='codex' && w.key===f.window && w.durationMinutes===f.durationMins && w.resetsAt!==null && w.resetsAt>now))
+        ? f : {...f,confidence:'stale' as const,ratePerHour:null,points:[]});
+    },
     async analytics({ days }) {
       const now = Math.floor(Date.now() / 1000);
       const since = now - Math.max(1, days) * 86400;
@@ -1533,7 +1539,6 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     commands: [
       { name: "codex", summary: "Switch captured Codex logins", usage: "bb accounts codex use <slot> | auto" },
       { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
-      { name: "jev", summary: "Jev usage from mx jev usage: this key's counts, and the TypeSafe console bill when one was read", usage: "bb accounts jev [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
@@ -1574,10 +1579,6 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       if (cmd === "telemetry") {
         const telemetry = await currentTelemetry();
         return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(telemetry) : formatTelemetry(telemetry) };
-      }
-      if (cmd === "jev") {
-        const jev = await readJevUsage();
-        return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(jev) : formatJev(jev, Date.now() / 1000) };
       }
       const json = argv.includes("--json");
 
