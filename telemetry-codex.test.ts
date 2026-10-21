@@ -64,3 +64,17 @@ test('selection never chooses a paused slot, even one that reads available and f
   assert.equal(telemetry.chooseCodexSlot(forced,'one',97,now),'three');
   assert.equal(telemetry.chooseCodexSlot(forced.filter(r=>r.slot!=='three'),'one',97,now),null);
 });
+test('a paused slot with no login on this Mac is shown, marked paused, and never chosen (MX-1527)',()=>{
+  const away={slot:'new',accountId:null,label:'nikita@scani.xyz',active:false,observedAt:null,snapshot:null,error:null,
+    paused:{at:1_761_048_480}};
+  const rows=telemetry.normalizeCodexSlots({version:1,accounts:[slot('one',99,true),away]},now);
+  assert.deepEqual(rows.map(r=>[r.slot,r.label,r.capacity]),[['one','one@example.test','available'],['new','nikita@scani.xyz','unknown']]);
+  assert.deepEqual(rows[1]!.paused,{at:1_761_048_480});
+  assert.equal(rows[1]!.accountId,null);
+  assert.match(rows[1]!.reason,/^Paused since/);
+  assert.equal(telemetry.chooseCodexSlot(rows,'one',97,now),null);
+  // CONTROL: a null identity WITHOUT the pause flag is still an invalid manifest.
+  const bad=telemetry.normalizeCodexSlots({version:1,accounts:[slot('one',99,true),{...away,paused:undefined}]},now);
+  assert.equal(bad.length,1);
+  assert.match(bad[0]!.reason,/invalid or duplicate identity/);
+});
