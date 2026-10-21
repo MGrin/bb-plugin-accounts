@@ -81,6 +81,23 @@ export function readSamples(db: Database, slot: string, sinceEpochSec: number): 
   return rows.map(toSample);
 }
 
+/** Latest transition into the current login, timestamped at its first observed poll.
+ * The helper/native login do not write plugin KV. This is observation, not an
+ * exact switch time or evidence of a manual choice for placement policy.
+ */
+export function readObservedLoginChange(db: Database, polledAt: number, slot: string):
+  { at: number; after: number; from: string; to: string; reason: string } | null {
+  const previous = db.prepare(`SELECT slot, polled_at FROM usage_sample
+    WHERE active = 1 AND slot != ? AND polled_at < ? ORDER BY polled_at DESC LIMIT 1`)
+    .get(slot, polledAt) as { slot: string; polled_at: number } | undefined;
+  if (!previous) return null;
+  const first = db.prepare(`SELECT MIN(polled_at) AS ts FROM usage_sample
+    WHERE active = 1 AND slot = ? AND polled_at > ? AND polled_at <= ?`)
+    .get(slot, previous.polled_at, polledAt) as { ts: number | null };
+  return { at: (first.ts ?? polledAt) * 1000, after: previous.polled_at * 1000, from: previous.slot, to: slot,
+    reason: "login change observed in usage polls; actual switch time/source unknown" };
+}
+
 /** Newest polled_at across every slot, or null when nothing is recorded yet. */
 export function latestSampleAt(db: Database): number | null {
   const row = db.prepare(`SELECT MAX(polled_at) AS t FROM usage_sample`).get() as { t: number | null };

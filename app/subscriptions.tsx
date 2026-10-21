@@ -6,7 +6,7 @@ import type { ProviderAccount } from "../telemetry.ts";
 import type { Status } from "./current.tsx";
 import { AccountCard } from "./account-card.tsx";
 import { claudeCards, codexCards } from "./cards.ts";
-import { capacityNotice } from "./format.ts";
+import { clockMs, capacityNotice } from "./format.ts";
 import { Notice, LoadingBlock } from "./ui.tsx";
 
 const POLL_MS = 30_000;
@@ -59,7 +59,8 @@ export function SubscriptionsSection({ compact = false }: { compact?: boolean })
     </div>
     {!compact && status?.lastSwitch && (
       <div className="text-xs text-muted-foreground">
-        Last Claude switch: {status.lastSwitch.from} → {status.lastSwitch.to}
+        Last Claude {status.lastSwitch.reason.includes("observed") ? "login change observed" : "switch"} {clockMs(status.lastSwitch.at)}: {status.lastSwitch.from} → {status.lastSwitch.to}
+        {status.lastSwitch.reason.includes("observed") && " · actual switch time/source unknown"}
       </div>
     )}
   </div>;

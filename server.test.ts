@@ -188,3 +188,36 @@ test('forecast reads seed current Codex history before the watch tick and retain
   assert.ok(second.every(f=>f.confidence==='stale'&&f.points.length===0));
  }finally{await harness.lifecycle.dispose();}
 });
+
+// Direct claude-acct use and native login never write the plugin's KV record.
+test('status and log report the newest observed login change, without rewriting switch policy', async () => {
+ const {bb,harness}=createFakePluginHost({pluginId:'accounts'});
+ let polledAt=Math.floor(Date.now()/1000)-10;
+ const older=polledAt-600;
+ const known={at:(older-300)*1000,from:'a',to:'b',reason:'manual via bb accounts switch'};
+ try {
+  await bb.storage.kv.set('last-switch',known);
+  await plugin(bb as any,{readClaudeUsage:async()=>({polledAt,accounts:[{
+   slot:'a',email:'a@example.com',active:true,fiveHour:10,sevenDay:3,fiveHourResetsAt:null,sevenDayResetsAt:null,credits:'off',creditSpend:null}]}),
+   readCodexSnapshot:async()=>unknownCodex()});
+  const db=bb.storage.database();
+  db.prepare('INSERT INTO usage_sample (polled_at,slot,active) VALUES (?,?,1)').run(older,'b');
+  const status=await harness.behavior.callRpc('status',null) as any;
+  assert.equal(status.lastSwitch.from,'b');assert.equal(status.lastSwitch.to,'a');
+  assert.equal(status.lastSwitch.at,polledAt*1000,'poll timestamp is seconds, switch timestamp is milliseconds');
+  assert.match(status.lastSwitch.reason,/observed/);
+  db.prepare('INSERT INTO usage_sample (polled_at,slot,active) VALUES (?,?,1)').run(polledAt,'a');
+  polledAt+=5;
+  const again=await harness.behavior.callRpc('status',null) as any;
+  assert.equal(again.lastSwitch.at,status.lastSwitch.at,'unchanged polls cannot move the change time');
+  assert.match((await harness.behavior.runCli(['log'])).stdout!,/b -> a/);
+  assert.deepEqual(await bb.storage.kv.get('last-switch'),known,'observation does not pin placement or change cooldown');
+  const exact={at:(older+30)*1000,from:'b',to:'a',reason:'manual via bb accounts switch'};
+  await bb.storage.kv.set('last-switch',exact);
+  assert.deepEqual((await harness.behavior.callRpc('status',null) as any).lastSwitch,exact,
+   'a known switch between the two polls retains its exact time and source');
+  const newer={at:Date.now(),from:'b',to:'a',reason:'manual via bb accounts switch'};
+  await bb.storage.kv.set('last-switch',newer);
+  assert.deepEqual((await harness.behavior.callRpc('status',null) as any).lastSwitch,newer);
+ } finally {await harness.lifecycle.dispose();}
+});

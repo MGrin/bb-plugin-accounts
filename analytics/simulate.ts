@@ -208,5 +208,14 @@ export function simulate(
     }
   }
 
+  // Include the horizon boundary without spending an extra tick of demand.
+  const endTs = startTs + horizonSec;
+  for (const a of state) rollWindows(a, endTs, policy);
+  timeline.push({
+    ts: endTs,
+    headroom: state.reduce((sum, a) => sum + headroomOf(a, policy), 0),
+    blacked: state.every((a) => isWalled(a, policy)),
+  });
+
   return { blackoutStart, blackoutEndsAt, timeline, weeklyExhaustedAt, blackoutSec, finalAccounts: state };
 }

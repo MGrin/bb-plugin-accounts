@@ -44,3 +44,18 @@ test('Codex series identity survives fitted to stale and missing history renders
  assert.match(stale,/stale.*UNKNOWN/);
  assert.match(render([]),/Codex.*UNKNOWN/);
 });
+
+// A clipped panel used to hide day 3..14 even though the handler returned them.
+import { ForecastSection } from "./forecast-section.tsx";
+test('the forecast panel renders the entire Claude horizon, independent of Codex reset', () => {
+ const start=1_700_000_000, end=start+14*86400;
+ const timeline=Array.from({length:1345},(_,i)=>({ts:start+i*900,headroom:150,blacked:i===1343}));
+ const html=renderToStaticMarkup(createElement(ForecastSection,{fc:{confidence:'fitted',generatedAt:start,
+  coverage:{distinctPolls:2000,neededPolls:1440,latestSampleAt:start},horizonSec:1209600,
+  blackout:{earliest:null,likely:null,latest:null,endsAt:null,expectedSec:0},weeklyExhaustedAt:{a:null,b:null},timeline,slotCurve:[]},
+  codex:[{...forecast,observedAt:start,resetsAt:start+7*86400,points:[{ts:start,remaining:75},{ts:start+7*86400,remaining:0}]}]}));
+ assert.ok(html.includes(new Date(end*1000).toLocaleString()),'axis ends at the advertised 14 days');
+ assert.match(html,/L100.00,/,'Claude reaches the horizon');
+ assert.match(html,/no capacity/,'late-horizon blackout is not discarded');
+ assert.match(html,/auto-scaled/,'the plotted peak must not masquerade as subscription capacity');
+});
