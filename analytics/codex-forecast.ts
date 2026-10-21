@@ -47,7 +47,10 @@ export function recordCodexWindows(db:Database,rows:ProviderAccount[],now:number
 }
 export function readCodexForecast(db:Database,now:number):CodexForecast[] {
  const rows=db.prepare(`SELECT account_id AS accountId,label,window,duration_mins AS durationMins,at,used,reset
-   FROM codex_window_sample WHERE at>=? ORDER BY account_id,window,duration_mins,at`).all(now-30*86400) as (Identity&Sample)[];
+   FROM codex_window_sample s WHERE at>=? OR at=(
+     SELECT MAX(last.at) FROM codex_window_sample last
+     WHERE last.account_id=s.account_id AND last.window=s.window AND last.duration_mins=s.duration_mins
+   ) ORDER BY account_id,window,duration_mins,at`).all(now-30*86400) as (Identity&Sample)[];
  const groups=new Map<string,(Identity&Sample)[]>();
  for(const row of rows){const key=JSON.stringify([row.accountId,row.window,row.durationMins]);const g=groups.get(key)??[];g.push(row);groups.set(key,g);}
  return [...groups.values()].map(samples=>{const r=samples.at(-1)!;return fitCodexWindow({accountId:r.accountId,label:r.label,window:r.window,durationMins:r.durationMins},samples,now);});

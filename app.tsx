@@ -21,9 +21,6 @@ const hhmm = (ts: number | null) =>
 
 
 export default definePluginApp((app) => {
-  // ONE tile for every subscription (MX-1226). Two tiles in two layouts, with no Jev at
-  // all, is what mgrin was looking at when he said the page was not unified and data was
-  // missing.
   app.slots.homepageSection({ id: "subscriptions", title: "Subscriptions", component: () => <SubscriptionsSection compact /> });
   app.slots.navPanel({
     id: "usage",

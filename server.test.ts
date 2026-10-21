@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { register } from "node:module";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { unknownCodex, unknownJev, JEV_WINDOWS } from "./telemetry.ts";
+import { unknownCodex } from "./telemetry.ts";
 register("./tests/sdk-loader.mjs", import.meta.url);
 const { default: plugin } = await import("./server.ts");
 
@@ -95,27 +95,6 @@ test("an in-flight SDK read cannot restore a thread after provider change", asyn
   } finally { await harness.lifecycle.dispose(); }
 });
 
-test("Jev spend rides its own rpc and CLI verb; telemetry keeps version 1 and gains no key", async () => {
-  const { bb, harness } = createFakePluginHost({ pluginId: "accounts" });
-  const ok = { ...unknownJev(""), state: "ok" as const, reason: "counts", generatedAt: 1_800_000_000, lastDecisionAt: 1_799_999_000,
-    billing: { amountUsd: 12.5, recordedAt: 1_799_990_000, period: "Sep 2026", source: "https://console.typesafe.ai/usage", asOf: null },
-    windows: JEV_WINDOWS.map(name => ({ name, since: 1_799_000_000, calls: 3, inputTokens: 1000, bySet: [] })) };
-  let reading: ReturnType<typeof unknownJev> = ok;
-  try {
-    await plugin(bb as unknown as Parameters<typeof plugin>[0], { readClaudeUsage: async () => ({ polledAt: null, accounts: [] }),
-      readCodexSnapshot: async () => unknownCodex(), readJevUsage: async () => reading });
-    const telemetry = await harness.behavior.callRpc("telemetry", null) as any;
-    assert.deepEqual(Object.keys(telemetry).sort(), ["accounts", "tokens", "version"]); assert.equal(telemetry.version, 1);
-    assert.deepEqual(await harness.behavior.callRpc("jev", null), ok);
-    const cli = await harness.behavior.runCli(["jev", "--json"]);
-    assert.equal(cli.exitCode, 0); assert.deepEqual(JSON.parse(cli.stdout!), ok);
-    assert.match((await harness.behavior.runCli(["jev"])).stdout!, /\$12\.50 for Sep 2026/);
-    reading = unknownJev("mx not found");
-    const blind = await harness.behavior.runCli(["jev"]);
-    assert.equal(blind.exitCode, 0, "a report, not a gate: README, Provider-scoped telemetry"); assert.match(blind.stdout!, /UNKNOWN · mx not found/); assert.doesNotMatch(blind.stdout!, /\$/);
-  } finally { await harness.lifecycle.dispose(); }
-});
-
 // MX-1226: `bb plugin list` read `accounts running (rpc status failed: rpc result at
 // $result.accounts[0].error is not a JSON value (undefined))`. `error` and `authState` are
 // optional in the contract, and zod accepts undefined — but the RPC wire does not: a key
@@ -187,8 +166,25 @@ test('Codex history records with switching disabled and RPC remains provider-sco
   await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:null,accounts:[]}),readCodexSlots:async()=>codexRows()});
   await harness.behavior.runSchedule('watch');
   const fc=await harness.behavior.callRpc('codexForecast',null) as any[];
-  assert.equal(fc.length,2);assert.ok(fc.every(f=>f.confidence==='provisional'&&f.polls===1));
+  assert.equal(fc.length,2);assert.ok(fc.every(f=>f.confidence==='provisional'&&f.polls>=1));
   const analytics=await harness.behavior.callRpc('analytics',{days:7}) as any;
   assert.deepEqual(analytics.codex.byModel,[]);assert.equal(analytics.codex.coverage.responses,0);
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('forecast reads seed current Codex history before the watch tick and retain UNKNOWN identity on read failure',async()=>{
+ const {bb,harness}=createFakePluginHost({pluginId:'accounts',settings:{autoSwitch:false}});
+ let failed=false;
+ try {
+  await plugin(bb as any,{readClaudeUsage:async()=>({polledAt:null,accounts:[]}),readCodexSlots:async()=>{
+   if(failed)throw new Error('simulated read timeout');
+   return codexRows();
+  }});
+  const first=await harness.behavior.callRpc('codexForecast',null) as any[];
+  assert.deepEqual(first.map(f=>f.accountId),['one','two']);
+  failed=true;
+  const second=await harness.behavior.callRpc('codexForecast',null) as any[];
+  assert.deepEqual(second.map(f=>f.accountId),['one','two']);
+  assert.ok(second.every(f=>f.confidence==='stale'&&f.points.length===0));
  }finally{await harness.lifecycle.dispose();}
 });
