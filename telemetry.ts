@@ -215,9 +215,12 @@ export function normalizeCodexSlots(value: unknown, now: number): ProviderAccoun
     const row = object(raw);
     const slot = typeof row.slot === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(row.slot) ? row.slot : null;
     const id = word(row.accountId);
-    if (!slot || !id || seenSlots.has(slot) || seenIds.has(id))
+    // A paused slot may have NO login on this Mac at all (its login lives elsewhere), and then
+    // no identity either: shown, marked paused, never a reading (MX-1527). Only paused.
+    const away = row.accountId === null && row.paused !== null && typeof row.paused === 'object';
+    if (!slot || (!id && !away) || seenSlots.has(slot) || (id && seenIds.has(id)))
       return [unknownCodex('Codex slot manifest has invalid or duplicate identity')];
-    seenSlots.add(slot); seenIds.add(id);
+    seenSlots.add(slot); if (id) seenIds.add(id);
     const snap = object(row.snapshot), out = normalizeCodex(snap, now);
     const matches = out.accountId === id && row.observedAt === snap.codex_observed_at;
     if (!matches || row.error || row.reauthRequired === true) {
