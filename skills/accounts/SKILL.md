@@ -1,6 +1,6 @@
 ---
 name: accounts
-description: Read custom Claude and Codex subscription telemetry, or switch captured Claude/Codex accounts in the accounts plugin.
+description: Read custom Claude and Codex subscription telemetry, switch captured Claude/Codex accounts, or see which accounts mgrin has paused in the accounts plugin.
 ---
 
 # Custom subscription accounts
@@ -40,3 +40,20 @@ includes cache; output includes reasoning; neither maps to quota percent. Missin
 context is shown as unknown/unresolved. Codex forecasts use each account/window's own
 measured quota history; they remain provisional until three days, 1,440 polls, and 1,296
 valid adjacent intervals. Forecasts stop at reset and do not predict post-reset use.
+
+## Paused accounts
+
+`bb accounts pause <slot>` / `bb accounts resume <slot>` (Claude) and
+`bb accounts codex pause <slot>` / `bb accounts codex resume <slot>` (Codex) pause or resume
+an account. **Paused means no request of any kind is made on it** — it is not polled, nothing
+switches or places work onto it, and `switch` / `codex use` refuse it naming `resume`. It stays
+listed everywhere, marked PAUSED, with its last-known usage and that reading's age. It is not
+disabled: resume is one command. The active account cannot be paused; switch away first.
+
+- In `telemetry --json` a paused row has `paused: {at}`, `capacity` `unknown` and `fresh` false.
+  Read `paused` before reading `capacity`: it is a decision, not a fault. Never report a paused
+  account as unreadable, blind, lost or as missing capacity, and never raise an alarm about one.
+- A paused account's windows are LAST-KNOWN: say how old they are, never present them as current.
+- **Pausing and resuming are mgrin's acts: agents never pause or resume an account on their own.**
+  Not to save quota, not to dodge a limit, not because an account looks unhealthy. If a pause
+  seems wrong, tell mgrin; do not undo it.
