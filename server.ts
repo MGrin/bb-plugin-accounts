@@ -33,6 +33,7 @@ import {
   type CreditSpend,
   type CreditState,
   decideSwitch,
+  inService,
   isLimitError,
   isAuthenticationError,
   isLimitFailure,
@@ -192,8 +193,16 @@ const accountShape = z.object({
   // downgrade to "exhausted" this plugin exists to avoid.
   credits: z.enum(["on", "off", "unknown"]),
   creditSpend: creditSpendShape.nullable(),
+  // MX-1527. A paused account is shown everywhere and decided on nowhere: no request of any
+  // kind is made on it, so `fiveHour`/`sevenDay` are null and `lastRead` is the only usage there
+  // is (its own age, never a fresh reading). Absent — never undefined — when not paused.
+  paused: z.object({ at: z.number() }).optional(),
+  lastRead: z.object({ at: z.number(), fiveHour: z.number().nullable(), sevenDay: z.number().nullable() }).optional(),
 });
 type Account = z.infer<typeof accountShape>;
+
+const pauseInput = z.object({ provider: z.enum(["claude-code", "codex"]), slot: z.string() });
+const pauseOutput = z.object({ ok: z.boolean(), message: z.string() });
 
 const burnSliceShape = z.object({ key: z.string(), messages: z.number(), weightedK: z.number() });
 
@@ -222,6 +231,11 @@ const forecastShape = z.object({
 
 export const rpcContract = defineRpcContract({
   telemetry: { input: z.null(), output: telemetryShape },
+  // MX-1527. Pausing and resuming are mgrin's acts, so these are only ever called from the
+  // panel's buttons; a refusal (the dotfiles CLI refuses the active account) is `ok: false`
+  // with its own reason, not a thrown error.
+  pause: { input: pauseInput, output: pauseOutput },
+  resume: { input: pauseInput, output: pauseOutput },
   forecast: { input: z.null(), output: forecastShape.nullable() },
   codexForecast: { input: z.null(), output: z.array(codexForecastShape) },
   analytics: {
@@ -287,6 +301,14 @@ interface RawUsage {
     } | null;
     error?: string;
     authState?: "ok" | "unknown" | "reauth-required";
+    /** MX-1527: written by dotfiles for a paused slot, with no `error` and no top-level windows. */
+    paused?: { at?: number } | null;
+    /** The last good reading. Also present on rate-limited rows (which carry an `error`). */
+    lastGood?: {
+      at?: number;
+      fiveHour?: { util?: number | null; resetsAt?: string | null } | null;
+      sevenDay?: { util?: number | null; resetsAt?: string | null } | null;
+    } | null;
   }[];
 }
 
@@ -339,25 +361,41 @@ function optional<T>(value: T | undefined, key: string): Record<string, T> {
   return value === undefined ? {} : { [key]: value };
 }
 
+/** The last good reading as the plugin carries it, or nothing at all when it is not well formed. */
+function lastReadOf(a: RawAccount): Account["lastRead"] | undefined {
+  const g = a.lastGood;
+  if (!g || typeof g.at !== "number" || !Number.isFinite(g.at)) return undefined;
+  const util = (w: { util?: number | null } | null | undefined) =>
+    typeof w?.util === "number" && Number.isFinite(w.util) ? w.util : null;
+  return { at: g.at, fiveHour: util(g.fiveHour), sevenDay: util(g.sevenDay) };
+}
+
+/** Pure: the cache's JSON into the plugin's account rows (exported for the tests). */
+export function usageFromRaw(raw: RawUsage): { polledAt: number | null; accounts: Account[] } {
+  return {
+    polledAt: raw.polledAt ?? null,
+    accounts: (raw.accounts ?? []).map((a) => ({
+      ...optional(a.error, "error"),
+      ...optional(a.authState, "authState"),
+      // A paused marker is a fact even when malformed: no request may be made on it.
+      ...optional(a.paused ? { at: typeof a.paused.at === "number" && Number.isFinite(a.paused.at) ? a.paused.at : 0 } : undefined, "paused"),
+      ...optional(lastReadOf(a), "lastRead"),
+      slot: a.slot,
+      email: a.email,
+      active: a.active,
+      fiveHour: a.fiveHour?.util ?? null,
+      sevenDay: a.sevenDay?.util ?? null,
+      fiveHourResetsAt: a.fiveHour?.resetsAt ?? null,
+      sevenDayResetsAt: a.sevenDay?.resetsAt ?? null,
+      credits: creditStateOf(a),
+      creditSpend: creditSpendOf(a),
+    })),
+  };
+}
+
 async function readUsageCache(): Promise<{ polledAt: number | null; accounts: Account[] }> {
   try {
-    const raw = JSON.parse(await readFile(USAGE, "utf8")) as RawUsage;
-    return {
-      polledAt: raw.polledAt ?? null,
-      accounts: (raw.accounts ?? []).map((a) => ({
-        ...optional(a.error, "error"),
-        ...optional(a.authState, "authState"),
-        slot: a.slot,
-        email: a.email,
-        active: a.active,
-        fiveHour: a.fiveHour?.util ?? null,
-        sevenDay: a.sevenDay?.util ?? null,
-        fiveHourResetsAt: a.fiveHour?.resetsAt ?? null,
-        sevenDayResetsAt: a.sevenDay?.resetsAt ?? null,
-        credits: creditStateOf(a),
-        creditSpend: creditSpendOf(a),
-      })),
-    };
+    return usageFromRaw(JSON.parse(await readFile(USAGE, "utf8")) as RawUsage);
   } catch {
     return { polledAt: null, accounts: [] };
   }
@@ -482,6 +520,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       active: a.active,
       fiveResetsAt: a.fiveHourResetsAt,
       sevenResetsAt: a.sevenDayResetsAt,
+      paused: Boolean(a.paused),
     }));
 
   /**
@@ -541,8 +580,52 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     return !!last && Date.now() - last.at < window * 1000;
   }
 
+  // ── Pause (MX-1527) ─────────────────────────────────────────────────────────────────────
+  // Paused = NO request of any kind on the account: no poll (dotfiles), and — here — no switch
+  // or placement onto it. Pausing and resuming are mgrin's acts; nothing in this plugin calls
+  // either on its own, only the CLI commands and the panel's buttons do. The dotfiles CLIs own
+  // the rules (they refuse the active account, rc 2 with the reason on stderr); this surfaces
+  // their words rather than second-guessing them.
+  const SLOT_RE = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/;
+  const failureText = (e: unknown): string => {
+    const stderr = (e as { stderr?: unknown } | null)?.stderr;
+    return (typeof stderr === "string" && stderr.trim()) || (e instanceof Error ? e.message : String(e));
+  };
+  async function setPaused(provider: "claude-code" | "codex", slot: string, pause: boolean): Promise<{ ok: boolean; message: string }> {
+    const verb = pause ? "pause" : "resume";
+    const done = pause ? "paused" : "resumed";
+    if (!SLOT_RE.test(slot)) return { ok: false, message: `invalid slot '${slot}'` };
+    try {
+      let message: string;
+      if (provider === "claude-code") {
+        message = (await runClaudeAccount([verb, slot])).trim() || `${done}: ${slot}`;
+      } else {
+        const raw = (await runCodexAccount([verb, slot])).trim();
+        let answer: { slot?: unknown; paused?: unknown } | null = null;
+        try { answer = JSON.parse(raw); } catch { /* handled below */ }
+        if (!answer || answer.slot !== slot || answer.paused !== pause) {
+          return { ok: false, message: `codex-acct ${verb} ${slot} gave an unexpected answer; check bb accounts telemetry` };
+        }
+        message = `${done}: ${slot}`;
+      }
+      bb.log.info(`${provider} slot ${slot} ${done} (an act of mgrin's, via bb accounts)`);
+      bb.realtime.publish("accounts.paused", { provider, slot, paused: pause });
+      return { ok: true, message };
+    } catch (e) {
+      return { ok: false, message: failureText(e) };
+    }
+  }
+  const pausedRefusal = (provider: "claude-code" | "codex", slot: string) =>
+    `${provider === "codex" ? "Codex slot" : "slot"} '${slot}' is paused — no requests are made on it, so nothing may be switched onto it. ` +
+    `Resuming is mgrin's act: bb accounts ${provider === "codex" ? "codex " : ""}resume ${slot}`;
+
   let switching = false;
   async function switchTo(to: Account, from: string, reason: string): Promise<boolean> {
+    if (to.paused) {
+      // Defence in depth: pickBest and placement already skip a paused slot.
+      bb.log.warn(`refusing to switch onto paused slot ${to.slot}`);
+      return false;
+    }
     if (switching) return false;
     switching = true;
     try {
@@ -786,7 +869,9 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         ? ` Next capacity ~${next.toISOString().slice(11, 16)}Z (${Math.round((next.getTime() - Date.now()) / 60000)} min).`
         : "";
     const held = stuck ? ` ${stuck} thread(s) held for resume.` : "";
-    const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom.${eta}${held}`;
+    const sidelined = accounts.filter((a) => a.paused).length;
+    const paused = sidelined ? ` ${sidelined} paused account(s) not counted.` : "";
+    const msg = `${active.slot} is at 5h ${active.fiveHour ?? "?"}% / 7d ${active.sevenDay ?? "?"}% and no account has headroom.${eta}${held}${paused}`;
     bb.log.warn(`cornered: ${msg} (${reason})`);
     try {
       await run("osascript", [
@@ -829,6 +914,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     const active = rows.filter(r=>r.active && r.slot);
     if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(slot) || active.length !== 1 || !rows.some(r=>r.slot===slot))
       return {exitCode:2,stderr:'Codex slot or active identity unavailable; poll accounts first'};
+    if (rows.find(r=>r.slot===slot)?.paused) return {exitCode:2,stderr:pausedRefusal('codex',slot)};
     if (codexSwitching) return {exitCode:2,stderr:'Codex switch already in progress'};
     codexSwitching = true;
     try {
@@ -1131,7 +1217,9 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       const t = iso ? Date.parse(iso) : Number.NaN;
       return Number.isFinite(t) ? Math.floor(t / 1000) : now + fallbackSec;
     };
-    return accounts.map((a) => ({
+    // A paused account is not capacity (MX-1527): the forecast must not count a window nothing
+    // may use, and must not read its missing numbers as a roomy 0.
+    return inService(accounts).map((a) => ({
       slot: a.slot,
       fiveUtil: a.fiveHour ?? 0,
       fiveResetsAt: parse(a.fiveHourResetsAt, DEFAULT_POLICY.fiveWindowSec),
@@ -1165,7 +1253,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
   async function currentForecast(): Promise<Forecast | null> {
     const { switchAt, weeklyAt, staleAfterMin } = await settings.get();
     const { accounts } = await readUsage();
-    if (accounts.length === 0) return null;
+    if (inService(accounts).length === 0) return null;
     const now = Math.floor(Date.now() / 1000);
     const demandSamples = readDemandSamples(db, now - PROFILE_LOOKBACK_SEC);
     const profile = buildProfile(demandSamples, now);
@@ -1335,6 +1423,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         fiveUtil: a.fiveHour,
         sevenUtil: a.sevenDay,
         active: a.active,
+        paused: Boolean(a.paused),
       })),
       modelWeight: weight,
       activeSlot: active?.slot ?? null,
@@ -1486,6 +1575,8 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
 
   bb.rpc.register(rpcContract, {
     telemetry: currentTelemetry,
+    pause: ({ provider, slot }) => setPaused(provider, slot, true),
+    resume: ({ provider, slot }) => setPaused(provider, slot, false),
     async forecast() {
       return (await currentForecast()) ?? null;
     },
@@ -1529,10 +1620,12 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       // injectable, so fixing only the cache reader leaves the same trap for the next
       // source; an optional field with nothing to say is dropped here for every one of
       // them.
-      const wireSafe = accounts.map(({ error, authState, ...rest }) => ({
+      const wireSafe = accounts.map(({ error, authState, paused, lastRead, ...rest }) => ({
         ...rest,
         ...optional(error, "error"),
         ...optional(authState, "authState"),
+        ...optional(paused, "paused"),
+        ...optional(lastRead, "lastRead"),
       }));
       const { weeklyAt } = await settings.get();
       const lastSwitch = await lastClaudeChange({ polledAt, accounts });
@@ -1550,10 +1643,12 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     name: "accounts",
     summary: "Claude switching and provider-scoped subscription telemetry",
     commands: [
-      { name: "codex", summary: "Switch captured Codex logins", usage: "bb accounts codex use <slot> | auto" },
+      { name: "codex", summary: "Switch, pause or resume captured Codex logins", usage: "bb accounts codex use <slot> | pause <slot> | resume <slot> | auto" },
       { name: "telemetry", summary: "Claude and Codex subscription windows; credits and tokens separate", usage: "bb accounts telemetry [--json]" },
       { name: "list", summary: "Per-account 5h/7d utilization (default)", usage: "bb accounts [list]" },
       { name: "switch", summary: "Switch the live Claude credentials to a slot", usage: "bb accounts switch <slot>" },
+      { name: "pause", summary: "Pause a Claude account: no requests of any kind on it, still shown (mgrin's act)", usage: "bb accounts pause <slot>" },
+      { name: "resume", summary: "Resume a paused Claude account (mgrin's act)", usage: "bb accounts resume <slot>" },
       { name: "auto", summary: "Run one auto-switch evaluation now", usage: "bb accounts auto" },
       { name: "log", summary: "Recent switch decisions", usage: "bb accounts log" },
       {
@@ -1587,13 +1682,24 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
       if (cmd === 'codex') {
         if (argv[1] === 'use' && argv.length === 3) return switchCodex(argv[2]!, await readCodexSlots());
         if (argv[1] === 'auto' && argv.length === 2) return autoCodex();
-        return {exitCode:2,stderr:'usage: bb accounts codex use <slot> | codex auto'};
+        if ((argv[1] === 'pause' || argv[1] === 'resume') && argv.length === 3) {
+          const r = await setPaused('codex', argv[2]!, argv[1] === 'pause');
+          return r.ok ? {exitCode:0,stdout:r.message} : {exitCode:2,stderr:r.message};
+        }
+        return {exitCode:2,stderr:'usage: bb accounts codex use <slot> | pause <slot> | resume <slot> | auto'};
       }
       if (cmd === "telemetry") {
         const telemetry = await currentTelemetry();
         return { exitCode: 0, stdout: argv.includes("--json") ? JSON.stringify(telemetry) : formatTelemetry(telemetry) };
       }
       const json = argv.includes("--json");
+
+      if (cmd === "pause" || cmd === "resume") {
+        const slot = argv[1];
+        if (!slot || argv.length !== 2) return { exitCode: 1, stderr: `usage: bb accounts ${cmd} <slot>` };
+        const r = await setPaused("claude-code", slot, cmd === "pause");
+        return r.ok ? { exitCode: 0, stdout: r.message } : { exitCode: 1, stderr: r.message };
+      }
 
       // Deliberately answered BEFORE anything else touches the db or the usage cache:
       // "what is running" must stay answerable when the thing running is broken.
@@ -1752,6 +1858,9 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         const { accounts } = await readUsage();
         const target = accounts.find((a) => a.slot === slot);
         if (!target) return { exitCode: 1, stderr: `unknown slot '${slot}' — bb accounts list` };
+        // Refused here, before claude-acct is ever called: dotfiles refuses it too, but a paused
+        // account must not even be asked (MX-1527).
+        if (target.paused) return { exitCode: 1, stderr: pausedRefusal("claude-code", slot) };
         const active = accounts.find((a) => a.active);
         const ok = await switchTo(target, active?.slot ?? "?", "manual via bb accounts switch");
         return ok ? { exitCode: 0, stdout: `switched to ${slot}` } : { exitCode: 1, stderr: "switch failed — see bb plugin logs accounts" };
@@ -1884,6 +1993,8 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
             `  ${a.slot.padEnd(24)} ${a.exhausted ? `out on ${a.binding.join("+")} until ${a.usableAt ?? "UNKNOWN"}` : known ? "usable" : "UNKNOWN"}`,
           );
         }
+        // Shown, never counted (MX-1527): a paused account is neither capacity nor a wall.
+        for (const a of o.accounts.filter(row => row.paused)) lines.push(`  ${a.slot.padEnd(24)} PAUSED — not counted`);
         return { exitCode, stdout: lines.join("\n") };
       }
       if (cmd === "log") {
@@ -1938,6 +2049,8 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
               sevenDay: { util: a.sevenDay, resetsAt: a.sevenDayResetsAt },
               credits: a.credits,
               creditSpend: a.creditSpend,
+              paused: a.paused,
+              lastRead: a.lastRead,
             })),
           }),
         };
@@ -1960,8 +2073,24 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         const cap = sp.limit === null ? "" : `/${sp.limit.toFixed(2)}`;
         return `  CREDITS ${sp.used.toFixed(2)}${cap}${sp.currency ? ` ${sp.currency}` : ""}`;
       };
+      // A paused account was not read: no bars, no percentages that would pass for a reading.
+      // It says what it is, since when, and what it last showed with that reading's own age —
+      // muted prose, never a warning (MX-1527).
+      const agoText = (sec: number): string => {
+        const m = Math.max(0, Math.floor(sec / 60));
+        return m < 1 ? "<1m" : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+      };
+      const pausedLine = (a: Account): string => {
+        const last = a.lastRead;
+        const pct = (v: number | null) => (v === null ? "?" : `${v}%`);
+        const read = last && (last.fiveHour !== null || last.sevenDay !== null)
+          ? `last read 5h ${pct(last.fiveHour)} 7d ${pct(last.sevenDay)}, ${agoText(Date.now() / 1000 - last.at)} ago`
+          : "last read UNKNOWN";
+        const since = a.paused && a.paused.at > 0 ? ` since ${clock(a.paused.at)}` : "";
+        return `  ${a.slot.padEnd(24)} PAUSED${since} — no requests (${read})`;
+      };
       const lines = accounts.map(
-        (a) =>
+        (a) => a.paused ? pausedLine(a) :
           `${a.active ? "▶" : " "} ${a.slot.padEnd(24)} 5h ${bar(a.fiveHour)} ${a.fiveHour === null ? "UNKNOWN" : `${a.fiveHour}%`}  7d ${bar(a.sevenDay)} ${a.sevenDay === null ? "UNKNOWN" : `${a.sevenDay}%`}${creditCell(a)}${a.error ? `  ${a.error}` : ""}`,
       );
       if (!stale && accounts.length > 0) {
