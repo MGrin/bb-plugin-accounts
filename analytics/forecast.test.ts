@@ -153,7 +153,7 @@ test("a custom horizon is respected", () => {
     horizonSec: 2 * DAY,
   });
   assert.equal(fc.horizonSec, 2 * DAY);
-  assert.equal(fc.timeline[fc.timeline.length - 1]!.ts < NOW + 2 * DAY, true);
+  assert.equal(fc.timeline[fc.timeline.length - 1]!.ts, NOW + 2 * DAY);
 });
 
 test("weeklyExhaustedAt names every real slot", () => {

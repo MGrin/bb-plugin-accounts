@@ -297,3 +297,16 @@ burn and ends at its window reset; it does not predict refills or infer quota fr
 Forecast provider identities remain visible when data is stale or unavailable (UNKNOWN).
 Failed refreshes retain the last series roster without projecting old measurements.
 Opening the panel records current Codex windows independently of the history schedule.
+
+The usage page's 7d/14d/30d **History range** controls retrospective breakdowns.
+The forecast independently covers the next 14 days, as returned by the handler;
+Claude includes the horizon endpoint while each Codex line still ends at reset.
+Claude's left scale auto-fits the projected headroom, not the subscription maximum.
+Each account contributes the smaller of its remaining 5h and weekly policy headroom
+(up to 97 points with the default switch threshold, hence 194 for two fresh accounts).
+
+Last-switch display and `bb accounts log` also reconcile active-login transitions
+from usage polls, covering `claude-acct use` and native login changes which do not
+write plugin KV. These are labeled observations with the first poll time: the exact
+switch time and source are unknown. A matching plugin switch retains its exact
+record. Observations do not change switching cooldown or manual placement pins.

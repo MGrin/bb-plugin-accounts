@@ -197,7 +197,8 @@ test("the caller's account state is not mutated", () => {
 
 test("the timeline covers the horizon at TICK_SEC resolution", () => {
   const res = simulate([account()], IDLE, policy(), NOW, 4 * HOUR, "p50");
-  assert.equal(res.timeline.length, (4 * HOUR) / TICK_SEC);
+  assert.equal(res.timeline.length, (4 * HOUR) / TICK_SEC + 1);
+  assert.equal(res.timeline.at(-1)!.ts, NOW + 4 * HOUR);
   assert.equal(res.timeline[0]!.ts, NOW);
   assert.equal(res.timeline[1]!.ts - res.timeline[0]!.ts, TICK_SEC);
 });

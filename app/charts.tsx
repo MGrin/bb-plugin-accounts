@@ -273,7 +273,7 @@ export function Timeline({ points, codex = [], height = 120 }: { points: Timelin
         )}
       </svg>
       <div className="text-[10px] text-muted-foreground flex justify-between">
-        <span>Claude{points.length===0 ? ' · UNKNOWN' : ''} · left scale 0–{Math.round(max)} summed headroom points</span><span>Codex · right scale 0–100% remaining per window</span>
+        <span>Claude{points.length===0 ? ' · UNKNOWN' : ''} · left scale 0–{Math.round(max)} summed headroom points (auto-scaled to projected values)</span><span>Codex · right scale 0–100% remaining per window</span>
       </div>
       {times.length>1 && <div className="text-[10px] text-muted-foreground flex justify-between"><span>{new Date(lo*1000).toLocaleString()}</span><span>{new Date(hi*1000).toLocaleString()}</span></div>}
       {codex.length===0 && <p data-provider="codex" className="text-xs text-muted-foreground">Codex forecast UNKNOWN · no measured window history available.</p>}

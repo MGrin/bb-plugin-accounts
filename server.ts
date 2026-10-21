@@ -95,6 +95,7 @@ import {
   burnByHourOfWeek,
   countDistinctPolls,
   latestSampleAt,
+  readObservedLoginChange,
   readCalibratableIntervals,
   readCursors,
   readDemandSamples,
@@ -1098,6 +1099,19 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
     }
   });
 
+  /** Display history is separate from policy's plugin-owned cooldown/pin record. */
+  async function lastClaudeChange(usage: Awaited<ReturnType<typeof readUsage>>) {
+    const known = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch") ?? null;
+    const active = usage.accounts.filter(a => a.active);
+    if (usage.polledAt === null || !Number.isFinite(usage.polledAt) || await isStale(usage.polledAt) || active.length !== 1) return known;
+    const change = readObservedLoginChange(db, usage.polledAt, active[0]!.slot);
+    const observed = change ? { at: change.at, from: change.from, to: change.to, reason: change.reason } : null;
+    if (known && change && known.from === change.from && known.to === change.to && known.at > change.after) return known;
+    // A fresh poll contradicting an old plugin switch must not show it as latest.
+    if (known && known.at <= usage.polledAt * 1000 && known.to !== active[0]!.slot) return observed;
+    return observed && (!known || observed.at > known.at) ? observed : known;
+  }
+
   // ── Forecasting ──────────────────────────────────────────────────────────
 
   /** How much demand history to feed the profile. */
@@ -1521,8 +1535,7 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         ...optional(authState, "authState"),
       }));
       const { weeklyAt } = await settings.get();
-      const lastSwitch =
-        (await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch")) ?? null;
+      const lastSwitch = await lastClaudeChange({ polledAt, accounts });
       return {
         polledAt,
         stale: await isStale(polledAt),
@@ -1874,12 +1887,12 @@ export default async function plugin(bb: BbPluginApi, dependencies: {
         return { exitCode, stdout: lines.join("\n") };
       }
       if (cmd === "log") {
-        const last = await bb.storage.kv.get<{ at: number; from: string; to: string; reason: string }>("last-switch");
+        const last = await lastClaudeChange(await readUsage());
         return {
           exitCode: 0,
           stdout: last
             ? `${new Date(last.at).toISOString()} ${last.from} -> ${last.to}: ${last.reason}`
-            : "no switches recorded by this plugin yet",
+            : "no Claude login changes observed yet",
         };
       }
       const { polledAt, accounts } = await readUsage();
